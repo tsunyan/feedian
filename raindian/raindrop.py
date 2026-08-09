@@ -62,6 +62,59 @@ class RaindropClient:
         data = self._get("/collections/childrens", {})
         return list(data.get("items") or [])
 
+    def get_raindrop(self, raindrop_id: int) -> dict[str, Any]:
+        data = self._get(f"/raindrop/{raindrop_id}", {})
+        item = data.get("item")
+        return item if isinstance(item, dict) else {}
+
+    def update_raindrop_note(self, raindrop_id: int, note: str) -> None:
+        request = Request(
+            f"{API_BASE}/raindrop/{raindrop_id}",
+            data=json.dumps({"note": note}).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {self.token}",
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "User-Agent": "raindian/0.1",
+            },
+            method="PUT",
+        )
+        try:
+            run_with_retries(
+                lambda: self._read_json(request),
+                max_retries=self.max_retries,
+                retry_base_seconds=self.retry_base_seconds,
+            )
+        except HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"Raindrop API error HTTP {exc.code}: {body}") from exc
+        except URLError as exc:
+            raise RuntimeError(f"Raindrop API network error: {exc.reason}") from exc
+
+    def append_raindrop_tags(self, collection_id: int, raindrop_id: int, tags: list[str]) -> None:
+        request = Request(
+            f"{API_BASE}/raindrops/{collection_id}",
+            data=json.dumps({"ids": [raindrop_id], "tags": tags}).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {self.token}",
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "User-Agent": "raindian/0.1",
+            },
+            method="PUT",
+        )
+        try:
+            run_with_retries(
+                lambda: self._read_json(request),
+                max_retries=self.max_retries,
+                retry_base_seconds=self.retry_base_seconds,
+            )
+        except HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"Raindrop API error HTTP {exc.code}: {body}") from exc
+        except URLError as exc:
+            raise RuntimeError(f"Raindrop API network error: {exc.reason}") from exc
+
     def _get(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
         query = f"?{urlencode(params)}" if params else ""
         request = Request(

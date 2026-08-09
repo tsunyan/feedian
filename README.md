@@ -130,15 +130,16 @@ The command reports its current phase while it runs: official price refresh, boo
 
 ## Behavior
 
-- Raindrop.io is read-only. This tool does not edit bookmark tags in Raindrop.
-- Existing notes are skipped unless `--force` is passed.
-- Filenames include the Raindrop item ID to avoid collisions.
+- Normal note generation is read-only against Raindrop.io. `--sync-raindrop-summary` and `--sync-raindrop-tags` are explicit opt-in operations that write Raindrop notes or tags.
+- Existing LLM-generated notes are skipped unless `--force` is passed. An LLM run automatically upgrades notes that were previously created with `--no-llm`; a later `--no-llm` run never downgrades an LLM-generated note.
+- New LLM-generated filenames use the Japanese note title and include the Raindrop item ID to avoid collisions. Use `--rename-existing` to rename existing LLM notes from their stored note titles and to rename `--no-llm` notes when they are upgraded.
+- Notes preserve the original Raindrop title and excerpt, and store the cleaned linked-page text as `Extracted Content (Original)`. Existing notes are not backfilled automatically.
 - If a web page cannot be fetched, the tool still uses Raindrop metadata such as title and excerpt.
 - HTML extraction prioritizes `article` and `main`, then article-like `class` / `id` values. Navigation, headers, footers, sidebars, ads, related links, comments, and cookie banners are excluded when identifiable from HTML structure or attributes.
 - Page fetching accepts only `http` and `https` URLs and rejects local/private network addresses by default, including after redirects. Set `allow_private_urls` only for a trusted internal bookmark collection.
 - Linked-page text and bookmark metadata are treated as untrusted reference data when sent to the LLM; instructions in them are not followed.
 - Raindrop and OpenAI requests retry transient 408, 409, 425, 429, 5xx, and network failures with bounded exponential backoff.
-- Successful LLM summaries append a JSON line to `<vault_path>/<output_folder>/.raindian-usage.jsonl`. Each line contains token usage, model and reasoning settings, a price snapshot, and the request's estimated USD cost; it does not contain page text or URLs.
+- Successful LLM summaries append a JSON line with `operation: "summarize"` to `<vault_path>/<output_folder>/.raindian-usage.jsonl`. Each line contains token usage, model and reasoning settings, a price snapshot, and the request's estimated USD cost; it does not contain page text or URLs.
 
 ## Useful Commands
 
@@ -152,6 +153,36 @@ Process one collection:
 
 ```powershell
 python -m raindian --config config.json --collection 123456 --limit 20
+```
+
+Upgrade `--no-llm` notes with LLM summaries and rename notes to their Japanese titles. Existing LLM notes are renamed from their saved frontmatter title without another OpenAI call:
+
+```powershell
+python -m raindian --config config.json --rename-existing
+```
+
+Preview copying existing Japanese LLM summaries into Raindrop notes. This reads local Markdown only and does not call OpenAI or modify Raindrop:
+
+```powershell
+python -m raindian --config config.json --sync-raindrop-summary --dry-run
+```
+
+Apply the summary sync. Raindian appends or updates only its managed `Raindian Summary` block in each Raindrop note, preserving any manual note text:
+
+```powershell
+python -m raindian --config config.json --sync-raindrop-summary
+```
+
+Preview tags from existing LLM notes before adding them to the matching Raindrop items:
+
+```powershell
+python -m raindian --config config.json --sync-raindrop-tags --dry-run
+```
+
+Apply the tag sync. Raindian excludes `base_tags`, reads the item's current Raindrop tags, and appends only missing tags. It never replaces or removes existing Raindrop tags:
+
+```powershell
+python -m raindian --config config.json --sync-raindrop-tags
 ```
 
 Use a different vault without editing config:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
 import uuid
@@ -25,8 +26,11 @@ from .estimate import (
 )
 from .extract import PageFetchResult, fetch_page_text
 from .llm import SUMMARY_INSTRUCTIONS, USAGE_FIELD, build_prompt, summarize_bookmark
-from .markdown import note_filename, render_note
+from .markdown import normalize_tag, note_filename, render_note, upsert_raindrop_summary
 from .raindrop import RaindropClient
+
+
+NON_CONTENT_TAGS = frozenset({"x", "sns"})
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -45,6 +49,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Preview Raindrop items without fetching pages, calling OpenAI, or writing files.",
     )
     parser.add_argument("--force", action="store_true", help="Overwrite existing notes.")
+    parser.add_argument(
+        "--rename-existing",
+        action="store_true",
+        help="Rename existing LLM notes to their stored note titles and rename upgraded notes after summarizing.",
+    )
     parser.add_argument(
         "--list-collections",
         action="store_true",
@@ -70,6 +79,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default="10%",
         metavar="SIZE",
         help="Sample size for --estimate: an integer, percentage, or 0 (default: 10%%).",
+    )
+    parser.add_argument(
+        "--sync-raindrop-summary",
+        action="store_true",
+        help="Copy Japanese LLM summaries from existing notes into managed Raindrop note blocks.",
+    )
+    parser.add_argument(
+        "--sync-raindrop-tags",
+        action="store_true",
+        help="Append LLM tags from existing notes to the matching Raindrop items.",
     )
     return parser.parse_args(argv)
 
@@ -177,6 +196,42 @@ def existing_note_for_item(destination: Path, item: dict[str, Any]) -> Path | No
     return matches[0] if matches else None
 
 
+def has_llm_summary(note_path: Path) -> bool:
+    try:
+        text = note_path.read_text(encoding="utf-8")
+    except OSError:
+        return True
+    if not text.startswith("---\n"):
+        return True
+    frontmatter, separator, _ = text[4:].partition("\n---\n")
+    if not separator:
+        return True
+    for line in frontmatter.splitlines():
+        if line.startswith("summary_model:"):
+            value = line.partition(":")[2].strip().strip('"').strip("'")
+            return bool(value)
+    return False
+
+
+def should_upgrade_note(note_path: Path, args: argparse.Namespace) -> bool:
+    return not args.no_llm and not args.dry_run and not has_llm_summary(note_path)
+
+
+def rename_existing_note(note_path: Path, destination: Path, item: dict[str, Any]) -> Path:
+    try:
+        text = note_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise RuntimeError(f"could not read existing note for rename: {note_path}") from exc
+    title = _frontmatter_values(text).get("title", "")
+    target = destination / note_filename(item, title=title)
+    if target == note_path:
+        return note_path
+    if target.exists():
+        raise FileExistsError(f"rename target already exists: {target}")
+    note_path.replace(target)
+    return target
+
+
 def write_note_atomically(target: Path, markdown: str) -> None:
     temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
     try:
@@ -202,6 +257,7 @@ def append_usage_record(
 ) -> None:
     record = {
         "recorded_at": datetime.now(timezone.utc).isoformat(),
+        "operation": "summarize",
         "raindrop_id": item.get("_id"),
         "model": model,
         "reasoning_effort": reasoning_effort,
@@ -241,6 +297,8 @@ def usage_output_ratio(
         if not isinstance(record, dict):
             continue
         if record.get("model") != model or record.get("reasoning_effort") != reasoning_effort:
+            continue
+        if record.get("operation") not in {None, "summarize"}:
             continue
         input_tokens = _non_negative_int(record.get("input_tokens"))
         output_tokens = _non_negative_int(record.get("output_tokens"))
@@ -292,6 +350,7 @@ def process_bookmarks(config: Config, args: argparse.Namespace) -> int:
 
     processed = 0
     created = 0
+    renamed = 0
     skipped = 0
     failed = 0
     now = datetime.now(timezone.utc).isoformat()
@@ -305,19 +364,33 @@ def process_bookmarks(config: Config, args: argparse.Namespace) -> int:
         limit=args.limit,
     ):
         processed += 1
-        filename = note_filename(item)
         existing = existing_note_for_item(destination, item)
-        target = existing or (destination / filename)
-        if existing and not args.force:
-            print(f"skip existing: {existing}")
-            skipped += 1
-            continue
-        if target.exists() and not args.force:
-            print(f"skip existing: {target}")
-            skipped += 1
-            continue
+        target = existing or (destination / note_filename(item))
+        existing_path = existing or (target if target.exists() else None)
+        if existing_path and not args.force:
+            if args.rename_existing and has_llm_summary(existing_path):
+                try:
+                    renamed_path = rename_existing_note(existing_path, destination, item)
+                except Exception as exc:
+                    print(f"  rename warning: {exc}")
+                    failed += 1
+                else:
+                    if renamed_path == existing_path:
+                        print(f"skip existing: {existing_path}")
+                    else:
+                        print(f"rename: {existing_path.name} -> {renamed_path.name}")
+                        renamed += 1
+                    skipped += 1
+                continue
+            if should_upgrade_note(existing_path, args):
+                print(f"upgrade no-llm note: {existing_path}")
+                target = existing_path
+            else:
+                print(f"skip existing: {existing_path}")
+                skipped += 1
+                continue
 
-        print(f"process: {item.get('title') or item.get('link')} -> {target}")
+        print(f"process: {item.get('title') or item.get('link')}")
         page = PageFetchResult(url=item.get("link", ""), text="", title="", error=None)
         if not args.dry_run and not args.skip_page_fetch and item.get("link"):
             page = fetch_page_text(
@@ -351,6 +424,20 @@ def process_bookmarks(config: Config, args: argparse.Namespace) -> int:
                 continue
         usage = summary.pop(USAGE_FIELD, None)
 
+        rename_source: Path | None = None
+        if existing is None:
+            target = destination / note_filename(item, title=str(summary.get("note_title") or ""))
+        elif args.rename_existing:
+            renamed_target = destination / note_filename(item, title=str(summary.get("note_title") or ""))
+            if renamed_target != existing:
+                if renamed_target.exists():
+                    print(f"  rename warning: rename target already exists: {renamed_target}")
+                    failed += 1
+                    continue
+                target = renamed_target
+                rename_source = existing
+        print(f"  note: {target}")
+
         markdown = render_note(
             item=item,
             page=page,
@@ -368,6 +455,13 @@ def process_bookmarks(config: Config, args: argparse.Namespace) -> int:
                 print(f"  write warning: {exc}")
                 failed += 1
                 continue
+            if rename_source is not None:
+                try:
+                    rename_source.unlink()
+                    renamed += 1
+                except OSError as exc:
+                    print(f"  rename warning: could not remove old note: {exc}")
+                    failed += 1
             created += 1
             if isinstance(usage, dict):
                 try:
@@ -390,10 +484,218 @@ def process_bookmarks(config: Config, args: argparse.Namespace) -> int:
 
     elapsed_seconds = time.perf_counter() - started_at
     print(
-        f"done: processed={processed} created={created} skipped={skipped} "
+        f"done: processed={processed} created={created} renamed={renamed} skipped={skipped} "
         f"failed={failed} elapsed={elapsed_seconds:.1f}s"
     )
     return 1 if failed else 0
+
+
+def sync_raindrop_summaries(config: Config, args: argparse.Namespace, client: RaindropClient | None) -> int:
+    started_at = time.perf_counter()
+    destination = output_dir(config)
+    if not destination.exists():
+        print(f"sync: no output folder: {destination}")
+        return 0
+
+    planned = 0
+    updated = 0
+    skipped = 0
+    failed = 0
+    notes = sorted(destination.glob("* - *.md"))
+    for note_path in notes:
+        candidate = summary_sync_candidate(note_path)
+        if candidate is None:
+            skipped += 1
+            continue
+        raindrop_id, summary = candidate
+        if args.limit is not None and planned >= args.limit:
+            break
+        planned += 1
+        print(f"sync: {note_path.name} -> raindrop_id={raindrop_id}")
+        if args.dry_run:
+            print("  dry-run: would update Raindrop note")
+            continue
+        if client is None:
+            raise RuntimeError("Raindrop client is required when applying summary sync.")
+        try:
+            item = client.get_raindrop(raindrop_id)
+            original_note = item.get("note")
+            original_note = original_note if isinstance(original_note, str) else ""
+            updated_note = upsert_raindrop_summary(original_note, summary)
+            if updated_note == original_note:
+                print("  sync: unchanged")
+                continue
+            if len(updated_note) > 10_000:
+                raise ValueError("updated Raindrop note exceeds the 10,000-character limit")
+            client.update_raindrop_note(raindrop_id, updated_note)
+            updated += 1
+        except Exception as exc:
+            print(f"  sync warning: {exc}")
+            failed += 1
+        if config.sleep_seconds > 0:
+            time.sleep(config.sleep_seconds)
+
+    elapsed_seconds = time.perf_counter() - started_at
+    print(
+        f"done: sync_planned={planned} sync_updated={updated} skipped={skipped} "
+        f"failed={failed} elapsed={elapsed_seconds:.1f}s"
+    )
+    return 1 if failed else 0
+
+
+def summary_sync_candidate(note_path: Path) -> tuple[int, str] | None:
+    try:
+        text = note_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    frontmatter = _frontmatter_values(text)
+    if not frontmatter.get("summary_model"):
+        return None
+    try:
+        raindrop_id = int(frontmatter.get("raindrop_id", ""))
+    except ValueError:
+        return None
+    summary_match = re.search(r"^## Summary\s*\n+(.*?)(?=^##\s|\Z)", text, flags=re.MULTILINE | re.DOTALL)
+    if not summary_match:
+        return None
+    summary = summary_match.group(1).strip()
+    return (raindrop_id, summary) if summary else None
+
+
+def sync_raindrop_tags(config: Config, args: argparse.Namespace, client: RaindropClient | None) -> int:
+    started_at = time.perf_counter()
+    destination = output_dir(config)
+    if not destination.exists():
+        print(f"sync-tags: no output folder: {destination}")
+        return 0
+
+    planned = 0
+    updated = 0
+    skipped = 0
+    failed = 0
+    for note_path in sorted(destination.glob("* - *.md")):
+        candidate = tag_sync_candidate(note_path, config.base_tags or [])
+        if candidate is None:
+            skipped += 1
+            continue
+        raindrop_id, collection_id, note_tags = candidate
+        if args.limit is not None and planned >= args.limit:
+            break
+        planned += 1
+        if args.dry_run:
+            print(f"sync-tags: {note_path.name} -> raindrop_id={raindrop_id} tags={note_tags}")
+            print("  dry-run: would append Raindrop tags")
+            continue
+        if client is None:
+            raise RuntimeError("Raindrop client is required when applying tag sync.")
+        try:
+            item = client.get_raindrop(raindrop_id)
+            existing_tags = {
+                normalized
+                for raw_tag in item.get("tags", [])
+                if isinstance(raw_tag, str) and (normalized := normalize_tag(raw_tag))
+            }
+            missing_tags = [tag for tag in note_tags if tag not in existing_tags]
+            if not missing_tags:
+                print(f"sync-tags: {note_path.name} -> unchanged")
+                continue
+            print(f"sync-tags: {note_path.name} -> raindrop_id={raindrop_id} tags={missing_tags}")
+            client.append_raindrop_tags(collection_id, raindrop_id, missing_tags)
+            updated += 1
+        except Exception as exc:
+            print(f"  sync-tags warning: {exc}")
+            failed += 1
+        if config.sleep_seconds > 0:
+            time.sleep(config.sleep_seconds)
+
+    elapsed_seconds = time.perf_counter() - started_at
+    print(
+        f"done: tag_sync_planned={planned} tag_sync_updated={updated} skipped={skipped} "
+        f"failed={failed} elapsed={elapsed_seconds:.1f}s"
+    )
+    return 1 if failed else 0
+
+
+def tag_sync_candidate(note_path: Path, base_tags: list[str]) -> tuple[int, int, list[str]] | None:
+    try:
+        text = note_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    frontmatter = _frontmatter_values(text)
+    if not frontmatter.get("summary_model"):
+        return None
+    try:
+        raindrop_id = int(frontmatter.get("raindrop_id", ""))
+        collection_id = int(frontmatter.get("raindrop_collection_id", ""))
+    except ValueError:
+        return None
+    if "llm_tags" in frontmatter:
+        raw_tags = _frontmatter_list(text, "llm_tags")
+    else:
+        raw_tags = _frontmatter_list(text, "tags")
+        excluded_tags = {normalize_tag(tag) for tag in base_tags}
+        raw_tags = [tag for tag in raw_tags if normalize_tag(tag) not in excluded_tags]
+    tags = [tag for tag in _normalized_unique_tags(raw_tags) if tag not in NON_CONTENT_TAGS]
+    return (raindrop_id, collection_id, tags) if tags else None
+
+
+def _frontmatter_values(text: str) -> dict[str, str]:
+    if not text.startswith("---\n"):
+        return {}
+    frontmatter, separator, _ = text[4:].partition("\n---\n")
+    if not separator:
+        return {}
+    values: dict[str, str] = {}
+    for line in frontmatter.splitlines():
+        key, delimiter, value = line.partition(":")
+        if not delimiter:
+            continue
+        key = key.strip()
+        value = value.strip()
+        if value.startswith('"') and value.endswith('"'):
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError:
+                value = value.strip('"')
+        values[key] = value
+    return values
+
+
+def _frontmatter_list(text: str, field: str) -> list[str]:
+    if not text.startswith("---\n"):
+        return []
+    frontmatter, separator, _ = text[4:].partition("\n---\n")
+    if not separator:
+        return []
+    lines = frontmatter.splitlines()
+    for index, line in enumerate(lines):
+        if line.strip() != f"{field}:":
+            continue
+        values: list[str] = []
+        for entry in lines[index + 1 :]:
+            if not entry.startswith("  - "):
+                break
+            value = entry[4:].strip()
+            if value.startswith('"') and value.endswith('"'):
+                try:
+                    value = json.loads(value)
+                except json.JSONDecodeError:
+                    value = value.strip('"')
+            if isinstance(value, str):
+                values.append(value)
+        return values
+    return []
+
+
+def _normalized_unique_tags(tags: list[str]) -> list[str]:
+    seen: set[str] = set()
+    normalized_tags: list[str] = []
+    for raw_tag in tags:
+        tag = normalize_tag(raw_tag)
+        if tag and tag not in seen:
+            seen.add(tag)
+            normalized_tags.append(tag)
+    return normalized_tags
 
 
 def estimate_bookmarks(config: Config, args: argparse.Namespace) -> int:
@@ -565,8 +867,11 @@ def main(argv: list[str] | None = None) -> int:
     try:
         load_env_file(Path(".env"))
         config = apply_overrides(load_config(args.config), args)
-        if args.estimate and (args.dry_run or args.list_collections):
-            raise ValueError("--estimate cannot be combined with --dry-run or --list-collections.")
+        sync_actions = int(args.sync_raindrop_summary) + int(args.sync_raindrop_tags)
+        if sync_actions > 1:
+            raise ValueError("Choose either --sync-raindrop-summary or --sync-raindrop-tags.")
+        if args.estimate and (args.dry_run or args.list_collections or sync_actions):
+            raise ValueError("--estimate cannot be combined with --dry-run, --list-collections, or sync options.")
         if args.list_collections:
             raindrop_token = require_env("RAINDROP_TOKEN")
             client = RaindropClient(
@@ -579,6 +884,28 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.estimate:
             return estimate_bookmarks(config, args)
+        if args.sync_raindrop_summary:
+            if args.dry_run:
+                return sync_raindrop_summaries(config, args, client=None)
+            raindrop_token = require_env("RAINDROP_TOKEN")
+            client = RaindropClient(
+                token=raindrop_token,
+                timeout_seconds=config.request_timeout_seconds,
+                max_retries=config.max_retries,
+                retry_base_seconds=config.retry_base_seconds,
+            )
+            return sync_raindrop_summaries(config, args, client)
+        if args.sync_raindrop_tags:
+            if args.dry_run:
+                return sync_raindrop_tags(config, args, client=None)
+            raindrop_token = require_env("RAINDROP_TOKEN")
+            client = RaindropClient(
+                token=raindrop_token,
+                timeout_seconds=config.request_timeout_seconds,
+                max_retries=config.max_retries,
+                retry_base_seconds=config.retry_base_seconds,
+            )
+            return sync_raindrop_tags(config, args, client)
         return process_bookmarks(config, args)
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)

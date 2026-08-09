@@ -2,7 +2,7 @@ import unittest
 from unittest.mock import patch
 
 from raindian.extract import PageFetchResult
-from raindian.llm import build_prompt, extract_output_text, summarize_bookmark
+from raindian.llm import SUMMARY_INSTRUCTIONS, build_prompt, extract_output_text, summarize_bookmark
 
 
 class LlmTests(unittest.TestCase):
@@ -72,6 +72,9 @@ class LlmTests(unittest.TestCase):
         self.assertIn("<untrusted_bookmark_metadata>", prompt)
         self.assertIn("<untrusted_page_text>", prompt)
         self.assertIn("Untrusted page text", prompt)
+
+    def test_summary_instructions_exclude_source_platform_tags(self) -> None:
+        self.assertIn("Do not use source or platform names as tags", SUMMARY_INSTRUCTIONS)
 
 
 if __name__ == "__main__":

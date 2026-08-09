@@ -34,10 +34,12 @@ WINDOWS_RESERVED_NAMES = {
     "LPT9",
 }
 MAX_FILENAME_TITLE_CHARS = 60
+RAINDIAN_SUMMARY_START = "<!-- raindian:summary:start -->"
+RAINDIAN_SUMMARY_END = "<!-- raindian:summary:end -->"
 
 
-def note_filename(item: dict[str, Any]) -> str:
-    title = item.get("title") or item.get("link") or "Untitled"
+def note_filename(item: dict[str, Any], title: str | None = None) -> str:
+    title = title or item.get("title") or item.get("link") or "Untitled"
     item_id = item.get("_id") or "unknown"
     base = sanitize_filename(str(title))
     if not base:
@@ -75,6 +77,7 @@ def render_note(
     all_tags = merge_tags(base_tags or [], item.get("tags") or [], summary.get("tags") or [])
     frontmatter = {
         "title": title,
+        "source_title": item.get("title"),
         "source": item.get("link"),
         "raindrop_id": item.get("_id"),
         "raindrop_collection_id": (item.get("collection") or {}).get("$id"),
@@ -86,6 +89,8 @@ def render_note(
         "summary_model": model,
         "tags": all_tags,
     }
+    if model:
+        frontmatter["llm_tags"] = merge_tags(summary.get("tags") or [])
     lines = ["---", yaml_frontmatter(frontmatter), "---", "", f"# {escape_markdown_heading(title)}", ""]
     lines.extend(
         [
@@ -112,13 +117,38 @@ def render_note(
     if excerpt or note or page.error:
         lines.extend(["## Raindrop Metadata", ""])
         if excerpt:
-            lines.extend(["### Excerpt", "", excerpt, ""])
+            lines.extend(["### Excerpt (Original)", "", excerpt, ""])
         if note:
-            lines.extend(["### Note", "", note, ""])
+            lines.extend(["### Note (Original)", "", note, ""])
         if page.error:
             lines.extend(["### Fetch Warning", "", page.error, ""])
 
+    extracted_content = page.text.strip()
+    if extracted_content:
+        lines.extend(["## Extracted Content (Original)", "", extracted_content, ""])
+
     return "\n".join(lines).rstrip() + "\n"
+
+
+def upsert_raindrop_summary(note: str, summary: str) -> str:
+    """Replace only Raindian's managed summary block in a Raindrop note."""
+    summary = summary.strip()
+    block = "\n".join(
+        [
+            RAINDIAN_SUMMARY_START,
+            "## Raindian Summary",
+            "",
+            summary,
+            RAINDIAN_SUMMARY_END,
+        ]
+    )
+    pattern = re.compile(
+        rf"{re.escape(RAINDIAN_SUMMARY_START)}.*?{re.escape(RAINDIAN_SUMMARY_END)}",
+        flags=re.DOTALL,
+    )
+    if pattern.search(note):
+        return pattern.sub(block, note, count=1).strip()
+    return f"{note.rstrip()}\n\n{block}".strip()
 
 
 def merge_tags(*groups: list[str]) -> list[str]:

@@ -14,6 +14,8 @@ from raindian.__main__ import (
     main,
     parse_args,
     process_bookmarks,
+    sync_raindrop_tags,
+    sync_raindrop_summaries,
     write_note_atomically,
 )
 from raindian.config import Config
@@ -46,6 +48,141 @@ class MainTests(unittest.TestCase):
             existing = path / "Old title - 123.md"
             existing.write_text("", encoding="utf-8")
             self.assertEqual(existing_note_for_item(path, {"_id": 123}), existing)
+
+    def test_llm_run_upgrades_an_existing_no_llm_note(self) -> None:
+        item = {"_id": 123, "title": "First", "link": "https://example.com/first", "collection": {}}
+        summary = {
+            "note_title": "First",
+            "summary": "LLM summary",
+            "key_points": [],
+            "tags": [],
+            "content_type": "link",
+        }
+
+        with TemporaryDirectory() as temp_dir:
+            destination = Path(temp_dir) / "Raindrop"
+            destination.mkdir()
+            existing = destination / "First - 123.md"
+            existing.write_text('---\nsummary_generated_at: "old"\n---\n\nNo LLM summary\n', encoding="utf-8")
+            config = Config(vault_path=temp_dir, sleep_seconds=0)
+            args = parse_args(["--skip-page-fetch"])
+            with (
+                patch.dict(os.environ, {"RAINDROP_TOKEN": "token", "OPENAI_API_KEY": "key"}),
+                patch("raindian.__main__.RaindropClient.iter_raindrops", return_value=iter([item])),
+                patch("raindian.__main__.summarize_bookmark", return_value=summary),
+            ):
+                result = process_bookmarks(config, args)
+
+            rendered = existing.read_text(encoding="utf-8")
+
+        self.assertEqual(result, 0)
+        self.assertIn("LLM summary", rendered)
+        self.assertIn('summary_model: "gpt-5.6-luna"', rendered)
+
+    def test_new_llm_note_uses_the_japanese_note_title_for_its_filename(self) -> None:
+        item = {"_id": 123, "title": "Original foreign title", "link": "https://example.com/first", "collection": {}}
+        summary = {
+            "note_title": "日本語のタイトル",
+            "summary": "LLM summary",
+            "key_points": [],
+            "tags": [],
+            "content_type": "link",
+        }
+
+        with TemporaryDirectory() as temp_dir:
+            config = Config(vault_path=temp_dir, sleep_seconds=0)
+            args = parse_args(["--skip-page-fetch"])
+            with (
+                patch.dict(os.environ, {"RAINDROP_TOKEN": "token", "OPENAI_API_KEY": "key"}),
+                patch("raindian.__main__.RaindropClient.iter_raindrops", return_value=iter([item])),
+                patch("raindian.__main__.summarize_bookmark", return_value=summary),
+            ):
+                result = process_bookmarks(config, args)
+
+            destination = Path(temp_dir) / "Raindrop"
+            created = destination / "日本語のタイトル - 123.md"
+            self.assertTrue(created.exists())
+
+        self.assertEqual(result, 0)
+
+    def test_rename_existing_moves_an_llm_note_without_calling_openai(self) -> None:
+        item = {"_id": 123, "title": "Original foreign title", "link": "https://example.com/first", "collection": {}}
+
+        with TemporaryDirectory() as temp_dir:
+            destination = Path(temp_dir) / "Raindrop"
+            destination.mkdir()
+            old_path = destination / "Original foreign title - 123.md"
+            old_path.write_text(
+                '---\ntitle: "日本語のタイトル"\nsummary_model: "gpt-5.6-luna"\n---\n\nSummary',
+                encoding="utf-8",
+            )
+            config = Config(vault_path=temp_dir, sleep_seconds=0)
+            args = parse_args(["--rename-existing"])
+            with (
+                patch.dict(os.environ, {"RAINDROP_TOKEN": "token", "OPENAI_API_KEY": "key"}),
+                patch("raindian.__main__.RaindropClient.iter_raindrops", return_value=iter([item])),
+                patch("raindian.__main__.summarize_bookmark") as summarize,
+            ):
+                result = process_bookmarks(config, args)
+
+            new_path = destination / "日本語のタイトル - 123.md"
+            self.assertTrue(new_path.exists())
+            self.assertFalse(old_path.exists())
+            summarize.assert_not_called()
+
+        self.assertEqual(result, 0)
+
+    def test_rename_existing_moves_an_upgraded_no_llm_note_after_writing_the_summary(self) -> None:
+        item = {"_id": 123, "title": "Original foreign title", "link": "https://example.com/first", "collection": {}}
+        summary = {
+            "note_title": "日本語のタイトル",
+            "summary": "LLM summary",
+            "key_points": [],
+            "tags": [],
+            "content_type": "link",
+        }
+
+        with TemporaryDirectory() as temp_dir:
+            destination = Path(temp_dir) / "Raindrop"
+            destination.mkdir()
+            old_path = destination / "Original foreign title - 123.md"
+            old_path.write_text('---\nsummary_generated_at: "old"\n---\n\nNo LLM summary\n', encoding="utf-8")
+            config = Config(vault_path=temp_dir, sleep_seconds=0)
+            args = parse_args(["--rename-existing", "--skip-page-fetch"])
+            with (
+                patch.dict(os.environ, {"RAINDROP_TOKEN": "token", "OPENAI_API_KEY": "key"}),
+                patch("raindian.__main__.RaindropClient.iter_raindrops", return_value=iter([item])),
+                patch("raindian.__main__.summarize_bookmark", return_value=summary),
+            ):
+                result = process_bookmarks(config, args)
+
+            new_path = destination / "日本語のタイトル - 123.md"
+            self.assertTrue(new_path.exists())
+            self.assertFalse(old_path.exists())
+
+        self.assertEqual(result, 0)
+
+    def test_no_llm_does_not_overwrite_an_existing_llm_note(self) -> None:
+        item = {"_id": 123, "title": "First", "link": "https://example.com/first", "collection": {}}
+
+        with TemporaryDirectory() as temp_dir:
+            destination = Path(temp_dir) / "Raindrop"
+            destination.mkdir()
+            existing = destination / "First - 123.md"
+            original = '---\nsummary_model: "gpt-5.6-luna"\n---\n\nLLM summary\n'
+            existing.write_text(original, encoding="utf-8")
+            config = Config(vault_path=temp_dir, sleep_seconds=0)
+            args = parse_args(["--no-llm", "--skip-page-fetch"])
+            with (
+                patch.dict(os.environ, {"RAINDROP_TOKEN": "token"}, clear=True),
+                patch("raindian.__main__.RaindropClient.iter_raindrops", return_value=iter([item])),
+            ):
+                result = process_bookmarks(config, args)
+
+            rendered = existing.read_text(encoding="utf-8")
+
+        self.assertEqual(result, 0)
+        self.assertEqual(rendered, original)
 
     def test_list_collections_accepts_null_parent(self) -> None:
         client = Mock()
@@ -121,6 +258,7 @@ class MainTests(unittest.TestCase):
 
         self.assertEqual(result, 0)
         self.assertEqual(record["raindrop_id"], 123)
+        self.assertEqual(record["operation"], "summarize")
         self.assertEqual(record["model"], "gpt-5.6-luna")
         self.assertEqual(record["input_tokens"], 120)
         self.assertEqual(record["cached_input_tokens"], 20)
@@ -134,6 +272,88 @@ class MainTests(unittest.TestCase):
         self.assertEqual(record["estimated_cost_usd"], 0.0000612)
         self.assertNotIn("url", record)
         self.assertNotIn("content", record)
+
+    def test_sync_raindrop_summaries_updates_only_the_managed_note_block(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            destination = Path(temp_dir) / "Raindrop"
+            destination.mkdir()
+            note = destination / "Japanese title - 123.md"
+            note.write_text(
+                "---\nraindrop_id: \"123\"\nsummary_model: \"gpt-5.6-luna\"\n---\n\n"
+                "# Japanese title\n\n## Summary\n\n日本語の要約です。\n",
+                encoding="utf-8",
+            )
+            config = Config(vault_path=temp_dir, sleep_seconds=0)
+            args = parse_args(["--sync-raindrop-summary"])
+            client = Mock()
+            client.get_raindrop.return_value = {"note": "My manual note"}
+
+            result = sync_raindrop_summaries(config, args, client)
+
+        self.assertEqual(result, 0)
+        client.update_raindrop_note.assert_called_once()
+        updated_note = client.update_raindrop_note.call_args.args[1]
+        self.assertIn("My manual note", updated_note)
+        self.assertIn("日本語の要約です。", updated_note)
+
+    def test_sync_raindrop_summaries_dry_run_does_not_call_raindrop(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            destination = Path(temp_dir) / "Raindrop"
+            destination.mkdir()
+            (destination / "Japanese title - 123.md").write_text(
+                "---\nraindrop_id: \"123\"\nsummary_model: \"gpt-5.6-luna\"\n---\n\n"
+                "## Summary\n\n日本語の要約です。\n",
+                encoding="utf-8",
+            )
+            config = Config(vault_path=temp_dir, sleep_seconds=0)
+            args = parse_args(["--sync-raindrop-summary", "--dry-run"])
+            client = Mock()
+
+            result = sync_raindrop_summaries(config, args, client)
+
+        self.assertEqual(result, 0)
+        client.get_raindrop.assert_not_called()
+        client.update_raindrop_note.assert_not_called()
+
+    def test_sync_raindrop_tags_appends_only_missing_non_base_tags(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            destination = Path(temp_dir) / "Raindrop"
+            destination.mkdir()
+            (destination / "Japanese title - 123.md").write_text(
+                "---\nraindrop_id: \"123\"\nraindrop_collection_id: \"5\"\n"
+                "summary_model: \"gpt-5.6-luna\"\ntags:\n  - \"raindrop\"\n"
+                "  - \"bookmark\"\n  - \"existing\"\n  - \"新規タグ\"\n"
+                "  - \"AI\"\n  - \"X\"\n  - \"SNS\"\n---\n",
+                encoding="utf-8",
+            )
+            config = Config(vault_path=temp_dir, sleep_seconds=0)
+            args = parse_args(["--sync-raindrop-tags"])
+            client = Mock()
+            client.get_raindrop.return_value = {"tags": ["existing"]}
+
+            result = sync_raindrop_tags(config, args, client)
+
+        self.assertEqual(result, 0)
+        client.append_raindrop_tags.assert_called_once_with(5, 123, ["新規タグ", "ai"])
+
+    def test_sync_raindrop_tags_dry_run_does_not_call_raindrop(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            destination = Path(temp_dir) / "Raindrop"
+            destination.mkdir()
+            (destination / "Japanese title - 123.md").write_text(
+                "---\nraindrop_id: \"123\"\nraindrop_collection_id: \"5\"\n"
+                "summary_model: \"gpt-5.6-luna\"\nllm_tags:\n  - \"新規タグ\"\n---\n",
+                encoding="utf-8",
+            )
+            config = Config(vault_path=temp_dir, sleep_seconds=0)
+            args = parse_args(["--sync-raindrop-tags", "--dry-run"])
+            client = Mock()
+
+            result = sync_raindrop_tags(config, args, client)
+
+        self.assertEqual(result, 0)
+        client.get_raindrop.assert_not_called()
+        client.append_raindrop_tags.assert_not_called()
 
     def test_dry_run_does_not_fetch_pages_or_call_openai(self) -> None:
         items = [{"_id": 1, "title": "First", "link": "https://example.com/first", "collection": {}}]
