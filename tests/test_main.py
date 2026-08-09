@@ -16,6 +16,7 @@ from raindian.__main__ import (
     process_bookmarks,
     sync_raindrop_tags,
     sync_raindrop_summaries,
+    usage_record_exists,
     write_note_atomically,
 )
 from raindian.config import Config
@@ -41,6 +42,18 @@ class MainTests(unittest.TestCase):
 
             self.assertEqual(target.read_text(encoding="utf-8"), "new")
             self.assertEqual(list(Path(temp_dir).glob("*.tmp")), [])
+
+    def test_usage_record_exists_matches_only_its_transaction_id(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            destination = Path(temp_dir) / "Raindrop"
+            destination.mkdir()
+            (destination / ".raindian-usage.jsonl").write_text(
+                '{"transaction_id":"txn-a"}\nnot-json\n',
+                encoding="utf-8",
+            )
+
+            self.assertTrue(usage_record_exists(destination, "txn-a"))
+            self.assertFalse(usage_record_exists(destination, "txn-b"))
 
     def test_existing_note_for_item_uses_raindrop_id_suffix(self) -> None:
         with TemporaryDirectory() as temp_dir:

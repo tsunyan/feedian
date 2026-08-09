@@ -245,8 +245,7 @@ def write_note_atomically(target: Path, markdown: str) -> None:
         raise
 
 
-def append_usage_record(
-    destination: Path,
+def build_usage_record(
     item: dict[str, Any],
     model: str,
     reasoning_effort: str,
@@ -254,9 +253,11 @@ def append_usage_record(
     usage: dict[str, Any],
     price: ModelPrice | None,
     price_source: str,
-) -> None:
-    record = {
+    transaction_id: str | None = None,
+) -> dict[str, Any]:
+    return {
         "recorded_at": datetime.now(timezone.utc).isoformat(),
+        "transaction_id": transaction_id or str(uuid.uuid4()),
         "operation": "summarize",
         "raindrop_id": item.get("_id"),
         "model": model,
@@ -274,8 +275,26 @@ def append_usage_record(
         "output_per_million_usd": price.output_per_million if price else None,
         "estimated_cost_usd": usage_cost_usd(usage, price) if price else None,
     }
+
+
+def append_usage_record(destination: Path, record: dict[str, Any]) -> None:
     with (destination / ".raindian-usage.jsonl").open("a", encoding="utf-8", newline="\n") as usage_file:
         usage_file.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+
+def usage_record_exists(destination: Path, transaction_id: str) -> bool:
+    usage_path = destination / ".raindian-usage.jsonl"
+    if not usage_path.exists():
+        return False
+    with usage_path.open(encoding="utf-8") as usage_file:
+        for line in usage_file:
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(record, dict) and record.get("transaction_id") == transaction_id:
+                return True
+    return False
 
 
 def usage_output_ratio(
@@ -465,8 +484,7 @@ def process_bookmarks(config: Config, args: argparse.Namespace) -> int:
             created += 1
             if isinstance(usage, dict):
                 try:
-                    append_usage_record(
-                        destination=destination,
+                    usage_record = build_usage_record(
                         item=item,
                         model=model,
                         reasoning_effort=config.openai_reasoning_effort,
@@ -474,6 +492,10 @@ def process_bookmarks(config: Config, args: argparse.Namespace) -> int:
                         usage=usage,
                         price=usage_price,
                         price_source=usage_price_source,
+                    )
+                    append_usage_record(
+                        destination=destination,
+                        record=usage_record,
                     )
                 except OSError as exc:
                     print(f"  usage log warning: {exc}")
