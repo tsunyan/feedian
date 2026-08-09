@@ -10,7 +10,7 @@ import uuid
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable, Iterator, TypeVar
 
 from .config import Config, load_config
 from .estimate import (
@@ -27,12 +27,14 @@ from .estimate import (
 from .extract import PageFetchResult, fetch_page_text
 from .llm import SUMMARY_INSTRUCTIONS, USAGE_FIELD, build_prompt, summarize_bookmark
 from .markdown import normalize_tag, note_filename, render_note, upsert_raindrop_summary
+from .progress import PROGRESS_MODES, ProgressReporter
 from .raindrop import RaindropClient
 from .recovery import PendingTransaction, load_pending, remove_pending, save_pending
 
 
 NON_CONTENT_TAGS = frozenset({"x", "sns"})
 PENDING_STATE_ROOT = Path.home() / ".raindian" / "pending"
+T = TypeVar("T")
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -92,6 +94,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="Append LLM tags from existing notes to the matching Raindrop items.",
     )
+    parser.add_argument(
+        "--progress",
+        choices=PROGRESS_MODES,
+        default="auto",
+        help="Progress display mode: auto, rich, plain, or off (default: auto).",
+    )
+    parser.add_argument("--verbose", action="store_true", help="Show per-bookmark processing details.")
     return parser.parse_args(argv)
 
 
@@ -225,24 +234,50 @@ def note_preference_key(note_path: Path) -> tuple[bool, float, float, str]:
 def unique_note_candidates(
     note_paths: list[Path],
     candidate_for_path: Callable[[Path], tuple[Any, ...] | None],
+    on_path: Callable[[], None] | None = None,
 ) -> tuple[list[tuple[Path, tuple[Any, ...]]], int]:
     candidates: dict[int, tuple[Path, tuple[Any, ...]]] = {}
     skipped = 0
     for note_path in note_paths:
-        candidate = candidate_for_path(note_path)
-        if candidate is None:
-            skipped += 1
-            continue
-        raindrop_id = candidate[0]
-        if not isinstance(raindrop_id, int):
-            skipped += 1
-            continue
-        current = candidates.get(raindrop_id)
-        if current is None or note_preference_key(note_path) > note_preference_key(current[0]):
-            candidates[raindrop_id] = (note_path, candidate)
-        if current is not None:
-            skipped += 1
+        try:
+            candidate = candidate_for_path(note_path)
+            if candidate is None:
+                skipped += 1
+                continue
+            raindrop_id = candidate[0]
+            if not isinstance(raindrop_id, int):
+                skipped += 1
+                continue
+            current = candidates.get(raindrop_id)
+            if current is None or note_preference_key(note_path) > note_preference_key(current[0]):
+                candidates[raindrop_id] = (note_path, candidate)
+            if current is not None:
+                skipped += 1
+        finally:
+            if on_path is not None:
+                on_path()
     return sorted(candidates.values(), key=lambda entry: entry[0].name), skipped
+
+
+def tracked_items(items: Iterable[T], reporter: ProgressReporter | None) -> Iterator[T]:
+    for item in items:
+        try:
+            yield item
+        finally:
+            if reporter is not None:
+                reporter.advance()
+
+
+def report(reporter: ProgressReporter | None, message: str, *, verbose: bool = False) -> None:
+    if reporter is None:
+        print(message)
+    elif verbose:
+        if reporter.verbose:
+            reporter.log(message)
+    elif reporter.mode == "off":
+        print(message)
+    else:
+        reporter.log(message)
 
 
 def has_llm_summary(note_path: Path) -> bool:
@@ -407,7 +442,11 @@ def _non_negative_int(value: Any) -> int | None:
     return value if isinstance(value, int) and value >= 0 else None
 
 
-def process_bookmarks(config: Config, args: argparse.Namespace) -> int:
+def process_bookmarks(
+    config: Config,
+    args: argparse.Namespace,
+    reporter: ProgressReporter | None = None,
+) -> int:
     started_at = time.perf_counter()
     raindrop_token = require_env("RAINDROP_TOKEN")
     openai_key = "" if args.no_llm or args.dry_run else require_env("OPENAI_API_KEY")
@@ -458,12 +497,18 @@ def process_bookmarks(config: Config, args: argparse.Namespace) -> int:
     if args.dry_run:
         print("dry-run: page fetching and OpenAI calls are disabled")
 
-    for item in client.iter_raindrops(
+    items: Iterable[dict[str, Any]] = client.iter_raindrops(
         collection_id=config.collection_id,
         per_page=config.per_page,
         nested=config.nested,
         limit=args.limit,
-    ):
+    )
+    if reporter is not None:
+        reporter.start_task("process: collecting Raindrop bookmarks")
+        items = list(tracked_items(items, reporter))
+        reporter.start_task("process: generating Obsidian notes", total=len(items))
+
+    for item in tracked_items(items, reporter):
         processed += 1
         existing = existing_note_for_item(destination, item)
         target = existing or (destination / note_filename(item))
@@ -473,25 +518,25 @@ def process_bookmarks(config: Config, args: argparse.Namespace) -> int:
                 try:
                     renamed_path = rename_existing_note(existing_path, destination, item)
                 except Exception as exc:
-                    print(f"  rename warning: {exc}")
+                    report(reporter, f"  rename warning: {exc}")
                     failed += 1
                 else:
                     if renamed_path == existing_path:
-                        print(f"skip existing: {existing_path}")
+                        report(reporter, f"skip existing: {existing_path}", verbose=True)
                     else:
-                        print(f"rename: {existing_path.name} -> {renamed_path.name}")
+                        report(reporter, f"rename: {existing_path.name} -> {renamed_path.name}", verbose=True)
                         renamed += 1
                     skipped += 1
                 continue
             if should_upgrade_note(existing_path, args):
-                print(f"upgrade no-llm note: {existing_path}")
+                report(reporter, f"upgrade no-llm note: {existing_path}", verbose=True)
                 target = existing_path
             else:
-                print(f"skip existing: {existing_path}")
+                report(reporter, f"skip existing: {existing_path}", verbose=True)
                 skipped += 1
                 continue
 
-        print(f"process: {item.get('title') or item.get('link')}")
+        report(reporter, f"process: {item.get('title') or item.get('link')}", verbose=True)
         page = PageFetchResult(url=item.get("link", ""), text="", title="", error=None)
         if not args.dry_run and not args.skip_page_fetch and item.get("link"):
             page = fetch_page_text(
@@ -501,7 +546,7 @@ def process_bookmarks(config: Config, args: argparse.Namespace) -> int:
                 allow_private_urls=config.allow_private_urls,
             )
             if page.error:
-                print(f"  page fetch warning: {page.error}")
+                report(reporter, f"  page fetch warning: {page.error}", verbose=True)
 
         if args.no_llm or args.dry_run:
             summary = fallback_summary(item, page)
@@ -509,7 +554,7 @@ def process_bookmarks(config: Config, args: argparse.Namespace) -> int:
             try:
                 ensure_usage_log_readable(destination)
             except OSError as exc:
-                print(f"  vault unavailable before OpenAI request: {exc}")
+                report(reporter, f"  vault unavailable before OpenAI request: {exc}")
                 failed += 1
                 break
             try:
@@ -526,7 +571,7 @@ def process_bookmarks(config: Config, args: argparse.Namespace) -> int:
                     retry_base_seconds=config.retry_base_seconds,
                 )
             except Exception as exc:
-                print(f"  summary warning: {exc}")
+                report(reporter, f"  summary warning: {exc}")
                 failed += 1
                 continue
         usage = summary.pop(USAGE_FIELD, None)
@@ -538,12 +583,12 @@ def process_bookmarks(config: Config, args: argparse.Namespace) -> int:
             renamed_target = destination / note_filename(item, title=str(summary.get("note_title") or ""))
             if renamed_target != existing:
                 if renamed_target.exists():
-                    print(f"  rename warning: rename target already exists: {renamed_target}")
+                    report(reporter, f"  rename warning: rename target already exists: {renamed_target}")
                     failed += 1
                     continue
                 target = renamed_target
                 rename_source = existing
-        print(f"  note: {target}")
+        report(reporter, f"  note: {target}", verbose=True)
 
         markdown = render_note(
             item=item,
@@ -573,16 +618,16 @@ def process_bookmarks(config: Config, args: argparse.Namespace) -> int:
             try:
                 save_pending(destination, transaction, state_root=PENDING_STATE_ROOT)
             except OSError as exc:
-                print(f"  pending recovery warning: {exc}")
+                report(reporter, f"  pending recovery warning: {exc}")
                 failed += 1
                 break
         if args.dry_run:
-            print(f"  dry-run: would write {len(markdown)} characters")
+            report(reporter, f"  dry-run: would write {len(markdown)} characters", verbose=True)
         else:
             try:
                 write_note_atomically(target, markdown)
             except Exception as exc:
-                print(f"  write warning: {exc}")
+                report(reporter, f"  write warning: {exc}")
                 failed += 1
                 break
             if rename_source is not None:
@@ -590,7 +635,7 @@ def process_bookmarks(config: Config, args: argparse.Namespace) -> int:
                     rename_source.unlink()
                     renamed += 1
                 except OSError as exc:
-                    print(f"  rename warning: could not remove old note: {exc}")
+                    report(reporter, f"  rename warning: could not remove old note: {exc}")
                     failed += 1
             created += 1
             if usage_record is not None:
@@ -600,13 +645,13 @@ def process_bookmarks(config: Config, args: argparse.Namespace) -> int:
                         record=usage_record,
                     )
                 except OSError as exc:
-                    print(f"  usage log warning: {exc}")
+                    report(reporter, f"  usage log warning: {exc}")
                     failed += 1
                     break
                 try:
                     remove_pending(destination, state_root=PENDING_STATE_ROOT)
                 except OSError as exc:
-                    print(f"  pending recovery warning: {exc}")
+                    report(reporter, f"  pending recovery warning: {exc}")
                     failed += 1
                     break
 
@@ -614,36 +659,52 @@ def process_bookmarks(config: Config, args: argparse.Namespace) -> int:
             time.sleep(config.sleep_seconds)
 
     elapsed_seconds = time.perf_counter() - started_at
-    print(
+    report(
+        reporter,
         f"done: processed={processed} created={created} renamed={renamed} skipped={skipped} "
         f"failed={failed} elapsed={elapsed_seconds:.1f}s"
     )
     return 1 if failed else 0
 
 
-def sync_raindrop_summaries(config: Config, args: argparse.Namespace, client: RaindropClient | None) -> int:
+def sync_raindrop_summaries(
+    config: Config,
+    args: argparse.Namespace,
+    client: RaindropClient | None,
+    reporter: ProgressReporter | None = None,
+) -> int:
     started_at = time.perf_counter()
     destination = output_dir(config)
     if not destination.exists():
         print(f"sync: no output folder: {destination}")
         return 0
-    print(f"sync: request_interval={config.sync_request_interval_seconds:.1f}s")
+    report(reporter, f"sync: request_interval={config.sync_request_interval_seconds:.1f}s")
 
     planned = 0
     updated = 0
     skipped = 0
     failed = 0
+    note_paths = sorted(destination.glob("* - *.md"))
+    if reporter is not None:
+        reporter.start_task("sync: scanning Obsidian notes", total=len(note_paths))
     candidates, skipped = unique_note_candidates(
-        sorted(destination.glob("* - *.md")), summary_sync_candidate
+        note_paths,
+        summary_sync_candidate,
+        reporter.advance if reporter is not None else None,
     )
-    for note_path, candidate in candidates:
+    if reporter is not None:
+        reporter.start_task(
+            "sync: updating Raindrop notes",
+            total=min(len(candidates), args.limit) if args.limit is not None else len(candidates),
+        )
+    for note_path, candidate in tracked_items(candidates, reporter):
         raindrop_id, summary = candidate
         if args.limit is not None and planned >= args.limit:
             break
         planned += 1
-        print(f"sync: {note_path.name} -> raindrop_id={raindrop_id}")
+        report(reporter, f"sync: {note_path.name} -> raindrop_id={raindrop_id}", verbose=True)
         if args.dry_run:
-            print("  dry-run: would update Raindrop note")
+            report(reporter, "  dry-run: would update Raindrop note", verbose=True)
             continue
         if client is None:
             raise RuntimeError("Raindrop client is required when applying summary sync.")
@@ -653,17 +714,18 @@ def sync_raindrop_summaries(config: Config, args: argparse.Namespace, client: Ra
             original_note = original_note if isinstance(original_note, str) else ""
             updated_note = upsert_raindrop_summary(original_note, summary)
             if updated_note == original_note:
-                print("  sync: unchanged")
+                report(reporter, "  sync: unchanged", verbose=True)
                 continue
             if len(updated_note) > 10_000:
                 raise ValueError("updated Raindrop note exceeds the 10,000-character limit")
             client.update_raindrop_note(raindrop_id, updated_note)
             updated += 1
         except Exception as exc:
-            print(f"  sync warning: {exc}")
+            report(reporter, f"  sync warning: {exc}")
             failed += 1
     elapsed_seconds = time.perf_counter() - started_at
-    print(
+    report(
+        reporter,
         f"done: sync_planned={planned} sync_updated={updated} skipped={skipped} "
         f"failed={failed} elapsed={elapsed_seconds:.1f}s"
     )
@@ -689,30 +751,48 @@ def summary_sync_candidate(note_path: Path) -> tuple[int, str] | None:
     return (raindrop_id, summary) if summary else None
 
 
-def sync_raindrop_tags(config: Config, args: argparse.Namespace, client: RaindropClient | None) -> int:
+def sync_raindrop_tags(
+    config: Config,
+    args: argparse.Namespace,
+    client: RaindropClient | None,
+    reporter: ProgressReporter | None = None,
+) -> int:
     started_at = time.perf_counter()
     destination = output_dir(config)
     if not destination.exists():
         print(f"sync-tags: no output folder: {destination}")
         return 0
-    print(f"sync-tags: request_interval={config.sync_request_interval_seconds:.1f}s")
+    report(reporter, f"sync-tags: request_interval={config.sync_request_interval_seconds:.1f}s")
 
     planned = 0
     updated = 0
     skipped = 0
     failed = 0
+    note_paths = sorted(destination.glob("* - *.md"))
+    if reporter is not None:
+        reporter.start_task("sync-tags: scanning Obsidian notes", total=len(note_paths))
     candidates, skipped = unique_note_candidates(
-        sorted(destination.glob("* - *.md")),
+        note_paths,
         lambda note_path: tag_sync_candidate(note_path, config.base_tags or []),
+        reporter.advance if reporter is not None else None,
     )
-    for note_path, candidate in candidates:
+    if reporter is not None:
+        reporter.start_task(
+            "sync-tags: updating Raindrop tags",
+            total=min(len(candidates), args.limit) if args.limit is not None else len(candidates),
+        )
+    for note_path, candidate in tracked_items(candidates, reporter):
         raindrop_id, collection_id, note_tags = candidate
         if args.limit is not None and planned >= args.limit:
             break
         planned += 1
         if args.dry_run:
-            print(f"sync-tags: {note_path.name} -> raindrop_id={raindrop_id} tags={note_tags}")
-            print("  dry-run: would append Raindrop tags")
+            report(
+                reporter,
+                f"sync-tags: {note_path.name} -> raindrop_id={raindrop_id} tags={note_tags}",
+                verbose=True,
+            )
+            report(reporter, "  dry-run: would append Raindrop tags", verbose=True)
             continue
         if client is None:
             raise RuntimeError("Raindrop client is required when applying tag sync.")
@@ -725,16 +805,21 @@ def sync_raindrop_tags(config: Config, args: argparse.Namespace, client: Raindro
             }
             missing_tags = [tag for tag in note_tags if tag not in existing_tags]
             if not missing_tags:
-                print(f"sync-tags: {note_path.name} -> unchanged")
+                report(reporter, f"sync-tags: {note_path.name} -> unchanged", verbose=True)
                 continue
-            print(f"sync-tags: {note_path.name} -> raindrop_id={raindrop_id} tags={missing_tags}")
+            report(
+                reporter,
+                f"sync-tags: {note_path.name} -> raindrop_id={raindrop_id} tags={missing_tags}",
+                verbose=True,
+            )
             client.append_raindrop_tags(collection_id, raindrop_id, missing_tags)
             updated += 1
         except Exception as exc:
-            print(f"  sync-tags warning: {exc}")
+            report(reporter, f"  sync-tags warning: {exc}")
             failed += 1
     elapsed_seconds = time.perf_counter() - started_at
-    print(
+    report(
+        reporter,
         f"done: tag_sync_planned={planned} tag_sync_updated={updated} skipped={skipped} "
         f"failed={failed} elapsed={elapsed_seconds:.1f}s"
     )
@@ -823,22 +908,32 @@ def _normalized_unique_tags(tags: list[str]) -> list[str]:
     return normalized_tags
 
 
-def estimate_bookmarks(config: Config, args: argparse.Namespace) -> int:
+def estimate_bookmarks(
+    config: Config,
+    args: argparse.Namespace,
+    reporter: ProgressReporter | None = None,
+) -> int:
     started_at = time.perf_counter()
     raindrop_token = require_env("RAINDROP_TOKEN")
     model = os.environ.get("OPENAI_MODEL", config.openai_model)
-    _estimate_progress("phase=refreshing-model-prices")
+    _estimate_progress("phase=refreshing-model-prices", reporter)
+    if reporter is not None:
+        reporter.start_task("estimate: refreshing model prices", total=1)
     price_refresh = refresh_model_prices(model, timeout_seconds=min(config.request_timeout_seconds, 10))
-    print(f"estimate: price_source={price_refresh.source} url=https://developers.openai.com/api/docs/models")
+    if reporter is not None:
+        reporter.advance()
+    report(reporter, f"estimate: price_source={price_refresh.source} url=https://developers.openai.com/api/docs/models")
     if price_refresh.warning:
-        print(f"estimate: price_refresh_warning={price_refresh.warning}")
+        report(reporter, f"estimate: price_refresh_warning={price_refresh.warning}")
     client = RaindropClient(
         token=raindrop_token,
         timeout_seconds=config.request_timeout_seconds,
         max_retries=config.max_retries,
         retry_base_seconds=config.retry_base_seconds,
     )
-    _estimate_progress("phase=collecting-bookmarks")
+    _estimate_progress("phase=collecting-bookmarks", reporter)
+    if reporter is not None:
+        reporter.start_task("estimate: collecting Raindrop bookmarks")
     items: list[dict[str, Any]] = []
     for item in client.iter_raindrops(
         collection_id=config.collection_id,
@@ -847,28 +942,34 @@ def estimate_bookmarks(config: Config, args: argparse.Namespace) -> int:
         limit=args.limit,
     ):
         items.append(item)
+        if reporter is not None:
+            reporter.advance()
         if len(items) % config.per_page == 0:
-            _estimate_progress(f"collected={len(items)}")
-    _estimate_progress(f"phase=sampling collected={len(items)}")
+            _estimate_progress(f"collected={len(items)}", reporter)
+    _estimate_progress(f"phase=sampling collected={len(items)}", reporter)
     population = len(items)
     if population == 0:
-        print("estimate: target=0")
+        report(reporter, "estimate: target=0")
         return 0
     sample_size = parse_sample_size(args.estimate_sample_size, population)
     if sample_size == 0:
-        _estimate_progress("phase=calculating-costs count-only=true")
-        _print_count_only_estimate(population, config.max_output_tokens, model, price_refresh.prices)
-        _print_elapsed(started_at)
+        _estimate_progress("phase=calculating-costs count-only=true", reporter)
+        _print_count_only_estimate(population, config.max_output_tokens, model, price_refresh.prices, reporter)
+        _print_elapsed(started_at, reporter)
         return 0
 
     samples = select_sample(items, sample_size)
-    _estimate_progress(f"phase=fetching-pages sample={len(samples)}")
+    _estimate_progress(f"phase=fetching-pages sample={len(samples)}", reporter)
+    if reporter is not None:
+        reporter.start_task("estimate: fetching sample pages", total=len(samples))
     token_counts: list[int] = []
     failures: Counter[str] = Counter()
     tokenizer_fallbacks: set[str] = set()
     for sample_index, item in enumerate(samples, start=1):
-        _estimate_progress(
-            f"fetching={sample_index}/{len(samples)} bookmark={_estimate_bookmark_label(item)}"
+        report(
+            reporter,
+            f"estimate: fetching={sample_index}/{len(samples)} bookmark={_estimate_bookmark_label(item)}",
+            verbose=True,
         )
         url = item.get("link")
         page = PageFetchResult(url=url if isinstance(url, str) else "", text="", title="", error=None)
@@ -888,32 +989,38 @@ def estimate_bookmarks(config: Config, args: argparse.Namespace) -> int:
         token_counts.append(token_count)
         if fallback:
             tokenizer_fallbacks.add(fallback)
+        if reporter is not None:
+            reporter.advance()
 
     if not token_counts:
-        print(f"estimate: target={population} sample={len(samples)} sampled=0 failed={sum(failures.values())}")
+        report(reporter, f"estimate: target={population} sample={len(samples)} sampled=0 failed={sum(failures.values())}")
         for reason, count in failures.most_common():
-            print(f"  page fetch failure: {count} x {reason}")
-        _print_elapsed(started_at)
+            report(reporter, f"  page fetch failure: {count} x {reason}")
+        _print_elapsed(started_at, reporter)
         return 1
 
     mean_tokens = sum(token_counts) / len(token_counts)
     projected_input_tokens = population * mean_tokens
-    print(
+    report(
+        reporter,
         f"estimate: target={population} sample={len(samples)} sampled={len(token_counts)} "
         f"failed={sum(failures.values())}"
     )
     if args.skip_page_fetch:
-        print("estimate: page_fetch=skipped")
-    print(
+        report(reporter, "estimate: page_fetch=skipped")
+    report(
+        reporter,
         f"estimate: mean_input_tokens={mean_tokens:.0f} "
         f"projected_input_tokens={projected_input_tokens:.0f} "
         f"max_output_tokens={config.max_output_tokens}"
     )
     for encoding_name in sorted(tokenizer_fallbacks):
-        print(f"estimate: tokenizer fallback={encoding_name}")
+        report(reporter, f"estimate: tokenizer fallback={encoding_name}")
     for reason, count in failures.most_common():
-        print(f"  page fetch failure: {count} x {reason}")
-    _estimate_progress("phase=calculating-costs")
+        report(reporter, f"  page fetch failure: {count} x {reason}")
+    _estimate_progress("phase=calculating-costs", reporter)
+    if reporter is not None:
+        reporter.start_task("estimate: calculating costs", total=1)
     historical_usage = usage_output_ratio(
         output_dir(config),
         model,
@@ -922,13 +1029,14 @@ def estimate_bookmarks(config: Config, args: argparse.Namespace) -> int:
     if historical_usage:
         output_ratio, usage_records = historical_usage
         typical_output_tokens = min(mean_tokens * output_ratio, config.max_output_tokens)
-        print(
+        report(
+            reporter,
             f"estimate: assumed_output_tokens={typical_output_tokens:.0f} "
             f"(usage-ratio records={usage_records})"
         )
     else:
         typical_output_tokens = min(mean_tokens, config.max_output_tokens)
-        print(f"estimate: assumed_output_tokens={typical_output_tokens:.0f} (input-matched)")
+        report(reporter, f"estimate: assumed_output_tokens={typical_output_tokens:.0f} (input-matched)")
     maximum_rows = projected_costs(
         population,
         mean_tokens,
@@ -946,8 +1054,10 @@ def estimate_bookmarks(config: Config, args: argparse.Namespace) -> int:
         selected_model=model,
         typical_rows=typical_rows,
     ):
-        print(line)
-    _print_elapsed(started_at)
+        report(reporter, line)
+    if reporter is not None:
+        reporter.advance()
+    _print_elapsed(started_at, reporter)
     return 0
 
 
@@ -956,29 +1066,33 @@ def _print_count_only_estimate(
     max_output_tokens: int,
     selected_model: str,
     prices: tuple[ModelPrice, ...],
+    reporter: ProgressReporter | None = None,
 ) -> None:
     lower = projected_costs(population, 2_000, max_output_tokens, prices)
     upper = projected_costs(population, 10_000, max_output_tokens, prices)
-    print(
+    report(
+        reporter,
         f"estimate: target={population} sample=0 count-only=true "
         "input_tokens_per_item=2000-10000 (generic range)"
     )
-    print(f"estimate: max_output_tokens={max_output_tokens}")
+    report(reporter, f"estimate: max_output_tokens={max_output_tokens}")
     selected_pricing_model = comparison_model(selected_model)
     if not any(row.model == selected_pricing_model for row in lower):
-        print(f"selected model: {selected_model} (not in comparison table)")
-    print("model\ttotal (max)")
+        report(reporter, f"selected model: {selected_model} (not in comparison table)")
+    report(reporter, "model\ttotal (max)")
     for lower_row, upper_row in zip(lower, upper):
         selected = " [selected]" if lower_row.model == selected_pricing_model else ""
-        print(f"{lower_row.name}{selected}\t${lower_row.total_cost:.2f}-${upper_row.total_cost:.2f}")
+        report(reporter, f"{lower_row.name}{selected}\t${lower_row.total_cost:.2f}-${upper_row.total_cost:.2f}")
 
 
-def _print_elapsed(started_at: float) -> None:
-    print(f"done: elapsed={time.perf_counter() - started_at:.1f}s")
+def _print_elapsed(started_at: float, reporter: ProgressReporter | None = None) -> None:
+    report(reporter, f"done: elapsed={time.perf_counter() - started_at:.1f}s")
 
 
-def _estimate_progress(message: str) -> None:
-    print(f"estimate: {message}", flush=True)
+def _estimate_progress(message: str, reporter: ProgressReporter | None = None) -> None:
+    if reporter is not None and reporter.mode == "off":
+        return
+    report(reporter, f"estimate: {message}")
 
 
 def _estimate_bookmark_label(item: dict[str, Any]) -> str:
@@ -997,6 +1111,7 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError("Choose either --sync-raindrop-summary or --sync-raindrop-tags.")
         if args.estimate and (args.dry_run or args.list_collections or sync_actions):
             raise ValueError("--estimate cannot be combined with --dry-run, --list-collections, or sync options.")
+        reporter = ProgressReporter(args.progress, verbose=args.verbose)
         if args.list_collections:
             raindrop_token = require_env("RAINDROP_TOKEN")
             client = RaindropClient(
@@ -1007,33 +1122,34 @@ def main(argv: list[str] | None = None) -> int:
             )
             list_collections(client)
             return 0
-        if args.estimate:
-            return estimate_bookmarks(config, args)
-        if args.sync_raindrop_summary:
-            if args.dry_run:
-                return sync_raindrop_summaries(config, args, client=None)
-            raindrop_token = require_env("RAINDROP_TOKEN")
-            client = RaindropClient(
-                token=raindrop_token,
-                timeout_seconds=config.request_timeout_seconds,
-                max_retries=config.max_retries,
-                retry_base_seconds=config.retry_base_seconds,
-                request_interval_seconds=config.sync_request_interval_seconds,
-            )
-            return sync_raindrop_summaries(config, args, client)
-        if args.sync_raindrop_tags:
-            if args.dry_run:
-                return sync_raindrop_tags(config, args, client=None)
-            raindrop_token = require_env("RAINDROP_TOKEN")
-            client = RaindropClient(
-                token=raindrop_token,
-                timeout_seconds=config.request_timeout_seconds,
-                max_retries=config.max_retries,
-                retry_base_seconds=config.retry_base_seconds,
-                request_interval_seconds=config.sync_request_interval_seconds,
-            )
-            return sync_raindrop_tags(config, args, client)
-        return process_bookmarks(config, args)
+        with reporter:
+            if args.estimate:
+                return estimate_bookmarks(config, args, reporter)
+            if args.sync_raindrop_summary:
+                if args.dry_run:
+                    return sync_raindrop_summaries(config, args, client=None, reporter=reporter)
+                raindrop_token = require_env("RAINDROP_TOKEN")
+                client = RaindropClient(
+                    token=raindrop_token,
+                    timeout_seconds=config.request_timeout_seconds,
+                    max_retries=config.max_retries,
+                    retry_base_seconds=config.retry_base_seconds,
+                    request_interval_seconds=config.sync_request_interval_seconds,
+                )
+                return sync_raindrop_summaries(config, args, client, reporter)
+            if args.sync_raindrop_tags:
+                if args.dry_run:
+                    return sync_raindrop_tags(config, args, client=None, reporter=reporter)
+                raindrop_token = require_env("RAINDROP_TOKEN")
+                client = RaindropClient(
+                    token=raindrop_token,
+                    timeout_seconds=config.request_timeout_seconds,
+                    max_retries=config.max_retries,
+                    retry_base_seconds=config.retry_base_seconds,
+                    request_interval_seconds=config.sync_request_interval_seconds,
+                )
+                return sync_raindrop_tags(config, args, client, reporter)
+            return process_bookmarks(config, args, reporter)
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

@@ -23,6 +23,7 @@ from raindian.config import Config
 from raindian.estimate import MODEL_PRICES, PriceRefresh
 from raindian.extract import PageFetchResult
 from raindian.recovery import PendingTransaction, load_pending, save_pending
+from raindian.progress import ProgressReporter
 
 
 class MainTests(unittest.TestCase):
@@ -216,6 +217,12 @@ class MainTests(unittest.TestCase):
             existing = path / "Old title - 123.md"
             existing.write_text("", encoding="utf-8")
             self.assertEqual(existing_note_for_item(path, {"_id": 123}), existing)
+
+    def test_parse_args_accepts_progress_controls(self) -> None:
+        args = parse_args(["--progress", "plain", "--verbose"])
+
+        self.assertEqual(args.progress, "plain")
+        self.assertTrue(args.verbose)
 
     def test_existing_note_for_item_prefers_the_newest_llm_summary(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -506,6 +513,28 @@ class MainTests(unittest.TestCase):
         self.assertEqual(result, 0)
         client.get_raindrop.assert_not_called()
         client.update_raindrop_note.assert_not_called()
+
+    def test_sync_raindrop_summaries_reports_scan_and_update_progress(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            destination = Path(temp_dir) / "Raindrop"
+            destination.mkdir()
+            (destination / "Japanese title - 123.md").write_text(
+                "---\nraindrop_id: \"123\"\nsummary_model: \"gpt-5.6-luna\"\n---\n\n"
+                "## Summary\n\n日本語の要約です。\n",
+                encoding="utf-8",
+            )
+            config = Config(vault_path=temp_dir, sleep_seconds=0)
+            args = parse_args(["--sync-raindrop-summary", "--dry-run"])
+            output = StringIO()
+            reporter = ProgressReporter("plain", stream=output)
+
+            with reporter:
+                result = sync_raindrop_summaries(config, args, client=None, reporter=reporter)
+
+        self.assertEqual(result, 0)
+        self.assertIn("sync: scanning Obsidian notes 0/1", output.getvalue())
+        self.assertIn("sync: scanning Obsidian notes 1/1", output.getvalue())
+        self.assertIn("sync: updating Raindrop notes 1/1", output.getvalue())
 
     def test_sync_raindrop_tags_appends_only_missing_non_base_tags(self) -> None:
         with TemporaryDirectory() as temp_dir:
