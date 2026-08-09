@@ -22,6 +22,7 @@ from raindian.__main__ import (
 from raindian.config import Config
 from raindian.estimate import MODEL_PRICES, PriceRefresh
 from raindian.extract import PageFetchResult
+from raindian.recovery import PendingTransaction, load_pending, save_pending
 
 
 class MainTests(unittest.TestCase):
@@ -54,6 +55,160 @@ class MainTests(unittest.TestCase):
 
             self.assertTrue(usage_record_exists(destination, "txn-a"))
             self.assertFalse(usage_record_exists(destination, "txn-b"))
+
+    def test_unreadable_usage_log_stops_before_openai(self) -> None:
+        item = {"_id": 1, "title": "First", "link": "https://example.com/first", "collection": {}}
+
+        with TemporaryDirectory() as temp_dir:
+            config = Config(vault_path=temp_dir, sleep_seconds=0)
+            args = parse_args(["--skip-page-fetch"])
+            with (
+                patch.dict(os.environ, {"RAINDROP_TOKEN": "token", "OPENAI_API_KEY": "key"}),
+                patch("raindian.__main__.RaindropClient.iter_raindrops", return_value=iter([item])),
+                patch(
+                    "raindian.__main__.ensure_usage_log_readable",
+                    side_effect=OSError("drive offline"),
+                    create=True,
+                ),
+                patch("raindian.__main__.summarize_bookmark") as summarize,
+            ):
+                result = process_bookmarks(config, args)
+
+        self.assertEqual(result, 1)
+        summarize.assert_not_called()
+
+    def test_markdown_failure_stops_and_leaves_one_pending_transaction(self) -> None:
+        items = [
+            {"_id": 1, "title": "First", "link": "https://example.com/first", "collection": {}},
+            {"_id": 2, "title": "Second", "link": "https://example.com/second", "collection": {}},
+        ]
+        summary = {
+            "note_title": "First",
+            "summary": "ok",
+            "key_points": [],
+            "tags": [],
+            "content_type": "link",
+            "_raindian_usage": {"input_tokens": 10, "output_tokens": 2, "total_tokens": 12},
+        }
+
+        with TemporaryDirectory() as temp_dir:
+            destination = Path(temp_dir) / "Raindrop"
+            state_root = Path(temp_dir) / "state"
+            config = Config(vault_path=temp_dir, sleep_seconds=0)
+            args = parse_args(["--skip-page-fetch"])
+            with (
+                patch.dict(os.environ, {"RAINDROP_TOKEN": "token", "OPENAI_API_KEY": "key"}),
+                patch("raindian.__main__.PENDING_STATE_ROOT", state_root, create=True),
+                patch("raindian.__main__.RaindropClient.iter_raindrops", return_value=iter(items)),
+                patch("raindian.__main__.summarize_bookmark", return_value=summary) as summarize,
+                patch("raindian.__main__.write_note_atomically", side_effect=OSError("drive offline")),
+            ):
+                result = process_bookmarks(config, args)
+
+            pending = load_pending(destination, state_root=state_root)
+
+        self.assertEqual(result, 1)
+        self.assertEqual(summarize.call_count, 1)
+        self.assertIsNotNone(pending)
+
+    def test_pending_transaction_is_recovered_without_another_openai_request(self) -> None:
+        item = {"_id": 123, "title": "First", "link": "https://example.com/first", "collection": {}}
+
+        with TemporaryDirectory() as temp_dir:
+            destination = Path(temp_dir) / "Raindrop"
+            state_root = Path(temp_dir) / "state"
+            transaction = PendingTransaction(
+                transaction_id="txn-1",
+                target=destination / "First - 123.md",
+                markdown='---\nsummary_model: "gpt-5.6-luna"\n---\n\nRecovered\n',
+                usage_record={"transaction_id": "txn-1", "raindrop_id": 123},
+            )
+            save_pending(destination, transaction, state_root=state_root)
+            config = Config(vault_path=temp_dir, sleep_seconds=0)
+            args = parse_args(["--skip-page-fetch"])
+            with (
+                patch.dict(os.environ, {"RAINDROP_TOKEN": "token", "OPENAI_API_KEY": "key"}),
+                patch("raindian.__main__.PENDING_STATE_ROOT", state_root, create=True),
+                patch("raindian.__main__.RaindropClient.iter_raindrops", return_value=iter([item])),
+                patch("raindian.__main__.summarize_bookmark") as summarize,
+            ):
+                result = process_bookmarks(config, args)
+
+            usage = (destination / ".raindian-usage.jsonl").read_text(encoding="utf-8")
+
+        self.assertEqual(result, 0)
+        self.assertIn("txn-1", usage)
+        self.assertIsNone(load_pending(destination, state_root=state_root))
+        summarize.assert_not_called()
+
+    def test_usage_write_failure_stops_and_leaves_one_pending_transaction(self) -> None:
+        items = [
+            {"_id": 1, "title": "First", "link": "https://example.com/first", "collection": {}},
+            {"_id": 2, "title": "Second", "link": "https://example.com/second", "collection": {}},
+        ]
+        summary = {
+            "note_title": "First",
+            "summary": "ok",
+            "key_points": [],
+            "tags": [],
+            "content_type": "link",
+            "_raindian_usage": {"input_tokens": 10, "output_tokens": 2, "total_tokens": 12},
+        }
+
+        with TemporaryDirectory() as temp_dir:
+            destination = Path(temp_dir) / "Raindrop"
+            state_root = Path(temp_dir) / "state"
+            config = Config(vault_path=temp_dir, sleep_seconds=0)
+            args = parse_args(["--skip-page-fetch"])
+            with (
+                patch.dict(os.environ, {"RAINDROP_TOKEN": "token", "OPENAI_API_KEY": "key"}),
+                patch("raindian.__main__.PENDING_STATE_ROOT", state_root),
+                patch("raindian.__main__.RaindropClient.iter_raindrops", return_value=iter(items)),
+                patch("raindian.__main__.summarize_bookmark", return_value=summary) as summarize,
+                patch("raindian.__main__.append_usage_record", side_effect=OSError("drive offline")),
+            ):
+                result = process_bookmarks(config, args)
+
+            pending = load_pending(destination, state_root=state_root)
+
+        self.assertEqual(result, 1)
+        self.assertEqual(summarize.call_count, 1)
+        self.assertIsNotNone(pending)
+
+    def test_pending_recovery_does_not_duplicate_an_existing_usage_record(self) -> None:
+        item = {"_id": 123, "title": "First", "link": "https://example.com/first", "collection": {}}
+
+        with TemporaryDirectory() as temp_dir:
+            destination = Path(temp_dir) / "Raindrop"
+            destination.mkdir()
+            state_root = Path(temp_dir) / "state"
+            usage_record = {"transaction_id": "txn-1", "raindrop_id": 123}
+            (destination / ".raindian-usage.jsonl").write_text(
+                json.dumps(usage_record) + "\n",
+                encoding="utf-8",
+            )
+            transaction = PendingTransaction(
+                transaction_id="txn-1",
+                target=destination / "First - 123.md",
+                markdown='---\nsummary_model: "gpt-5.6-luna"\n---\n\nRecovered\n',
+                usage_record=usage_record,
+            )
+            save_pending(destination, transaction, state_root=state_root)
+            config = Config(vault_path=temp_dir, sleep_seconds=0)
+            args = parse_args(["--skip-page-fetch"])
+            with (
+                patch.dict(os.environ, {"RAINDROP_TOKEN": "token", "OPENAI_API_KEY": "key"}),
+                patch("raindian.__main__.PENDING_STATE_ROOT", state_root),
+                patch("raindian.__main__.RaindropClient.iter_raindrops", return_value=iter([item])),
+                patch("raindian.__main__.summarize_bookmark") as summarize,
+            ):
+                result = process_bookmarks(config, args)
+
+            usage_lines = (destination / ".raindian-usage.jsonl").read_text(encoding="utf-8").splitlines()
+
+        self.assertEqual(result, 0)
+        self.assertEqual(usage_lines, [json.dumps(usage_record)])
+        summarize.assert_not_called()
 
     def test_existing_note_for_item_uses_raindrop_id_suffix(self) -> None:
         with TemporaryDirectory() as temp_dir:

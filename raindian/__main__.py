@@ -28,9 +28,11 @@ from .extract import PageFetchResult, fetch_page_text
 from .llm import SUMMARY_INSTRUCTIONS, USAGE_FIELD, build_prompt, summarize_bookmark
 from .markdown import normalize_tag, note_filename, render_note, upsert_raindrop_summary
 from .raindrop import RaindropClient
+from .recovery import PendingTransaction, load_pending, remove_pending, save_pending
 
 
 NON_CONTENT_TAGS = frozenset({"x", "sns"})
+PENDING_STATE_ROOT = Path.home() / ".raindian" / "pending"
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -297,6 +299,29 @@ def usage_record_exists(destination: Path, transaction_id: str) -> bool:
     return False
 
 
+def ensure_usage_log_readable(destination: Path) -> None:
+    usage_path = destination / ".raindian-usage.jsonl"
+    with usage_path.open("a+", encoding="utf-8", newline="\n") as usage_file:
+        usage_file.seek(0)
+        usage_file.read(1)
+
+
+def recover_pending_transaction(destination: Path) -> bool:
+    transaction = load_pending(destination, state_root=PENDING_STATE_ROOT)
+    if transaction is None:
+        return False
+
+    print(f"recovery: {transaction.target}")
+    ensure_usage_log_readable(destination)
+    if not transaction.target.exists():
+        write_note_atomically(transaction.target, transaction.markdown)
+    if not usage_record_exists(destination, transaction.transaction_id):
+        append_usage_record(destination, transaction.usage_record)
+    remove_pending(destination, state_root=PENDING_STATE_ROOT)
+    print("  recovery: completed")
+    return True
+
+
 def usage_output_ratio(
     destination: Path,
     model: str,
@@ -365,7 +390,17 @@ def process_bookmarks(config: Config, args: argparse.Namespace) -> int:
     )
     destination = output_dir(config)
     if not args.dry_run:
-        destination.mkdir(parents=True, exist_ok=True)
+        try:
+            destination.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            print(f"vault unavailable: {exc}")
+            return 1
+    if not args.no_llm and not args.dry_run:
+        try:
+            recover_pending_transaction(destination)
+        except (OSError, ValueError) as exc:
+            print(f"vault recovery warning: {exc}")
+            return 1
 
     processed = 0
     created = 0
@@ -425,6 +460,12 @@ def process_bookmarks(config: Config, args: argparse.Namespace) -> int:
             summary = fallback_summary(item, page)
         else:
             try:
+                ensure_usage_log_readable(destination)
+            except OSError as exc:
+                print(f"  vault unavailable before OpenAI request: {exc}")
+                failed += 1
+                break
+            try:
                 summary = summarize_bookmark(
                     api_key=openai_key,
                     model=model,
@@ -465,6 +506,29 @@ def process_bookmarks(config: Config, args: argparse.Namespace) -> int:
             generated_at=now,
             model=None if args.no_llm else model,
         )
+        usage_record: dict[str, Any] | None = None
+        if isinstance(usage, dict):
+            usage_record = build_usage_record(
+                item=item,
+                model=model,
+                reasoning_effort=config.openai_reasoning_effort,
+                max_output_tokens=config.max_output_tokens,
+                usage=usage,
+                price=usage_price,
+                price_source=usage_price_source,
+            )
+            transaction = PendingTransaction(
+                transaction_id=str(usage_record["transaction_id"]),
+                target=target,
+                markdown=markdown,
+                usage_record=usage_record,
+            )
+            try:
+                save_pending(destination, transaction, state_root=PENDING_STATE_ROOT)
+            except OSError as exc:
+                print(f"  pending recovery warning: {exc}")
+                failed += 1
+                break
         if args.dry_run:
             print(f"  dry-run: would write {len(markdown)} characters")
         else:
@@ -473,7 +537,7 @@ def process_bookmarks(config: Config, args: argparse.Namespace) -> int:
             except Exception as exc:
                 print(f"  write warning: {exc}")
                 failed += 1
-                continue
+                break
             if rename_source is not None:
                 try:
                     rename_source.unlink()
@@ -482,17 +546,8 @@ def process_bookmarks(config: Config, args: argparse.Namespace) -> int:
                     print(f"  rename warning: could not remove old note: {exc}")
                     failed += 1
             created += 1
-            if isinstance(usage, dict):
+            if usage_record is not None:
                 try:
-                    usage_record = build_usage_record(
-                        item=item,
-                        model=model,
-                        reasoning_effort=config.openai_reasoning_effort,
-                        max_output_tokens=config.max_output_tokens,
-                        usage=usage,
-                        price=usage_price,
-                        price_source=usage_price_source,
-                    )
                     append_usage_record(
                         destination=destination,
                         record=usage_record,
@@ -500,6 +555,13 @@ def process_bookmarks(config: Config, args: argparse.Namespace) -> int:
                 except OSError as exc:
                     print(f"  usage log warning: {exc}")
                     failed += 1
+                    break
+                try:
+                    remove_pending(destination, state_root=PENDING_STATE_ROOT)
+                except OSError as exc:
+                    print(f"  pending recovery warning: {exc}")
+                    failed += 1
+                    break
 
         if config.sleep_seconds > 0:
             time.sleep(config.sleep_seconds)
