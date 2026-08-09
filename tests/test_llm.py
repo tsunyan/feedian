@@ -39,6 +39,8 @@ class LlmTests(unittest.TestCase):
             timeout_seconds=30,
             max_output_tokens=800,
             reasoning_effort="none",
+            max_retries=3,
+            retry_base_seconds=1.0,
         )
 
         payload = __import__("json").loads(mock_urlopen.call_args.args[0].data.decode("utf-8"))

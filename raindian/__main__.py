@@ -174,6 +174,8 @@ def process_bookmarks(config: Config, args: argparse.Namespace) -> int:
     client = RaindropClient(
         token=raindrop_token,
         timeout_seconds=config.request_timeout_seconds,
+        max_retries=config.max_retries,
+        retry_base_seconds=config.retry_base_seconds,
     )
     destination = output_dir(config)
     if not args.dry_run:
@@ -231,6 +233,8 @@ def process_bookmarks(config: Config, args: argparse.Namespace) -> int:
                     timeout_seconds=config.request_timeout_seconds,
                     max_output_tokens=config.max_output_tokens,
                     reasoning_effort=config.openai_reasoning_effort,
+                    max_retries=config.max_retries,
+                    retry_base_seconds=config.retry_base_seconds,
                 )
             except Exception as exc:
                 print(f"  summary warning: {exc}")
@@ -278,6 +282,8 @@ def main(argv: list[str] | None = None) -> int:
             client = RaindropClient(
                 token=raindrop_token,
                 timeout_seconds=config.request_timeout_seconds,
+                max_retries=config.max_retries,
+                retry_base_seconds=config.retry_base_seconds,
             )
             list_collections(client)
             return 0

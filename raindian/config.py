@@ -20,6 +20,8 @@ class Config:
     max_output_tokens: int = 800
     openai_reasoning_effort: str = "none"
     allow_private_urls: bool = False
+    max_retries: int = 3
+    retry_base_seconds: float = 1.0
     request_timeout_seconds: int = 30
     sleep_seconds: float = 0.3
 
@@ -31,6 +33,8 @@ class Config:
         self.max_output_tokens = max(100, int(self.max_output_tokens))
         if self.openai_reasoning_effort not in {"none", "minimal", "low", "medium", "high", "xhigh", "max"}:
             raise ValueError("openai_reasoning_effort must be a supported reasoning effort.")
+        self.max_retries = max(0, min(int(self.max_retries), 5))
+        self.retry_base_seconds = max(0.1, float(self.retry_base_seconds))
         self.request_timeout_seconds = max(1, int(self.request_timeout_seconds))
         self.sleep_seconds = max(0.0, float(self.sleep_seconds))
 
@@ -50,4 +54,7 @@ def load_config(path: str | Path) -> Config:
 
 def _known_keys(data: dict[str, Any]) -> dict[str, Any]:
     allowed = set(Config.__dataclass_fields__.keys())
-    return {key: value for key, value in data.items() if key in allowed}
+    unknown = sorted(set(data) - allowed)
+    if unknown:
+        raise ValueError(f"Unknown config field(s): {', '.join(unknown)}")
+    return dict(data)

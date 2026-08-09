@@ -6,6 +6,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from .extract import PageFetchResult
+from .retry import run_with_retries
 
 
 SUMMARY_SCHEMA: dict[str, Any] = {
@@ -41,6 +42,8 @@ def summarize_bookmark(
     timeout_seconds: int,
     max_output_tokens: int,
     reasoning_effort: str,
+    max_retries: int,
+    retry_base_seconds: float,
 ) -> dict[str, Any]:
     prompt = build_prompt(item=item, page=page, language=language)
     payload = {
@@ -82,8 +85,11 @@ def summarize_bookmark(
         method="POST",
     )
     try:
-        with urlopen(request, timeout=timeout_seconds) as response:
-            data = json.loads(response.read().decode("utf-8"))
+        data = run_with_retries(
+            lambda: _read_response(request, timeout_seconds),
+            max_retries=max_retries,
+            retry_base_seconds=retry_base_seconds,
+        )
     except HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"OpenAI API error HTTP {exc.code}: {body}") from exc
@@ -98,6 +104,11 @@ def summarize_bookmark(
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"OpenAI output was not valid JSON: {output_text[:500]}") from exc
     return result
+
+
+def _read_response(request: Request, timeout_seconds: int) -> dict[str, Any]:
+    with urlopen(request, timeout=timeout_seconds) as response:
+        return json.loads(response.read().decode("utf-8"))
 
 
 def build_prompt(item: dict[str, Any], page: PageFetchResult, language: str) -> str:

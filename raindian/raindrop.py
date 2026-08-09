@@ -6,14 +6,24 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+from .retry import run_with_retries
+
 
 API_BASE = "https://api.raindrop.io/rest/v1"
 
 
 class RaindropClient:
-    def __init__(self, token: str, timeout_seconds: int = 30) -> None:
+    def __init__(
+        self,
+        token: str,
+        timeout_seconds: int = 30,
+        max_retries: int = 3,
+        retry_base_seconds: float = 1.0,
+    ) -> None:
         self.token = token
         self.timeout_seconds = timeout_seconds
+        self.max_retries = max_retries
+        self.retry_base_seconds = retry_base_seconds
 
     def iter_raindrops(
         self,
@@ -64,10 +74,17 @@ class RaindropClient:
             method="GET",
         )
         try:
-            with urlopen(request, timeout=self.timeout_seconds) as response:
-                return json.loads(response.read().decode("utf-8"))
+            return run_with_retries(
+                lambda: self._read_json(request),
+                max_retries=self.max_retries,
+                retry_base_seconds=self.retry_base_seconds,
+            )
         except HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
             raise RuntimeError(f"Raindrop API error HTTP {exc.code}: {body}") from exc
         except URLError as exc:
             raise RuntimeError(f"Raindrop API network error: {exc.reason}") from exc
+
+    def _read_json(self, request: Request) -> dict[str, Any]:
+        with urlopen(request, timeout=self.timeout_seconds) as response:
+            return json.loads(response.read().decode("utf-8"))

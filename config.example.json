@@ -11,6 +11,8 @@
   "max_output_tokens": 800,
   "openai_reasoning_effort": "none",
   "allow_private_urls": false,
+  "max_retries": 3,
+  "retry_base_seconds": 1.0,
   "request_timeout_seconds": 30,
   "sleep_seconds": 0.3
 }
