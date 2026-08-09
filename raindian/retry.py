@@ -37,9 +37,20 @@ def is_transient_error(exc: Exception) -> bool:
 def retry_delay_seconds(exc: Exception, retry_base_seconds: float, attempt: int) -> float:
     if isinstance(exc, HTTPError):
         retry_after = exc.headers.get("Retry-After") if exc.headers else None
+        retry_after_seconds: float | None = None
         if retry_after:
             try:
-                return min(60.0, max(0.0, float(retry_after)))
+                retry_after_seconds = min(60.0, max(0.0, float(retry_after)))
             except ValueError:
                 pass
+        if exc.code == 429 and exc.headers:
+            reset = exc.headers.get("X-RateLimit-Reset")
+            if reset:
+                try:
+                    reset_seconds = max(0.0, float(reset) - time.time()) + 0.1
+                    return max(retry_after_seconds or 0.0, reset_seconds)
+                except ValueError:
+                    pass
+        if retry_after_seconds is not None:
+            return retry_after_seconds
     return retry_base_seconds * (2**attempt)
