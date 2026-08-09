@@ -39,6 +39,23 @@ class RaindropClientTests(unittest.TestCase):
             {"ids": [123], "tags": ["ai", "new-tag"]},
         )
 
+    def test_request_interval_spaces_each_http_request(self) -> None:
+        response = MagicMock()
+        response.read.return_value = b'{"result":true}'
+        context_manager = MagicMock()
+        context_manager.__enter__.return_value = response
+
+        with (
+            patch("raindian.raindrop.urlopen", return_value=context_manager),
+            patch("raindian.raindrop.time.monotonic", side_effect=[0.0, 0.0]),
+            patch("raindian.raindrop.time.sleep") as sleep,
+        ):
+            client = RaindropClient(token="token", max_retries=0, request_interval_seconds=0.5)
+            client.update_raindrop_note(123, "one")
+            client.update_raindrop_note(124, "two")
+
+        sleep.assert_called_once_with(0.5)
+
 
 if __name__ == "__main__":
     unittest.main()

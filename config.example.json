@@ -14,5 +14,6 @@
   "max_retries": 3,
   "retry_base_seconds": 1.0,
   "request_timeout_seconds": 30,
-  "sleep_seconds": 0.3
+  "sleep_seconds": 0.3,
+  "sync_request_interval_seconds": 0.5
 }

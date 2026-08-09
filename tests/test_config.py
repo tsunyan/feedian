@@ -20,3 +20,9 @@ class ConfigTests(unittest.TestCase):
 
         self.assertEqual(config.max_retries, 5)
         self.assertEqual(config.retry_base_seconds, 0.1)
+
+    def test_sync_request_interval_defaults_to_half_a_second(self) -> None:
+        config = Config(vault_path="vault", sync_request_interval_seconds=-1)
+
+        self.assertEqual(config.sync_request_interval_seconds, 0.0)
+        self.assertEqual(Config(vault_path="vault").sync_request_interval_seconds, 0.5)

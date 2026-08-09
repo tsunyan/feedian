@@ -24,6 +24,7 @@ class Config:
     retry_base_seconds: float = 1.0
     request_timeout_seconds: int = 30
     sleep_seconds: float = 0.3
+    sync_request_interval_seconds: float = 0.5
 
     def __post_init__(self) -> None:
         if self.base_tags is None:
@@ -37,6 +38,7 @@ class Config:
         self.retry_base_seconds = max(0.1, float(self.retry_base_seconds))
         self.request_timeout_seconds = max(1, int(self.request_timeout_seconds))
         self.sleep_seconds = max(0.0, float(self.sleep_seconds))
+        self.sync_request_interval_seconds = max(0.0, float(self.sync_request_interval_seconds))
 
     def model_copy(self) -> "Config":
         return replace(self, base_tags=list(self.base_tags or []))

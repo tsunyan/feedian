@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import Any, Iterator
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -19,11 +20,14 @@ class RaindropClient:
         timeout_seconds: int = 30,
         max_retries: int = 3,
         retry_base_seconds: float = 1.0,
+        request_interval_seconds: float = 0.0,
     ) -> None:
         self.token = token
         self.timeout_seconds = timeout_seconds
         self.max_retries = max_retries
         self.retry_base_seconds = retry_base_seconds
+        self.request_interval_seconds = max(0.0, request_interval_seconds)
+        self._next_request_at = 0.0
 
     def iter_raindrops(
         self,
@@ -139,5 +143,15 @@ class RaindropClient:
             raise RuntimeError(f"Raindrop API network error: {exc.reason}") from exc
 
     def _read_json(self, request: Request) -> dict[str, Any]:
+        self._wait_for_request_slot()
         with urlopen(request, timeout=self.timeout_seconds) as response:
             return json.loads(response.read().decode("utf-8"))
+
+    def _wait_for_request_slot(self) -> None:
+        if self.request_interval_seconds <= 0:
+            return
+        now = time.monotonic()
+        delay = self._next_request_at - now
+        if delay > 0:
+            time.sleep(delay)
+        self._next_request_at = max(now, self._next_request_at) + self.request_interval_seconds
