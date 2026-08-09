@@ -1,0 +1,7 @@
+.env
+config.json
+.raindian-state.json
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
