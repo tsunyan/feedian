@@ -1,10 +1,18 @@
 import os
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
-from raindian.__main__ import existing_note_for_item, parse_args, process_bookmarks, write_note_atomically
+from raindian.__main__ import (
+    existing_note_for_item,
+    list_collections,
+    parse_args,
+    process_bookmarks,
+    write_note_atomically,
+)
 from raindian.config import Config
 
 
@@ -25,6 +33,20 @@ class MainTests(unittest.TestCase):
             existing = path / "Old title - 123.md"
             existing.write_text("", encoding="utf-8")
             self.assertEqual(existing_note_for_item(path, {"_id": 123}), existing)
+
+    def test_list_collections_accepts_null_parent(self) -> None:
+        client = Mock()
+        client.get_root_collections.return_value = [{"_id": 1, "title": "Root", "count": 2, "parent": None}]
+        client.get_child_collections.return_value = [
+            {"_id": 1, "title": "Root", "count": 2, "parent": None},
+            {"_id": 2, "title": "Child", "count": 1, "parent": {"$id": 1}},
+        ]
+
+        output = StringIO()
+        with redirect_stdout(output):
+            list_collections(client)
+
+        self.assertEqual(output.getvalue().splitlines(), ["1\tRoot\tcount=2", "2\tChild\tcount=1 parent=1"])
 
     def test_summary_failure_does_not_stop_later_bookmarks(self) -> None:
         items = [

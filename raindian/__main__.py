@@ -111,17 +111,33 @@ def fallback_summary(item: dict[str, Any], page: PageFetchResult) -> dict[str, A
 def list_collections(client: RaindropClient) -> None:
     roots = client.get_root_collections()
     children = client.get_child_collections()
-    all_items = roots + children
+    all_items: list[dict[str, Any]] = []
+    seen_ids: set[int] = set()
+    for item in roots + children:
+        collection_id = item.get("_id")
+        if isinstance(collection_id, int) and collection_id in seen_ids:
+            continue
+        if isinstance(collection_id, int):
+            seen_ids.add(collection_id)
+        all_items.append(item)
     if not all_items:
         print("No collections found.")
         return
-    for item in sorted(all_items, key=lambda entry: (entry.get("parent", {}).get("$id", 0), entry.get("title", ""))):
+    for item in sorted(all_items, key=lambda entry: (collection_parent_id(entry), entry.get("title", ""))):
         collection_id = item.get("_id")
         title = item.get("title", "(untitled)")
         count = item.get("count", 0)
-        parent = item.get("parent", {}).get("$id")
+        parent = collection_parent_id(item)
         parent_text = f" parent={parent}" if parent else ""
         print(f"{collection_id}\t{title}\tcount={count}{parent_text}")
+
+
+def collection_parent_id(item: dict[str, Any]) -> int:
+    parent = item.get("parent")
+    if not isinstance(parent, dict):
+        return 0
+    parent_id = parent.get("$id")
+    return parent_id if isinstance(parent_id, int) else 0
 
 
 def output_dir(config: Config) -> Path:
