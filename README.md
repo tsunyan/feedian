@@ -71,6 +71,7 @@ Important fields:
 - `max_article_chars`: Maximum linked-page text sent to OpenAI (default: `10000`).
 - `max_output_tokens`: Hard upper bound for visible output and reasoning tokens per OpenAI request (default: `800`).
 - `openai_reasoning_effort`: Reasoning effort for supported OpenAI models (default: `none`). Use `low` only when testing shows it improves note quality.
+- `allow_private_urls`: Allow page fetches to private or local network addresses (default: `false`).
 
 ## OpenAI API Cost Estimate
 
@@ -100,6 +101,8 @@ The estimate is intentionally broad. `max_article_chars` limits fetched page tex
 - Filenames include the Raindrop item ID to avoid collisions.
 - If a web page cannot be fetched, the tool still uses Raindrop metadata such as title and excerpt.
 - HTML extraction prioritizes `article` and `main`, then article-like `class` / `id` values. Navigation, headers, footers, sidebars, ads, related links, comments, and cookie banners are excluded when identifiable from HTML structure or attributes.
+- Page fetching accepts only `http` and `https` URLs and rejects local/private network addresses by default, including after redirects. Set `allow_private_urls` only for a trusted internal bookmark collection.
+- Linked-page text and bookmark metadata are treated as untrusted reference data when sent to the LLM; instructions in them are not followed.
 
 ## Useful Commands
 

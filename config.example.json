@@ -10,6 +10,7 @@
   "max_article_chars": 10000,
   "max_output_tokens": 800,
   "openai_reasoning_effort": "none",
+  "allow_private_urls": false,
   "request_timeout_seconds": 30,
   "sleep_seconds": 0.3
 }

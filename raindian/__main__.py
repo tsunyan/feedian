@@ -213,6 +213,7 @@ def process_bookmarks(config: Config, args: argparse.Namespace) -> int:
                 item["link"],
                 timeout_seconds=config.request_timeout_seconds,
                 max_chars=config.max_article_chars,
+                allow_private_urls=config.allow_private_urls,
             )
             if page.error:
                 print(f"  page fetch warning: {page.error}")

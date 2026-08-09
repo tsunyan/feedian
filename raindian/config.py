@@ -19,6 +19,7 @@ class Config:
     max_article_chars: int = 10000
     max_output_tokens: int = 800
     openai_reasoning_effort: str = "none"
+    allow_private_urls: bool = False
     request_timeout_seconds: int = 30
     sleep_seconds: float = 0.3
 

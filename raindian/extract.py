@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import ipaddress
 import re
+import socket
 import ssl
 from dataclasses import dataclass
 from html import unescape
 from html.parser import HTMLParser
 from typing import Iterable
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.parse import urljoin, urlparse
+from urllib.request import HTTPSHandler, HTTPRedirectHandler, Request, build_opener
 
 
 @dataclass
@@ -22,6 +25,17 @@ class PageFetchResult:
 class TextCandidate:
     priority: int
     parts: list[str]
+
+
+class SafeRedirectHandler(HTTPRedirectHandler):
+    def __init__(self, allow_private_urls: bool) -> None:
+        super().__init__()
+        self.allow_private_urls = allow_private_urls
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        destination = urljoin(req.full_url, newurl)
+        validate_fetch_url(destination, allow_private_urls=self.allow_private_urls)
+        return super().redirect_request(req, fp, code, msg, headers, destination)
 
 
 class TextExtractor(HTMLParser):
@@ -142,7 +156,17 @@ class TextExtractor(HTMLParser):
         return normalize_inline(" ".join(self.title_parts))
 
 
-def fetch_page_text(url: str, timeout_seconds: int, max_chars: int) -> PageFetchResult:
+def fetch_page_text(
+    url: str,
+    timeout_seconds: int,
+    max_chars: int,
+    allow_private_urls: bool = False,
+) -> PageFetchResult:
+    try:
+        validate_fetch_url(url, allow_private_urls=allow_private_urls)
+    except ValueError as exc:
+        return PageFetchResult(url=url, text="", error=f"blocked URL: {exc}")
+
     request = Request(
         url,
         headers={
@@ -153,7 +177,8 @@ def fetch_page_text(url: str, timeout_seconds: int, max_chars: int) -> PageFetch
     )
     try:
         context = ssl.create_default_context()
-        with urlopen(request, timeout=timeout_seconds, context=context) as response:
+        opener = build_opener(HTTPSHandler(context=context), SafeRedirectHandler(allow_private_urls))
+        with opener.open(request, timeout=timeout_seconds) as response:
             content_type = response.headers.get("Content-Type", "")
             raw = response.read(max_chars * 4)
     except HTTPError as exc:
@@ -175,6 +200,25 @@ def fetch_page_text(url: str, timeout_seconds: int, max_chars: int) -> PageFetch
     parser.feed(decoded)
     parser.close()
     return PageFetchResult(url=url, text=parser.text[:max_chars], title=parser.title)
+
+
+def validate_fetch_url(url: str, allow_private_urls: bool = False) -> None:
+    parsed = urlparse(url)
+    if parsed.scheme.lower() not in {"http", "https"}:
+        raise ValueError("only http and https URLs are allowed")
+    if not parsed.hostname:
+        raise ValueError("URL does not include a hostname")
+    if allow_private_urls:
+        return
+
+    try:
+        addresses = socket.getaddrinfo(parsed.hostname, parsed.port, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise ValueError(f"hostname could not be resolved: {parsed.hostname}") from exc
+    for _, _, _, _, sockaddr in addresses:
+        address = ipaddress.ip_address(sockaddr[0].split("%", 1)[0])
+        if not address.is_global:
+            raise ValueError(f"non-public address is not allowed: {address}")
 
 
 def charset_from_content_type(content_type: str) -> str | None:
