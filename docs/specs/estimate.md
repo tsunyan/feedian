@@ -72,9 +72,9 @@ mean input tokens, projected input tokens, configured output-token cap, and elap
 time. It then prints a table with all four model prices and estimates.
 
 Page fetch failures do not stop the estimate. They are counted and summarized by
-reason, and successful sampled prompts form the estimate. If every sampled fetch
-fails, the command prints no sampled-content cost table and exits with an error.
-Target populations of zero are reported without an estimate.
+reason, and their Raindrop metadata and fetch-error fallback prompt are included in
+the sampled estimate, matching normal processing. Target populations of zero are
+reported without an estimate.
 
 ## Non-goals
 

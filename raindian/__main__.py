@@ -11,7 +11,14 @@ from pathlib import Path
 from typing import Any
 
 from .config import Config, load_config
-from .estimate import count_prompt_tokens, format_cost_rows, parse_sample_size, projected_costs, select_sample
+from .estimate import (
+    comparison_model,
+    count_prompt_tokens,
+    format_cost_rows,
+    parse_sample_size,
+    projected_costs,
+    select_sample,
+)
 from .extract import PageFetchResult, fetch_page_text
 from .llm import SUMMARY_INSTRUCTIONS, build_prompt, summarize_bookmark
 from .markdown import note_filename, render_note
@@ -318,25 +325,23 @@ def estimate_bookmarks(config: Config, args: argparse.Namespace) -> int:
     tokenizer_fallbacks: set[str] = set()
     for item in samples:
         url = item.get("link")
-        if not isinstance(url, str) or not url:
-            failures["bookmark has no URL"] += 1
-            continue
-        page = fetch_page_text(
-            url,
-            timeout_seconds=config.request_timeout_seconds,
-            max_chars=config.max_article_chars,
-            allow_private_urls=config.allow_private_urls,
-        )
-        if page.error:
-            failures[page.error] += 1
-            continue
+        page = PageFetchResult(url=url if isinstance(url, str) else "", text="", title="", error=None)
+        if not args.skip_page_fetch and page.url:
+            page = fetch_page_text(
+                page.url,
+                timeout_seconds=config.request_timeout_seconds,
+                max_chars=config.max_article_chars,
+                allow_private_urls=config.allow_private_urls,
+            )
+            if page.error:
+                failures[page.error] += 1
+            if config.sleep_seconds > 0:
+                time.sleep(config.sleep_seconds)
         prompt = build_prompt(item=item, page=page, language=config.language)
         token_count, fallback = count_prompt_tokens(f"{SUMMARY_INSTRUCTIONS}\n\n{prompt}", model)
         token_counts.append(token_count)
         if fallback:
             tokenizer_fallbacks.add(fallback)
-        if config.sleep_seconds > 0:
-            time.sleep(config.sleep_seconds)
 
     if not token_counts:
         print(f"estimate: target={population} sample={len(samples)} sampled=0 failed={sum(failures.values())}")
@@ -351,6 +356,8 @@ def estimate_bookmarks(config: Config, args: argparse.Namespace) -> int:
         f"estimate: target={population} sample={len(samples)} sampled={len(token_counts)} "
         f"failed={sum(failures.values())}"
     )
+    if args.skip_page_fetch:
+        print("estimate: page_fetch=skipped")
     print(
         f"estimate: mean_input_tokens={mean_tokens:.0f} "
         f"projected_input_tokens={projected_input_tokens:.0f} "
@@ -377,9 +384,12 @@ def _print_count_only_estimate(population: int, max_output_tokens: int, selected
         "input_tokens_per_item=2000-10000 (generic range)"
     )
     print(f"estimate: max_output_tokens={max_output_tokens}")
+    selected_pricing_model = comparison_model(selected_model)
+    if not any(row.model == selected_pricing_model for row in lower):
+        print(f"selected model: {selected_model} (not in comparison table)")
     print("model\ttotal (max)")
     for lower_row, upper_row in zip(lower, upper):
-        selected = " [selected]" if lower_row.model == selected_model else ""
+        selected = " [selected]" if lower_row.model == selected_pricing_model else ""
         print(f"{lower_row.name}{selected}\t${lower_row.total_cost:.2f}-${upper_row.total_cost:.2f}")
 
 

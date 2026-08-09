@@ -46,7 +46,7 @@ def parse_sample_size(value: str, population: int) -> int:
         percentage = Decimal(text[:-1])
     except InvalidOperation as exc:
         raise ValueError("sample percentage must be a number from 0 to 100.") from exc
-    if percentage < 0 or percentage > 100:
+    if not percentage.is_finite() or percentage < 0 or percentage > 100:
         raise ValueError("sample percentage must be from 0 to 100.")
     if percentage == 0:
         return 0
@@ -100,13 +100,21 @@ def projected_costs(
 
 
 def format_cost_rows(rows: list[CostRow], selected_model: str) -> list[str]:
-    lines = ["model\tinput\toutput (max)\ttotal (max)"]
+    pricing_model = comparison_model(selected_model)
+    lines: list[str] = []
+    if not any(row.model == pricing_model for row in rows):
+        lines.append(f"selected model: {selected_model} (not in comparison table)")
+    lines.append("model\tinput\toutput (max)\ttotal (max)")
     for row in rows:
-        selected = " [selected]" if row.model == selected_model else ""
+        selected = " [selected]" if row.model == pricing_model else ""
         lines.append(
             f"{row.name}{selected}\t${row.input_cost:.2f}\t${row.output_cost:.2f}\t${row.total_cost:.2f}"
         )
     return lines
+
+
+def comparison_model(model: str) -> str:
+    return "gpt-5.6-sol" if model == "gpt-5.6" else model
 
 
 def _collection_id(item: dict[str, Any]) -> int:

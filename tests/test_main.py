@@ -156,7 +156,24 @@ class MainTests(unittest.TestCase):
         self.assertEqual(result, 0)
         fetch_page.assert_not_called()
 
-    def test_estimate_returns_error_when_every_page_fetch_fails(self) -> None:
+    def test_estimate_respects_skip_page_fetch(self) -> None:
+        items = [{"_id": 1, "title": "First", "link": "https://example.com/first", "collection": {}}]
+
+        with TemporaryDirectory() as temp_dir:
+            config = Config(vault_path=temp_dir, sleep_seconds=0)
+            args = parse_args(["--estimate", "--estimate-sample-size", "1", "--skip-page-fetch"])
+            with (
+                patch.dict(os.environ, {"RAINDROP_TOKEN": "token"}, clear=True),
+                patch("raindian.__main__.RaindropClient.iter_raindrops", return_value=iter(items)),
+                patch("raindian.__main__.fetch_page_text") as fetch_page,
+                redirect_stdout(StringIO()),
+            ):
+                result = estimate_bookmarks(config, args)
+
+        self.assertEqual(result, 0)
+        fetch_page.assert_not_called()
+
+    def test_estimate_uses_metadata_when_every_page_fetch_fails(self) -> None:
         items = [{"_id": 1, "title": "First", "link": "https://example.com/first", "collection": {}}]
         failed_page = PageFetchResult(url=items[0]["link"], text="", title="", error="HTTP 503")
 
@@ -172,9 +189,10 @@ class MainTests(unittest.TestCase):
             ):
                 result = estimate_bookmarks(config, args)
 
-        self.assertEqual(result, 1)
-        self.assertIn("sampled=0", output.getvalue())
-        self.assertNotIn("GPT-5.6 Sol", output.getvalue())
+        self.assertEqual(result, 0)
+        self.assertIn("sampled=1", output.getvalue())
+        self.assertIn("GPT-5.6 Sol", output.getvalue())
+        self.assertIn("page fetch failure: 1 x HTTP 503", output.getvalue())
 
     def test_estimate_reports_empty_target_without_page_fetch(self) -> None:
         with TemporaryDirectory() as temp_dir:

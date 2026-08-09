@@ -121,9 +121,12 @@ python -m raindian --config config.json --estimate --estimate-sample-size 20%
 
 # Do not fetch pages; use the generic 2,000-10,000 input-token range instead.
 python -m raindian --config config.json --estimate --estimate-sample-size 0
+
+# Estimate metadata and excerpts only, without fetching linked pages.
+python -m raindian --config config.json --estimate --skip-page-fetch
 ```
 
-The output always shows GPT-5.6 Sol, GPT-5.6 Terra, GPT-5.6 Luna, and GPT-5.5. The `openai_model` from your configuration, or its `OPENAI_MODEL` override, is labeled `selected`. The estimate uses current uncached token prices and the configured `max_output_tokens` as a per-bookmark output ceiling; server-side request framing, reasoning tokens, or future price changes can still make the final bill differ.
+The output always shows GPT-5.6 Sol, GPT-5.6 Terra, GPT-5.6 Luna, and GPT-5.5. The `openai_model` from your configuration, or its `OPENAI_MODEL` override, is labeled `selected`; the `gpt-5.6` alias maps to Sol, while other models outside the comparison are named explicitly. A failed page fetch still estimates the fallback prompt made from Raindrop metadata and the fetch error. The estimate uses current uncached token prices and the configured `max_output_tokens` as a per-bookmark output ceiling; server-side request framing, reasoning tokens, or future price changes can still make the final bill differ.
 
 ## Behavior
 

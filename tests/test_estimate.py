@@ -4,6 +4,7 @@ import unittest
 
 from raindian.estimate import (
     count_prompt_tokens,
+    format_cost_rows,
     parse_sample_size,
     projected_costs,
     select_sample,
@@ -29,6 +30,8 @@ class EstimateTests(unittest.TestCase):
             parse_sample_size("abc", 10)
         with self.assertRaisesRegex(ValueError, "percentage"):
             parse_sample_size("101%", 10)
+        with self.assertRaisesRegex(ValueError, "percentage"):
+            parse_sample_size("NaN%", 10)
 
     def test_selection_is_proportional_and_evenly_spaced(self) -> None:
         items = [bookmark(index, 1) for index in range(1, 9)]
@@ -56,6 +59,16 @@ class EstimateTests(unittest.TestCase):
             ["GPT-5.6 Sol", "GPT-5.6 Terra", "GPT-5.6 Luna", "GPT-5.5"],
         )
         self.assertEqual(rows[2].input_cost, 0.20)
+
+    def test_sol_alias_is_marked_as_selected(self) -> None:
+        lines = format_cost_rows(projected_costs(1, 1, 1), selected_model="gpt-5.6")
+
+        self.assertIn("GPT-5.6 Sol [selected]", lines[1])
+
+    def test_unknown_selected_model_is_explicit_in_the_table(self) -> None:
+        lines = format_cost_rows(projected_costs(1, 1, 1), selected_model="custom-model")
+
+        self.assertEqual(lines[0], "selected model: custom-model (not in comparison table)")
 
 
 if __name__ == "__main__":
