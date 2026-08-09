@@ -301,29 +301,38 @@ def estimate_bookmarks(config: Config, args: argparse.Namespace) -> int:
         max_retries=config.max_retries,
         retry_base_seconds=config.retry_base_seconds,
     )
-    items = list(
-        client.iter_raindrops(
-            collection_id=config.collection_id,
-            per_page=config.per_page,
-            nested=config.nested,
-            limit=args.limit,
-        )
-    )
+    _estimate_progress("phase=collecting-bookmarks")
+    items: list[dict[str, Any]] = []
+    for item in client.iter_raindrops(
+        collection_id=config.collection_id,
+        per_page=config.per_page,
+        nested=config.nested,
+        limit=args.limit,
+    ):
+        items.append(item)
+        if len(items) % config.per_page == 0:
+            _estimate_progress(f"collected={len(items)}")
+    _estimate_progress(f"phase=sampling collected={len(items)}")
     population = len(items)
     if population == 0:
         print("estimate: target=0")
         return 0
     sample_size = parse_sample_size(args.estimate_sample_size, population)
     if sample_size == 0:
+        _estimate_progress("phase=calculating-costs count-only=true")
         _print_count_only_estimate(population, config.max_output_tokens, model)
         _print_elapsed(started_at)
         return 0
 
     samples = select_sample(items, sample_size)
+    _estimate_progress(f"phase=fetching-pages sample={len(samples)}")
     token_counts: list[int] = []
     failures: Counter[str] = Counter()
     tokenizer_fallbacks: set[str] = set()
-    for item in samples:
+    for sample_index, item in enumerate(samples, start=1):
+        _estimate_progress(
+            f"fetching={sample_index}/{len(samples)} bookmark={_estimate_bookmark_label(item)}"
+        )
         url = item.get("link")
         page = PageFetchResult(url=url if isinstance(url, str) else "", text="", title="", error=None)
         if not args.skip_page_fetch and page.url:
@@ -367,6 +376,7 @@ def estimate_bookmarks(config: Config, args: argparse.Namespace) -> int:
         print(f"estimate: tokenizer fallback={encoding_name}")
     for reason, count in failures.most_common():
         print(f"  page fetch failure: {count} x {reason}")
+    _estimate_progress("phase=calculating-costs")
     for line in format_cost_rows(
         projected_costs(population, mean_tokens, config.max_output_tokens),
         selected_model=model,
@@ -395,6 +405,15 @@ def _print_count_only_estimate(population: int, max_output_tokens: int, selected
 
 def _print_elapsed(started_at: float) -> None:
     print(f"done: elapsed={time.perf_counter() - started_at:.1f}s")
+
+
+def _estimate_progress(message: str) -> None:
+    print(f"estimate: {message}", flush=True)
+
+
+def _estimate_bookmark_label(item: dict[str, Any]) -> str:
+    label = item.get("title") or item.get("link") or item.get("_id") or "(untitled)"
+    return str(label).replace("\r", " ").replace("\n", " ")[:80]
 
 
 def main(argv: list[str] | None = None) -> int:

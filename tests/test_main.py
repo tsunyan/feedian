@@ -121,6 +121,10 @@ class MainTests(unittest.TestCase):
         self.assertFalse((Path(temp_dir) / "Raindrop").exists())
         self.assertIn("GPT-5.6 Sol", output.getvalue())
         self.assertIn("GPT-5.6 Luna [selected]", output.getvalue())
+        self.assertIn("phase=collecting-bookmarks", output.getvalue())
+        self.assertIn("phase=sampling", output.getvalue())
+        self.assertIn("phase=fetching-pages", output.getvalue())
+        self.assertIn("phase=calculating-costs", output.getvalue())
 
     def test_estimate_counts_the_shared_developer_instructions(self) -> None:
         items = [{"_id": 1, "title": "First", "link": "https://example.com/first", "collection": {}}]

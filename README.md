@@ -126,7 +126,7 @@ python -m raindian --config config.json --estimate --estimate-sample-size 0
 python -m raindian --config config.json --estimate --skip-page-fetch
 ```
 
-The output always shows GPT-5.6 Sol, GPT-5.6 Terra, GPT-5.6 Luna, and GPT-5.5. The `openai_model` from your configuration, or its `OPENAI_MODEL` override, is labeled `selected`; the `gpt-5.6` alias maps to Sol, while other models outside the comparison are named explicitly. A failed page fetch still estimates the fallback prompt made from Raindrop metadata and the fetch error. The estimate uses current uncached token prices and the configured `max_output_tokens` as a per-bookmark output ceiling; server-side request framing, reasoning tokens, or future price changes can still make the final bill differ.
+The command reports its current phase while it runs: bookmark collection, every 50 collected bookmarks, sample selection, each page fetch, and cost calculation. The output always shows GPT-5.6 Sol, GPT-5.6 Terra, GPT-5.6 Luna, and GPT-5.5. The `openai_model` from your configuration, or its `OPENAI_MODEL` override, is labeled `selected`; the `gpt-5.6` alias maps to Sol, while other models outside the comparison are named explicitly. A failed page fetch still estimates the fallback prompt made from Raindrop metadata and the fetch error. The estimate uses current uncached token prices and the configured `max_output_tokens` as a per-bookmark output ceiling; server-side request framing, reasoning tokens, or future price changes can still make the final bill differ.
 
 ## Behavior
 
