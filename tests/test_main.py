@@ -1,19 +1,22 @@
 import os
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import Mock, patch
 
 from raindian.__main__ import (
+    estimate_bookmarks,
     existing_note_for_item,
     list_collections,
+    main,
     parse_args,
     process_bookmarks,
     write_note_atomically,
 )
 from raindian.config import Config
+from raindian.extract import PageFetchResult
 
 
 class MainTests(unittest.TestCase):
@@ -94,6 +97,92 @@ class MainTests(unittest.TestCase):
         fetch_page.assert_not_called()
         summarize.assert_not_called()
         self.assertFalse((Path(temp_dir) / "Raindrop").exists())
+
+    def test_estimate_uses_raindrop_and_page_fetch_without_openai_or_writes(self) -> None:
+        items = [{"_id": 1, "title": "First", "link": "https://example.com/first", "collection": {}}]
+        page = PageFetchResult(url=items[0]["link"], text="Example page text.", title="Example", error=None)
+
+        with TemporaryDirectory() as temp_dir:
+            config = Config(vault_path=temp_dir, sleep_seconds=0)
+            args = parse_args(["--estimate", "--estimate-sample-size", "1"])
+            output = StringIO()
+            with (
+                patch.dict(os.environ, {"RAINDROP_TOKEN": "token"}, clear=True),
+                patch("raindian.__main__.RaindropClient.iter_raindrops", return_value=iter(items)),
+                patch("raindian.__main__.fetch_page_text", return_value=page) as fetch_page,
+                patch("raindian.__main__.summarize_bookmark") as summarize,
+                redirect_stdout(output),
+            ):
+                result = estimate_bookmarks(config, args)
+
+        self.assertEqual(result, 0)
+        fetch_page.assert_called_once()
+        summarize.assert_not_called()
+        self.assertFalse((Path(temp_dir) / "Raindrop").exists())
+        self.assertIn("GPT-5.6 Sol", output.getvalue())
+        self.assertIn("GPT-5.6 Luna [selected]", output.getvalue())
+
+    def test_estimate_count_only_does_not_fetch_pages(self) -> None:
+        items = [{"_id": 1, "title": "First", "link": "https://example.com/first", "collection": {}}]
+
+        with TemporaryDirectory() as temp_dir:
+            config = Config(vault_path=temp_dir, sleep_seconds=0)
+            args = parse_args(["--estimate", "--estimate-sample-size", "0"])
+            with (
+                patch.dict(os.environ, {"RAINDROP_TOKEN": "token"}, clear=True),
+                patch("raindian.__main__.RaindropClient.iter_raindrops", return_value=iter(items)),
+                patch("raindian.__main__.fetch_page_text") as fetch_page,
+            ):
+                result = estimate_bookmarks(config, args)
+
+        self.assertEqual(result, 0)
+        fetch_page.assert_not_called()
+
+    def test_estimate_returns_error_when_every_page_fetch_fails(self) -> None:
+        items = [{"_id": 1, "title": "First", "link": "https://example.com/first", "collection": {}}]
+        failed_page = PageFetchResult(url=items[0]["link"], text="", title="", error="HTTP 503")
+
+        with TemporaryDirectory() as temp_dir:
+            config = Config(vault_path=temp_dir, sleep_seconds=0)
+            args = parse_args(["--estimate", "--estimate-sample-size", "1"])
+            output = StringIO()
+            with (
+                patch.dict(os.environ, {"RAINDROP_TOKEN": "token"}, clear=True),
+                patch("raindian.__main__.RaindropClient.iter_raindrops", return_value=iter(items)),
+                patch("raindian.__main__.fetch_page_text", return_value=failed_page),
+                redirect_stdout(output),
+            ):
+                result = estimate_bookmarks(config, args)
+
+        self.assertEqual(result, 1)
+        self.assertIn("sampled=0", output.getvalue())
+        self.assertNotIn("GPT-5.6 Sol", output.getvalue())
+
+    def test_estimate_reports_empty_target_without_page_fetch(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config = Config(vault_path=temp_dir, sleep_seconds=0)
+            args = parse_args(["--estimate"])
+            output = StringIO()
+            with (
+                patch.dict(os.environ, {"RAINDROP_TOKEN": "token"}, clear=True),
+                patch("raindian.__main__.RaindropClient.iter_raindrops", return_value=iter(())),
+                patch("raindian.__main__.fetch_page_text") as fetch_page,
+                redirect_stdout(output),
+            ):
+                result = estimate_bookmarks(config, args)
+
+        self.assertEqual(result, 0)
+        self.assertIn("target=0", output.getvalue())
+        fetch_page.assert_not_called()
+
+    def test_main_rejects_estimate_with_dry_run(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.json"
+            config_path.write_text('{"vault_path": "C:/vault"}', encoding="utf-8")
+            with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                result = main(["--config", str(config_path), "--estimate", "--dry-run"])
+
+        self.assertEqual(result, 1)
 
 
 if __name__ == "__main__":

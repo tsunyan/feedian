@@ -5,13 +5,15 @@ import os
 import sys
 import time
 import uuid
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from .config import Config, load_config
+from .estimate import count_prompt_tokens, format_cost_rows, parse_sample_size, projected_costs, select_sample
 from .extract import PageFetchResult, fetch_page_text
-from .llm import summarize_bookmark
+from .llm import build_prompt, summarize_bookmark
 from .markdown import note_filename, render_note
 from .raindrop import RaindropClient
 
@@ -46,6 +48,17 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--no-llm",
         action="store_true",
         help="Create notes from metadata without calling OpenAI.",
+    )
+    parser.add_argument(
+        "--estimate",
+        action="store_true",
+        help="Estimate OpenAI API cost without calling OpenAI or writing notes.",
+    )
+    parser.add_argument(
+        "--estimate-sample-size",
+        default="10%",
+        metavar="SIZE",
+        help="Sample size for --estimate: an integer, percentage, or 0 (default: 10%%).",
     )
     return parser.parse_args(argv)
 
@@ -271,12 +284,117 @@ def process_bookmarks(config: Config, args: argparse.Namespace) -> int:
     return 1 if failed else 0
 
 
+def estimate_bookmarks(config: Config, args: argparse.Namespace) -> int:
+    started_at = time.perf_counter()
+    raindrop_token = require_env("RAINDROP_TOKEN")
+    model = os.environ.get("OPENAI_MODEL", config.openai_model)
+    client = RaindropClient(
+        token=raindrop_token,
+        timeout_seconds=config.request_timeout_seconds,
+        max_retries=config.max_retries,
+        retry_base_seconds=config.retry_base_seconds,
+    )
+    items = list(
+        client.iter_raindrops(
+            collection_id=config.collection_id,
+            per_page=config.per_page,
+            nested=config.nested,
+            limit=args.limit,
+        )
+    )
+    population = len(items)
+    if population == 0:
+        print("estimate: target=0")
+        return 0
+    sample_size = parse_sample_size(args.estimate_sample_size, population)
+    if sample_size == 0:
+        _print_count_only_estimate(population, config.max_output_tokens, model)
+        _print_elapsed(started_at)
+        return 0
+
+    samples = select_sample(items, sample_size)
+    token_counts: list[int] = []
+    failures: Counter[str] = Counter()
+    tokenizer_fallbacks: set[str] = set()
+    for item in samples:
+        url = item.get("link")
+        if not isinstance(url, str) or not url:
+            failures["bookmark has no URL"] += 1
+            continue
+        page = fetch_page_text(
+            url,
+            timeout_seconds=config.request_timeout_seconds,
+            max_chars=config.max_article_chars,
+            allow_private_urls=config.allow_private_urls,
+        )
+        if page.error:
+            failures[page.error] += 1
+            continue
+        prompt = build_prompt(item=item, page=page, language=config.language)
+        token_count, fallback = count_prompt_tokens(prompt, model)
+        token_counts.append(token_count)
+        if fallback:
+            tokenizer_fallbacks.add(fallback)
+        if config.sleep_seconds > 0:
+            time.sleep(config.sleep_seconds)
+
+    if not token_counts:
+        print(f"estimate: target={population} sample={len(samples)} sampled=0 failed={sum(failures.values())}")
+        for reason, count in failures.most_common():
+            print(f"  page fetch failure: {count} x {reason}")
+        _print_elapsed(started_at)
+        return 1
+
+    mean_tokens = sum(token_counts) / len(token_counts)
+    projected_input_tokens = population * mean_tokens
+    print(
+        f"estimate: target={population} sample={len(samples)} sampled={len(token_counts)} "
+        f"failed={sum(failures.values())}"
+    )
+    print(
+        f"estimate: mean_input_tokens={mean_tokens:.0f} "
+        f"projected_input_tokens={projected_input_tokens:.0f} "
+        f"max_output_tokens={config.max_output_tokens}"
+    )
+    for encoding_name in sorted(tokenizer_fallbacks):
+        print(f"estimate: tokenizer fallback={encoding_name}")
+    for reason, count in failures.most_common():
+        print(f"  page fetch failure: {count} x {reason}")
+    for line in format_cost_rows(
+        projected_costs(population, mean_tokens, config.max_output_tokens),
+        selected_model=model,
+    ):
+        print(line)
+    _print_elapsed(started_at)
+    return 0
+
+
+def _print_count_only_estimate(population: int, max_output_tokens: int, selected_model: str) -> None:
+    lower = projected_costs(population, 2_000, max_output_tokens)
+    upper = projected_costs(population, 10_000, max_output_tokens)
+    print(
+        f"estimate: target={population} sample=0 count-only=true "
+        "input_tokens_per_item=2000-10000 (generic range)"
+    )
+    print(f"estimate: max_output_tokens={max_output_tokens}")
+    print("model\ttotal (max)")
+    for lower_row, upper_row in zip(lower, upper):
+        selected = " [selected]" if lower_row.model == selected_model else ""
+        print(f"{lower_row.name}{selected}\t${lower_row.total_cost:.2f}-${upper_row.total_cost:.2f}")
+
+
+def _print_elapsed(started_at: float) -> None:
+    print(f"done: elapsed={time.perf_counter() - started_at:.1f}s")
+
+
 def main(argv: list[str] | None = None) -> int:
     configure_console_output()
     args = parse_args(argv or sys.argv[1:])
     try:
         load_env_file(Path(".env"))
         config = apply_overrides(load_config(args.config), args)
+        if args.estimate and (args.dry_run or args.list_collections):
+            raise ValueError("--estimate cannot be combined with --dry-run or --list-collections.")
         if args.list_collections:
             raindrop_token = require_env("RAINDROP_TOKEN")
             client = RaindropClient(
@@ -287,6 +405,8 @@ def main(argv: list[str] | None = None) -> int:
             )
             list_collections(client)
             return 0
+        if args.estimate:
+            return estimate_bookmarks(config, args)
         return process_bookmarks(config, args)
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)

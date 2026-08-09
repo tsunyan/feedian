@@ -99,6 +99,16 @@ def projected_costs(
     ]
 
 
+def format_cost_rows(rows: list[CostRow], selected_model: str) -> list[str]:
+    lines = ["model\tinput\toutput (max)\ttotal (max)"]
+    for row in rows:
+        selected = " [selected]" if row.model == selected_model else ""
+        lines.append(
+            f"{row.name}{selected}\t${row.input_cost:.2f}\t${row.output_cost:.2f}\t${row.total_cost:.2f}"
+        )
+    return lines
+
+
 def _collection_id(item: dict[str, Any]) -> int:
     collection = item.get("collection")
     if not isinstance(collection, dict):
