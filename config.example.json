@@ -1,0 +1,15 @@
+{
+  "vault_path": "C:\\Users\\you\\Documents\\Obsidian\\Vault",
+  "output_folder": "Raindrop",
+  "collection_id": 0,
+  "nested": true,
+  "per_page": 50,
+  "base_tags": ["raindrop", "bookmark"],
+  "language": "ja",
+  "openai_model": "gpt-5.6-luna",
+  "max_article_chars": 10000,
+  "max_output_tokens": 800,
+  "openai_reasoning_effort": "none",
+  "request_timeout_seconds": 30,
+  "sleep_seconds": 0.3
+}
