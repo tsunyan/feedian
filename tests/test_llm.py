@@ -27,10 +27,13 @@ class LlmTests(unittest.TestCase):
         response = mock_urlopen.return_value.__enter__.return_value
         response.read.return_value = (
             b'{"output_text":"{\\"note_title\\":\\"Title\\",\\"summary\\":\\"Summary\\",'
-            b'\\"key_points\\":[],\\"tags\\":[\\"tag\\"],\\"content_type\\":\\"link\\"}"}'
+            b'\\"key_points\\":[],\\"tags\\":[\\"tag\\"],\\"content_type\\":\\"link\\"}",'
+            b'"usage":{"input_tokens":120,"output_tokens":34,"total_tokens":154,'
+            b'"input_tokens_details":{"cached_tokens":20},'
+            b'"output_tokens_details":{"reasoning_tokens":8}}}'
         )
 
-        summarize_bookmark(
+        summary = summarize_bookmark(
             api_key="key",
             model="gpt-5.6-luna",
             item={"title": "Title", "link": "https://example.com"},
@@ -48,6 +51,16 @@ class LlmTests(unittest.TestCase):
         self.assertEqual(payload["reasoning"], {"effort": "none"})
         self.assertEqual(payload["text"]["verbosity"], "low")
         self.assertIn("untrusted reference data", payload["instructions"])
+        self.assertEqual(
+            summary["_raindian_usage"],
+            {
+                "input_tokens": 120,
+                "cached_input_tokens": 20,
+                "output_tokens": 34,
+                "reasoning_tokens": 8,
+                "total_tokens": 154,
+            },
+        )
 
     def test_prompt_marks_bookmark_content_as_untrusted(self) -> None:
         prompt = build_prompt(

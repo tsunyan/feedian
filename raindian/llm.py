@@ -9,6 +9,9 @@ from .extract import PageFetchResult
 from .retry import run_with_retries
 
 
+USAGE_FIELD = "_raindian_usage"
+
+
 SUMMARY_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -106,6 +109,7 @@ def summarize_bookmark(
         result = json.loads(output_text)
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"OpenAI output was not valid JSON: {output_text[:500]}") from exc
+    result[USAGE_FIELD] = extract_usage(data)
     return result
 
 
@@ -160,3 +164,26 @@ def extract_output_text(data: dict[str, Any]) -> str:
             if isinstance(text, str):
                 texts.append(text)
     return "\n".join(texts).strip()
+
+
+def extract_usage(data: dict[str, Any]) -> dict[str, int]:
+    usage = data.get("usage")
+    if not isinstance(usage, dict):
+        return {}
+    input_details = usage.get("input_tokens_details")
+    output_details = usage.get("output_tokens_details")
+    return {
+        "input_tokens": _usage_count(usage.get("input_tokens")),
+        "cached_input_tokens": _usage_count(
+            input_details.get("cached_tokens") if isinstance(input_details, dict) else None
+        ),
+        "output_tokens": _usage_count(usage.get("output_tokens")),
+        "reasoning_tokens": _usage_count(
+            output_details.get("reasoning_tokens") if isinstance(output_details, dict) else None
+        ),
+        "total_tokens": _usage_count(usage.get("total_tokens")),
+    }
+
+
+def _usage_count(value: Any) -> int:
+    return value if isinstance(value, int) and value >= 0 else 0

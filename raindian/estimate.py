@@ -4,7 +4,8 @@ import math
 import re
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_CEILING
-from typing import Any
+from typing import Any, Callable, Sequence
+from urllib.request import Request, urlopen
 
 import tiktoken
 
@@ -14,6 +15,7 @@ class ModelPrice:
     name: str
     model: str
     input_per_million: float
+    cached_input_per_million: float
     output_per_million: float
 
 
@@ -26,11 +28,21 @@ class CostRow:
     total_cost: float
 
 
+@dataclass(frozen=True)
+class PriceRefresh:
+    prices: tuple[ModelPrice, ...]
+    source: str
+    warning: str | None
+    fallback_models: frozenset[str] = frozenset()
+
+
+MODEL_DOCS_BASE_URL = "https://developers.openai.com"
+MODEL_CATALOG_URL = f"{MODEL_DOCS_BASE_URL}/api/docs/models.md"
 MODEL_PRICES = (
-    ModelPrice("GPT-5.6 Sol", "gpt-5.6-sol", 5.00, 30.00),
-    ModelPrice("GPT-5.6 Terra", "gpt-5.6-terra", 2.50, 15.00),
-    ModelPrice("GPT-5.6 Luna", "gpt-5.6-luna", 1.00, 6.00),
-    ModelPrice("GPT-5.5", "gpt-5.5", 5.00, 30.00),
+    ModelPrice("GPT-5.6 Sol", "gpt-5.6-sol", 5.00, 0.50, 30.00),
+    ModelPrice("GPT-5.6 Terra", "gpt-5.6-terra", 2.00, 0.20, 12.00),
+    ModelPrice("GPT-5.6 Luna", "gpt-5.6-luna", 0.20, 0.02, 1.20),
+    ModelPrice("GPT-5.5", "gpt-5.5", 5.00, 0.50, 30.00),
 )
 
 
@@ -83,6 +95,7 @@ def projected_costs(
     population: int,
     input_tokens_per_item: float,
     max_output_tokens: int,
+    prices: Sequence[ModelPrice] = MODEL_PRICES,
 ) -> list[CostRow]:
     input_tokens = population * input_tokens_per_item
     output_tokens = population * max_output_tokens
@@ -95,21 +108,157 @@ def projected_costs(
             total_cost=(input_tokens * price.input_per_million + output_tokens * price.output_per_million)
             / 1_000_000,
         )
-        for price in MODEL_PRICES
+        for price in prices
     ]
 
 
-def format_cost_rows(rows: list[CostRow], selected_model: str) -> list[str]:
+def refresh_model_prices(
+    selected_model: str,
+    timeout_seconds: int,
+    fetch_text: Callable[[str, int], str] | None = None,
+    include_recommended: bool = True,
+) -> PriceRefresh:
+    fetch = fetch_text or _fetch_official_text
+    try:
+        catalog = fetch(MODEL_CATALOG_URL, timeout_seconds)
+        links = _model_links(catalog)
+        candidates = _recommended_model_links(catalog) if include_recommended else []
+        pricing_model = comparison_model(selected_model)
+        if pricing_model not in {model for _, model, _ in candidates}:
+            name, url = links.get(pricing_model, (pricing_model, _model_url(pricing_model)))
+            if url:
+                candidates.append((name, pricing_model, url))
+        prices: list[ModelPrice] = []
+        errors: list[str] = []
+        fallback_models: set[str] = set()
+        for name, _, url in candidates:
+            try:
+                prices.append(_parse_model_price(fetch(url, timeout_seconds), name))
+            except (OSError, ValueError) as exc:
+                errors.append(str(exc))
+        if prices:
+            if pricing_model not in {price.model for price in prices}:
+                fallback_price = next(
+                    (price for price in MODEL_PRICES if price.model == pricing_model), None
+                )
+                if fallback_price:
+                    prices.append(fallback_price)
+                    fallback_models.add(pricing_model)
+            warning = "; ".join(errors) if errors else None
+            return PriceRefresh(tuple(prices), "official", warning, frozenset(fallback_models))
+        raise OSError("; ".join(errors) or "no model pricing was found")
+    except (OSError, ValueError) as exc:
+        return PriceRefresh(
+            MODEL_PRICES,
+            "fallback",
+            str(exc),
+            frozenset(price.model for price in MODEL_PRICES),
+        )
+
+
+def _fetch_official_text(url: str, timeout_seconds: int) -> str:
+    request = Request(url, headers={"User-Agent": "Raindian/1.0"})
+    with urlopen(request, timeout=timeout_seconds) as response:
+        return response.read().decode("utf-8")
+
+
+def _recommended_model_links(catalog: str) -> list[tuple[str, str, str]]:
+    start = catalog.find("## Recommended models")
+    if start < 0:
+        raise ValueError("official model catalog has no Recommended models section")
+    next_heading = catalog.find("\n## ", start + 1)
+    section = catalog[start:] if next_heading < 0 else catalog[start:next_heading]
+    links = _model_links(section)
+    if not links:
+        raise ValueError("official model catalog has no recommended model links")
+    return [(name, model, url) for model, (name, url) in links.items()]
+
+
+def _model_links(text: str) -> dict[str, tuple[str, str]]:
+    links: dict[str, tuple[str, str]] = {}
+    for name, path in re.findall(r"- \[([^\]]+)\]\((/api/docs/models/[A-Za-z0-9._-]+\.md)\)", text):
+        model = path.removesuffix(".md").rsplit("/", 1)[-1]
+        links.setdefault(model, (name, f"{MODEL_DOCS_BASE_URL}{path}"))
+    return links
+
+
+def _model_url(model: str) -> str | None:
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", model):
+        return None
+    return f"{MODEL_DOCS_BASE_URL}/api/docs/models/{model}.md"
+
+
+def _parse_model_price(document: str, fallback_name: str) -> ModelPrice:
+    model_match = re.search(r"^Model ID: `([^`]+)`$", document, flags=re.MULTILINE)
+    if not model_match:
+        raise ValueError("official model document has no model ID")
+    heading_match = re.search(r"^# (.+)$", document, flags=re.MULTILINE)
+    name = heading_match.group(1).strip() if heading_match else fallback_name
+    pricing_start = document.find("### Text tokens")
+    if pricing_start < 0:
+        raise ValueError(f"official model document has no text token pricing for {model_match.group(1)}")
+    pricing = document[pricing_start:]
+    input_match = re.search(r"^\| Input \| \$([0-9]+(?:\.[0-9]+)?) \|", pricing, flags=re.MULTILINE)
+    cached_input_match = re.search(
+        r"^\| Cached input \| \$([0-9]+(?:\.[0-9]+)?) \|", pricing, flags=re.MULTILINE
+    )
+    output_match = re.search(r"^\| Output \| \$([0-9]+(?:\.[0-9]+)?) \|", pricing, flags=re.MULTILINE)
+    if not input_match or not output_match:
+        raise ValueError(f"official model document has incomplete text token pricing for {model_match.group(1)}")
+    return ModelPrice(
+        name=name,
+        model=model_match.group(1),
+        input_per_million=float(input_match.group(1)),
+        cached_input_per_million=(
+            float(cached_input_match.group(1)) if cached_input_match else float(input_match.group(1))
+        ),
+        output_per_million=float(output_match.group(1)),
+    )
+
+
+def usage_cost_usd(usage: dict[str, Any], price: ModelPrice) -> float:
+    input_tokens = _usage_token_count(usage.get("input_tokens"))
+    cached_input_tokens = min(input_tokens, _usage_token_count(usage.get("cached_input_tokens")))
+    output_tokens = _usage_token_count(usage.get("output_tokens"))
+    return (
+        (input_tokens - cached_input_tokens) * price.input_per_million
+        + cached_input_tokens * price.cached_input_per_million
+        + output_tokens * price.output_per_million
+    ) / 1_000_000
+
+
+def _usage_token_count(value: Any) -> int:
+    return value if isinstance(value, int) and value >= 0 else 0
+
+
+def format_cost_rows(
+    rows: Sequence[CostRow],
+    selected_model: str,
+    typical_rows: Sequence[CostRow] | None = None,
+) -> list[str]:
     pricing_model = comparison_model(selected_model)
     lines: list[str] = []
     if not any(row.model == pricing_model for row in rows):
         lines.append(f"selected model: {selected_model} (not in comparison table)")
-    lines.append("model\tinput\toutput (max)\ttotal (max)")
+    typical_by_model = {row.model: row for row in typical_rows} if typical_rows else {}
+    if typical_rows:
+        lines.append(
+            "model\tinput\toutput (input-matched)\ttotal (input-matched)\toutput (max)\ttotal (max)"
+        )
+    else:
+        lines.append("model\tinput\toutput (max)\ttotal (max)")
     for row in rows:
         selected = " [selected]" if row.model == pricing_model else ""
-        lines.append(
-            f"{row.name}{selected}\t${row.input_cost:.2f}\t${row.output_cost:.2f}\t${row.total_cost:.2f}"
-        )
+        typical = typical_by_model.get(row.model)
+        if typical:
+            lines.append(
+                f"{row.name}{selected}\t${row.input_cost:.2f}\t${typical.output_cost:.2f}\t"
+                f"${typical.total_cost:.2f}\t${row.output_cost:.2f}\t${row.total_cost:.2f}"
+            )
+        else:
+            lines.append(
+                f"{row.name}{selected}\t${row.input_cost:.2f}\t${row.output_cost:.2f}\t${row.total_cost:.2f}"
+            )
     return lines
 
 

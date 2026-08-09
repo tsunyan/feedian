@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -12,15 +13,18 @@ from typing import Any
 
 from .config import Config, load_config
 from .estimate import (
+    ModelPrice,
     comparison_model,
     count_prompt_tokens,
     format_cost_rows,
     parse_sample_size,
     projected_costs,
+    refresh_model_prices,
     select_sample,
+    usage_cost_usd,
 )
 from .extract import PageFetchResult, fetch_page_text
-from .llm import SUMMARY_INSTRUCTIONS, build_prompt, summarize_bookmark
+from .llm import SUMMARY_INSTRUCTIONS, USAGE_FIELD, build_prompt, summarize_bookmark
 from .markdown import note_filename, render_note
 from .raindrop import RaindropClient
 
@@ -59,7 +63,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--estimate",
         action="store_true",
-        help="Estimate OpenAI API cost without calling OpenAI or writing notes.",
+        help="Estimate model API cost without calling a model or writing notes.",
     )
     parser.add_argument(
         "--estimate-sample-size",
@@ -186,11 +190,96 @@ def write_note_atomically(target: Path, markdown: str) -> None:
         raise
 
 
+def append_usage_record(
+    destination: Path,
+    item: dict[str, Any],
+    model: str,
+    reasoning_effort: str,
+    max_output_tokens: int,
+    usage: dict[str, Any],
+    price: ModelPrice | None,
+    price_source: str,
+) -> None:
+    record = {
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+        "raindrop_id": item.get("_id"),
+        "model": model,
+        "reasoning_effort": reasoning_effort,
+        "max_output_tokens": max_output_tokens,
+        "summary_format": "bookmark_note/v1",
+        "input_tokens": usage.get("input_tokens", 0),
+        "cached_input_tokens": usage.get("cached_input_tokens", 0),
+        "output_tokens": usage.get("output_tokens", 0),
+        "reasoning_tokens": usage.get("reasoning_tokens", 0),
+        "total_tokens": usage.get("total_tokens", 0),
+        "price_source": price_source,
+        "input_per_million_usd": price.input_per_million if price else None,
+        "cached_input_per_million_usd": price.cached_input_per_million if price else None,
+        "output_per_million_usd": price.output_per_million if price else None,
+        "estimated_cost_usd": usage_cost_usd(usage, price) if price else None,
+    }
+    with (destination / ".raindian-usage.jsonl").open("a", encoding="utf-8", newline="\n") as usage_file:
+        usage_file.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+
+def usage_output_ratio(
+    destination: Path,
+    model: str,
+    reasoning_effort: str,
+) -> tuple[float, int] | None:
+    usage_path = destination / ".raindian-usage.jsonl"
+    if not usage_path.exists():
+        return None
+    input_total = 0
+    output_total = 0
+    record_count = 0
+    for line in usage_path.read_text(encoding="utf-8").splitlines():
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(record, dict):
+            continue
+        if record.get("model") != model or record.get("reasoning_effort") != reasoning_effort:
+            continue
+        input_tokens = _non_negative_int(record.get("input_tokens"))
+        output_tokens = _non_negative_int(record.get("output_tokens"))
+        if input_tokens is None or output_tokens is None or input_tokens == 0:
+            continue
+        input_total += input_tokens
+        output_total += output_tokens
+        record_count += 1
+    if input_total == 0:
+        return None
+    return output_total / input_total, record_count
+
+
+def _non_negative_int(value: Any) -> int | None:
+    return value if isinstance(value, int) and value >= 0 else None
+
+
 def process_bookmarks(config: Config, args: argparse.Namespace) -> int:
     started_at = time.perf_counter()
     raindrop_token = require_env("RAINDROP_TOKEN")
     openai_key = "" if args.no_llm or args.dry_run else require_env("OPENAI_API_KEY")
     model = os.environ.get("OPENAI_MODEL", config.openai_model)
+    usage_price: ModelPrice | None = None
+    usage_price_source = "unavailable"
+    if not args.no_llm and not args.dry_run:
+        print("usage: phase=refreshing-model-prices")
+        price_refresh = refresh_model_prices(
+            model,
+            timeout_seconds=min(config.request_timeout_seconds, 10),
+            include_recommended=False,
+        )
+        pricing_model = comparison_model(model)
+        usage_price = next((price for price in price_refresh.prices if price.model == pricing_model), None)
+        usage_price_source = (
+            "fallback" if pricing_model in price_refresh.fallback_models else price_refresh.source
+        )
+        print(f"usage: price_source={usage_price_source}")
+        if price_refresh.warning:
+            print(f"usage: price_refresh_warning={price_refresh.warning}")
     client = RaindropClient(
         token=raindrop_token,
         timeout_seconds=config.request_timeout_seconds,
@@ -260,6 +349,7 @@ def process_bookmarks(config: Config, args: argparse.Namespace) -> int:
                 print(f"  summary warning: {exc}")
                 failed += 1
                 continue
+        usage = summary.pop(USAGE_FIELD, None)
 
         markdown = render_note(
             item=item,
@@ -279,6 +369,21 @@ def process_bookmarks(config: Config, args: argparse.Namespace) -> int:
                 failed += 1
                 continue
             created += 1
+            if isinstance(usage, dict):
+                try:
+                    append_usage_record(
+                        destination=destination,
+                        item=item,
+                        model=model,
+                        reasoning_effort=config.openai_reasoning_effort,
+                        max_output_tokens=config.max_output_tokens,
+                        usage=usage,
+                        price=usage_price,
+                        price_source=usage_price_source,
+                    )
+                except OSError as exc:
+                    print(f"  usage log warning: {exc}")
+                    failed += 1
 
         if config.sleep_seconds > 0:
             time.sleep(config.sleep_seconds)
@@ -295,6 +400,11 @@ def estimate_bookmarks(config: Config, args: argparse.Namespace) -> int:
     started_at = time.perf_counter()
     raindrop_token = require_env("RAINDROP_TOKEN")
     model = os.environ.get("OPENAI_MODEL", config.openai_model)
+    _estimate_progress("phase=refreshing-model-prices")
+    price_refresh = refresh_model_prices(model, timeout_seconds=min(config.request_timeout_seconds, 10))
+    print(f"estimate: price_source={price_refresh.source} url=https://developers.openai.com/api/docs/models")
+    if price_refresh.warning:
+        print(f"estimate: price_refresh_warning={price_refresh.warning}")
     client = RaindropClient(
         token=raindrop_token,
         timeout_seconds=config.request_timeout_seconds,
@@ -320,7 +430,7 @@ def estimate_bookmarks(config: Config, args: argparse.Namespace) -> int:
     sample_size = parse_sample_size(args.estimate_sample_size, population)
     if sample_size == 0:
         _estimate_progress("phase=calculating-costs count-only=true")
-        _print_count_only_estimate(population, config.max_output_tokens, model)
+        _print_count_only_estimate(population, config.max_output_tokens, model, price_refresh.prices)
         _print_elapsed(started_at)
         return 0
 
@@ -377,18 +487,51 @@ def estimate_bookmarks(config: Config, args: argparse.Namespace) -> int:
     for reason, count in failures.most_common():
         print(f"  page fetch failure: {count} x {reason}")
     _estimate_progress("phase=calculating-costs")
+    historical_usage = usage_output_ratio(
+        output_dir(config),
+        model,
+        config.openai_reasoning_effort,
+    )
+    if historical_usage:
+        output_ratio, usage_records = historical_usage
+        typical_output_tokens = min(mean_tokens * output_ratio, config.max_output_tokens)
+        print(
+            f"estimate: assumed_output_tokens={typical_output_tokens:.0f} "
+            f"(usage-ratio records={usage_records})"
+        )
+    else:
+        typical_output_tokens = min(mean_tokens, config.max_output_tokens)
+        print(f"estimate: assumed_output_tokens={typical_output_tokens:.0f} (input-matched)")
+    maximum_rows = projected_costs(
+        population,
+        mean_tokens,
+        config.max_output_tokens,
+        price_refresh.prices,
+    )
+    typical_rows = projected_costs(
+        population,
+        mean_tokens,
+        typical_output_tokens,
+        price_refresh.prices,
+    )
     for line in format_cost_rows(
-        projected_costs(population, mean_tokens, config.max_output_tokens),
+        maximum_rows,
         selected_model=model,
+        typical_rows=typical_rows,
     ):
         print(line)
     _print_elapsed(started_at)
     return 0
 
 
-def _print_count_only_estimate(population: int, max_output_tokens: int, selected_model: str) -> None:
-    lower = projected_costs(population, 2_000, max_output_tokens)
-    upper = projected_costs(population, 10_000, max_output_tokens)
+def _print_count_only_estimate(
+    population: int,
+    max_output_tokens: int,
+    selected_model: str,
+    prices: tuple[ModelPrice, ...],
+) -> None:
+    lower = projected_costs(population, 2_000, max_output_tokens, prices)
+    upper = projected_costs(population, 10_000, max_output_tokens, prices)
     print(
         f"estimate: target={population} sample=0 count-only=true "
         "input_tokens_per_item=2000-10000 (generic range)"

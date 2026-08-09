@@ -57,19 +57,33 @@ is unknown to the installed tokenizer, Raindian uses `o200k_base` and states tha
 fallback in its output.
 
 The mean measured input-token count is multiplied by the total target bookmark count.
-Each supported model's total is calculated using that projected input plus the
-configured `max_output_tokens` for every target item. The output always includes GPT-5.6
-Sol, GPT-5.6 Terra, GPT-5.6 Luna, and GPT-5.5. The model configured by `openai_model`
-is visibly marked `selected`.
+Each model's total is calculated using that projected input plus the configured
+`max_output_tokens` for every target item. At the beginning of each run, Raindian reads
+the official OpenAI model catalog and the published Markdown pages for its recommended
+models. It also includes the model configured by `openai_model`, which is visibly marked
+`selected`. If the catalog or prices cannot be fetched or parsed, it reports
+`price_source=fallback` and uses its built-in price table instead.
 
 Count-only mode uses the documented generic input-token range from the README instead
 of fetching pages. It is explicitly labeled as less precise.
 
 ## Output and Failures
 
-The command reports target count, resolved sample size, sampled/failed page counts,
-mean input tokens, projected input tokens, configured output-token cap, and elapsed
-time. It then prints a table with all four model prices and estimates.
+The command reports its price-refresh source, target count, resolved sample size,
+sampled/failed page counts, mean input tokens, projected input tokens, configured
+output-token cap, and elapsed time. It then prints a table with the refreshed model
+prices and estimates. When a sample is available, it includes an `input-matched`
+planning estimate that assumes output tokens equal the measured mean input tokens, as
+well as the `max` estimate using `max_output_tokens`. The input-matched value is not a
+replacement for measured API usage. When matching usage records exist, their aggregate
+`output_tokens / input_tokens` ratio replaces the input-matched assumption for the
+typical estimate.
+
+Successful LLM summaries append one JSON line to
+`<vault_path>/<output_folder>/.raindian-usage.jsonl`. It records token counts, model and
+reasoning settings, the price snapshot, and the request's estimated USD cost. It does
+not record page text or URLs. The estimate uses only matching records' input and output
+token counts; the price snapshot is retained for later cost aggregation.
 
 Page fetch failures do not stop the estimate. They are counted and summarized by
 reason, and their Raindrop metadata and fetch-error fallback prompt are included in
@@ -78,7 +92,8 @@ reported without an estimate.
 
 ## Non-goals
 
-- No OpenAI API request, generated note, or vault write occurs in estimate mode.
+- No OpenAI model API request, generated note, or vault write occurs in estimate mode. It may
+  read public OpenAI documentation to refresh the price table.
 - The command does not guarantee the eventual billed amount: server-side request
   framing, model updates, and reasoning tokens can differ from local token counts.
 - It does not add a cache or persist fetched page content.

@@ -1,4 +1,5 @@
 import os
+import json
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
@@ -16,10 +17,19 @@ from raindian.__main__ import (
     write_note_atomically,
 )
 from raindian.config import Config
+from raindian.estimate import MODEL_PRICES, PriceRefresh
 from raindian.extract import PageFetchResult
 
 
 class MainTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.price_refresh = patch(
+            "raindian.__main__.refresh_model_prices",
+            return_value=PriceRefresh(prices=MODEL_PRICES, source="official", warning=None),
+        )
+        self.price_refresh.start()
+        self.addCleanup(self.price_refresh.stop)
+
     def test_write_note_atomically_replaces_existing_note(self) -> None:
         with TemporaryDirectory() as temp_dir:
             target = Path(temp_dir) / "note.md"
@@ -79,6 +89,52 @@ class MainTests(unittest.TestCase):
             self.assertFalse((destination / "First - 1.md").exists())
             self.assertTrue((destination / "Second - 2.md").exists())
 
+    def test_successful_llm_summary_records_usage_without_page_content(self) -> None:
+        item = {"_id": 123, "title": "First", "link": "https://example.com/first", "collection": {}}
+        summary = {
+            "note_title": "First",
+            "summary": "ok",
+            "key_points": [],
+            "tags": [],
+            "content_type": "link",
+            "_raindian_usage": {
+                "input_tokens": 120,
+                "cached_input_tokens": 20,
+                "output_tokens": 34,
+                "reasoning_tokens": 8,
+                "total_tokens": 154,
+            },
+        }
+
+        with TemporaryDirectory() as temp_dir:
+            config = Config(vault_path=temp_dir, sleep_seconds=0)
+            args = parse_args(["--skip-page-fetch"])
+            with (
+                patch.dict(os.environ, {"RAINDROP_TOKEN": "token", "OPENAI_API_KEY": "key"}),
+                patch("raindian.__main__.RaindropClient.iter_raindrops", return_value=iter([item])),
+                patch("raindian.__main__.summarize_bookmark", return_value=summary),
+            ):
+                result = process_bookmarks(config, args)
+
+            usage_path = Path(temp_dir) / "Raindrop" / ".raindian-usage.jsonl"
+            record = json.loads(usage_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(result, 0)
+        self.assertEqual(record["raindrop_id"], 123)
+        self.assertEqual(record["model"], "gpt-5.6-luna")
+        self.assertEqual(record["input_tokens"], 120)
+        self.assertEqual(record["cached_input_tokens"], 20)
+        self.assertEqual(record["output_tokens"], 34)
+        self.assertEqual(record["reasoning_tokens"], 8)
+        self.assertEqual(record["total_tokens"], 154)
+        self.assertEqual(record["price_source"], "official")
+        self.assertEqual(record["input_per_million_usd"], 0.2)
+        self.assertEqual(record["cached_input_per_million_usd"], 0.02)
+        self.assertEqual(record["output_per_million_usd"], 1.2)
+        self.assertEqual(record["estimated_cost_usd"], 0.0000612)
+        self.assertNotIn("url", record)
+        self.assertNotIn("content", record)
+
     def test_dry_run_does_not_fetch_pages_or_call_openai(self) -> None:
         items = [{"_id": 1, "title": "First", "link": "https://example.com/first", "collection": {}}]
 
@@ -111,6 +167,7 @@ class MainTests(unittest.TestCase):
                 patch("raindian.__main__.RaindropClient.iter_raindrops", return_value=iter(items)),
                 patch("raindian.__main__.fetch_page_text", return_value=page) as fetch_page,
                 patch("raindian.__main__.summarize_bookmark") as summarize,
+                patch("raindian.__main__.count_prompt_tokens", return_value=(10, None)),
                 redirect_stdout(output),
             ):
                 result = estimate_bookmarks(config, args)
@@ -125,6 +182,8 @@ class MainTests(unittest.TestCase):
         self.assertIn("phase=sampling", output.getvalue())
         self.assertIn("phase=fetching-pages", output.getvalue())
         self.assertIn("phase=calculating-costs", output.getvalue())
+        self.assertIn("price_source=official", output.getvalue())
+        self.assertIn("assumed_output_tokens=10 (input-matched)", output.getvalue())
 
     def test_estimate_counts_the_shared_developer_instructions(self) -> None:
         items = [{"_id": 1, "title": "First", "link": "https://example.com/first", "collection": {}}]
@@ -143,6 +202,37 @@ class MainTests(unittest.TestCase):
                 estimate_bookmarks(config, args)
 
         self.assertIn("You summarize bookmarked web pages", count_tokens.call_args.args[0])
+
+    def test_estimate_uses_matching_usage_records_for_typical_output(self) -> None:
+        items = [{"_id": 1, "title": "First", "link": "https://example.com/first", "collection": {}}]
+        page = PageFetchResult(url=items[0]["link"], text="Example page text.", title="Example", error=None)
+        usage_records = [
+            {"model": "gpt-5.6-luna", "reasoning_effort": "none", "input_tokens": 200, "output_tokens": 50},
+            {"model": "gpt-5.6-luna", "reasoning_effort": "none", "input_tokens": 200, "output_tokens": 50},
+        ]
+
+        with TemporaryDirectory() as temp_dir:
+            destination = Path(temp_dir) / "Raindrop"
+            destination.mkdir()
+            usage_path = destination / ".raindian-usage.jsonl"
+            usage_path.write_text(
+                "".join(json.dumps(record) + "\n" for record in usage_records),
+                encoding="utf-8",
+            )
+            config = Config(vault_path=temp_dir, sleep_seconds=0)
+            args = parse_args(["--estimate", "--estimate-sample-size", "1"])
+            output = StringIO()
+            with (
+                patch.dict(os.environ, {"RAINDROP_TOKEN": "token"}, clear=True),
+                patch("raindian.__main__.RaindropClient.iter_raindrops", return_value=iter(items)),
+                patch("raindian.__main__.fetch_page_text", return_value=page),
+                patch("raindian.__main__.count_prompt_tokens", return_value=(100, None)),
+                redirect_stdout(output),
+            ):
+                result = estimate_bookmarks(config, args)
+
+        self.assertEqual(result, 0)
+        self.assertIn("assumed_output_tokens=25 (usage-ratio records=2)", output.getvalue())
 
     def test_estimate_count_only_does_not_fetch_pages(self) -> None:
         items = [{"_id": 1, "title": "First", "link": "https://example.com/first", "collection": {}}]

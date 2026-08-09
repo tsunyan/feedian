@@ -94,8 +94,8 @@ The following rough estimate uses standard, uncached text pricing as of 2026-08-
 | Model | Input / output per 1M tokens | Estimated total for 449 bookmarks |
 | --- | ---: | ---: |
 | [GPT-5.6 Sol](https://developers.openai.com/api/docs/models/gpt-5.6-sol) | $5.00 / $30.00 | $15.27-$33.23 |
-| [GPT-5.6 Terra](https://developers.openai.com/api/docs/models/gpt-5.6-terra) | $2.50 / $15.00 | $7.63-$16.61 |
-| [GPT-5.6 Luna](https://developers.openai.com/api/docs/models/gpt-5.6-luna) | $1.00 / $6.00 | $3.05-$6.65 |
+| [GPT-5.6 Terra](https://developers.openai.com/api/docs/models/gpt-5.6-terra) | $2.00 / $12.00 | $6.11-$13.29 |
+| [GPT-5.6 Luna](https://developers.openai.com/api/docs/models/gpt-5.6-luna) | $0.20 / $1.20 | $0.61-$1.33 |
 | [GPT-5.5](https://developers.openai.com/api/docs/models/gpt-5.5) | $5.00 / $30.00 | $15.27-$33.23 |
 
 Costs scale approximately linearly with the bookmark count. For `N` bookmarks, multiply the 449-bookmark estimate by `N / 449`.
@@ -104,7 +104,7 @@ The estimate is intentionally broad. `max_article_chars` limits fetched page tex
 
 ## Sampled Cost Estimate
 
-Use `--estimate` to calculate a project-specific estimate without calling the OpenAI API or writing notes. It needs `RAINDROP_TOKEN`, fetches a representative sample of linked pages, builds the same prompts used for normal processing, and counts their input tokens locally with `tiktoken`.
+Use `--estimate` to calculate a project-specific estimate without calling an OpenAI model API or writing notes. It needs `RAINDROP_TOKEN`, fetches a representative sample of linked pages, builds the same prompts used for normal processing, and counts their input tokens locally with `tiktoken`. It also reads the public OpenAI model documentation to refresh prices; this does not require `OPENAI_API_KEY` or incur model API charges.
 
 ```powershell
 python -m raindian --config config.json --estimate
@@ -126,7 +126,7 @@ python -m raindian --config config.json --estimate --estimate-sample-size 0
 python -m raindian --config config.json --estimate --skip-page-fetch
 ```
 
-The command reports its current phase while it runs: bookmark collection, every 50 collected bookmarks, sample selection, each page fetch, and cost calculation. The output always shows GPT-5.6 Sol, GPT-5.6 Terra, GPT-5.6 Luna, and GPT-5.5. The `openai_model` from your configuration, or its `OPENAI_MODEL` override, is labeled `selected`; the `gpt-5.6` alias maps to Sol, while other models outside the comparison are named explicitly. A failed page fetch still estimates the fallback prompt made from Raindrop metadata and the fetch error. The estimate uses current uncached token prices and the configured `max_output_tokens` as a per-bookmark output ceiling; server-side request framing, reasoning tokens, or future price changes can still make the final bill differ.
+The command reports its current phase while it runs: official price refresh, bookmark collection, every 50 collected bookmarks, sample selection, each page fetch, and cost calculation. On each run it reads the [official OpenAI model catalog](https://developers.openai.com/api/docs/models) and prices for its recommended models, then also includes the configured `openai_model` (or `OPENAI_MODEL` override) and labels it `selected`. The `gpt-5.6` alias maps to Sol. If the catalog cannot be read or parsed, it prints `price_source=fallback` and uses the built-in price table instead. When pages are sampled, the table shows both a typical and a maximum estimate. The typical estimate uses the aggregate `output_tokens / input_tokens` ratio from matching usage records when available; otherwise it uses the initial `input-matched` assumption that output tokens equal the measured mean input tokens. The maximum estimate uses `max_output_tokens`. A failed page fetch still estimates the fallback prompt made from Raindrop metadata and the fetch error. Server-side request framing, reasoning tokens, or future price changes can still make the final bill differ.
 
 ## Behavior
 
@@ -138,6 +138,7 @@ The command reports its current phase while it runs: bookmark collection, every 
 - Page fetching accepts only `http` and `https` URLs and rejects local/private network addresses by default, including after redirects. Set `allow_private_urls` only for a trusted internal bookmark collection.
 - Linked-page text and bookmark metadata are treated as untrusted reference data when sent to the LLM; instructions in them are not followed.
 - Raindrop and OpenAI requests retry transient 408, 409, 425, 429, 5xx, and network failures with bounded exponential backoff.
+- Successful LLM summaries append a JSON line to `<vault_path>/<output_folder>/.raindian-usage.jsonl`. Each line contains token usage, model and reasoning settings, a price snapshot, and the request's estimated USD cost; it does not contain page text or URLs.
 
 ## Useful Commands
 
