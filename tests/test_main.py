@@ -455,10 +455,14 @@ class MainTests(unittest.TestCase):
             args = parse_args(["--sync-raindrop-summary"])
             client = Mock()
             client.get_raindrop.return_value = {"note": "My manual note"}
+            output = StringIO()
 
-            result = sync_raindrop_summaries(config, args, client)
+            with redirect_stdout(output):
+                result = sync_raindrop_summaries(config, args, client)
 
         self.assertEqual(result, 0)
+        self.assertIn("sync: request_interval=0.5s", output.getvalue())
+        self.assertIn("elapsed=", output.getvalue())
         client.update_raindrop_note.assert_called_once()
         updated_note = client.update_raindrop_note.call_args.args[1]
         self.assertIn("My manual note", updated_note)
@@ -498,10 +502,14 @@ class MainTests(unittest.TestCase):
             args = parse_args(["--sync-raindrop-tags"])
             client = Mock()
             client.get_raindrop.return_value = {"tags": ["existing"]}
+            output = StringIO()
 
-            result = sync_raindrop_tags(config, args, client)
+            with redirect_stdout(output):
+                result = sync_raindrop_tags(config, args, client)
 
         self.assertEqual(result, 0)
+        self.assertIn("sync-tags: request_interval=0.5s", output.getvalue())
+        self.assertIn("elapsed=", output.getvalue())
         client.append_raindrop_tags.assert_called_once_with(5, 123, ["新規タグ", "ai"])
 
     def test_sync_raindrop_tags_dry_run_does_not_call_raindrop(self) -> None:

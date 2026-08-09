@@ -580,6 +580,7 @@ def sync_raindrop_summaries(config: Config, args: argparse.Namespace, client: Ra
     if not destination.exists():
         print(f"sync: no output folder: {destination}")
         return 0
+    print(f"sync: request_interval={config.sync_request_interval_seconds:.1f}s")
 
     planned = 0
     updated = 0
@@ -616,9 +617,6 @@ def sync_raindrop_summaries(config: Config, args: argparse.Namespace, client: Ra
         except Exception as exc:
             print(f"  sync warning: {exc}")
             failed += 1
-        if config.sleep_seconds > 0:
-            time.sleep(config.sleep_seconds)
-
     elapsed_seconds = time.perf_counter() - started_at
     print(
         f"done: sync_planned={planned} sync_updated={updated} skipped={skipped} "
@@ -652,6 +650,7 @@ def sync_raindrop_tags(config: Config, args: argparse.Namespace, client: Raindro
     if not destination.exists():
         print(f"sync-tags: no output folder: {destination}")
         return 0
+    print(f"sync-tags: request_interval={config.sync_request_interval_seconds:.1f}s")
 
     planned = 0
     updated = 0
@@ -689,9 +688,6 @@ def sync_raindrop_tags(config: Config, args: argparse.Namespace, client: Raindro
         except Exception as exc:
             print(f"  sync-tags warning: {exc}")
             failed += 1
-        if config.sleep_seconds > 0:
-            time.sleep(config.sleep_seconds)
-
     elapsed_seconds = time.perf_counter() - started_at
     print(
         f"done: tag_sync_planned={planned} tag_sync_updated={updated} skipped={skipped} "
@@ -977,6 +973,7 @@ def main(argv: list[str] | None = None) -> int:
                 timeout_seconds=config.request_timeout_seconds,
                 max_retries=config.max_retries,
                 retry_base_seconds=config.retry_base_seconds,
+                request_interval_seconds=config.sync_request_interval_seconds,
             )
             return sync_raindrop_summaries(config, args, client)
         if args.sync_raindrop_tags:
@@ -988,6 +985,7 @@ def main(argv: list[str] | None = None) -> int:
                 timeout_seconds=config.request_timeout_seconds,
                 max_retries=config.max_retries,
                 retry_base_seconds=config.retry_base_seconds,
+                request_interval_seconds=config.sync_request_interval_seconds,
             )
             return sync_raindrop_tags(config, args, client)
         return process_bookmarks(config, args)

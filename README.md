@@ -78,6 +78,7 @@ Important fields:
 - `allow_private_urls`: Allow page fetches to private or local network addresses (default: `false`).
 - `max_retries`: Maximum retries after a transient Raindrop or OpenAI API failure (default: `3`).
 - `retry_base_seconds`: Initial retry delay; delays double on each retry (default: `1.0`).
+- `sync_request_interval_seconds`: Minimum interval between Raindrop HTTP requests during note or tag sync only (default: `0.5`).
 
 ## OpenAI API Cost Estimate
 
@@ -139,6 +140,7 @@ The command reports its current phase while it runs: official price refresh, boo
 - Page fetching accepts only `http` and `https` URLs and rejects local/private network addresses by default, including after redirects. Set `allow_private_urls` only for a trusted internal bookmark collection.
 - Linked-page text and bookmark metadata are treated as untrusted reference data when sent to the LLM; instructions in them are not followed.
 - Raindrop and OpenAI requests retry transient 408, 409, 425, 429, 5xx, and network failures with bounded exponential backoff.
+- Raindrop note and tag syncs pace each HTTP request independently at `sync_request_interval_seconds`. On a 429 response, the retry waits for the later of `Retry-After` and Raindrop's `X-RateLimit-Reset` time before retrying. Each sync prints its request interval at start and `elapsed=<seconds>s` when complete.
 - Before each OpenAI summary request, Raindian reads the usage log to confirm the vault is available. If the vault cannot be read or a Markdown or usage write fails, it stops before making further OpenAI requests.
 - After an LLM response, Raindian temporarily stores at most one pending note under `~/.raindian/pending` until both the Markdown note and usage record are stored in the vault. The next LLM run automatically completes this pending write without requesting another summary; the local pending file is then removed.
 - Successful LLM summaries append a JSON line with `operation: "summarize"` and a transaction ID to `<vault_path>/<output_folder>/.raindian-usage.jsonl`. Each line contains token usage, model and reasoning settings, a price snapshot, and the request's estimated USD cost; it does not contain page text or URLs.
