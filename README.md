@@ -79,7 +79,7 @@ Important fields:
 
 `--no-llm` does not call the OpenAI API, so it does not incur OpenAI API charges.
 
-The following rough estimate uses standard, uncached text pricing as of 2026-08-08 and assumes:
+The following rough estimate uses standard, uncached text pricing as of 2026-08-09 and assumes:
 
 - 449 bookmarks
 - About 2,000-10,000 input tokens per bookmark (up to 10,000 fetched page characters plus metadata)
@@ -90,9 +90,11 @@ The following rough estimate uses standard, uncached text pricing as of 2026-08-
 | Model | Input / output per 1M tokens | Estimated total for 449 bookmarks |
 | --- | ---: | ---: |
 | [GPT-5.6 Sol](https://developers.openai.com/api/docs/models/gpt-5.6-sol) | $5.00 / $30.00 | $15.27-$33.23 |
-| [GPT-5.6 Terra](https://developers.openai.com/api/docs/models/gpt-5.6-terra) | $2.50 / $15.00 | $7.63-$16.61 |
-| [GPT-5.6 Luna](https://developers.openai.com/api/docs/models/gpt-5.6-luna) | $1.00 / $6.00 | $3.05-$6.64 |
+| [GPT-5.6 Terra](https://developers.openai.com/api/docs/models/gpt-5.6-terra) | $2.00 / $12.00 | $6.11-$13.29 |
+| [GPT-5.6 Luna](https://developers.openai.com/api/docs/models/gpt-5.6-luna) | $0.20 / $1.20 | $0.61-$1.33 |
 | [GPT-5.5](https://developers.openai.com/api/docs/models/gpt-5.5) | $5.00 / $30.00 | $15.27-$33.23 |
+
+Costs scale approximately linearly with the bookmark count. For `N` bookmarks, multiply the 449-bookmark estimate by `N / 449`.
 
 The estimate is intentionally broad. `max_article_chars` limits fetched page text by characters, not API tokens. `max_output_tokens` is a hard ceiling for visible output and reasoning tokens, but actual input length still varies with page language and metadata. Check the linked official OpenAI documentation before a large run because model pricing can change.
 
