@@ -13,7 +13,7 @@ from typing import Any
 from .config import Config, load_config
 from .estimate import count_prompt_tokens, format_cost_rows, parse_sample_size, projected_costs, select_sample
 from .extract import PageFetchResult, fetch_page_text
-from .llm import build_prompt, summarize_bookmark
+from .llm import SUMMARY_INSTRUCTIONS, build_prompt, summarize_bookmark
 from .markdown import note_filename, render_note
 from .raindrop import RaindropClient
 
@@ -331,7 +331,7 @@ def estimate_bookmarks(config: Config, args: argparse.Namespace) -> int:
             failures[page.error] += 1
             continue
         prompt = build_prompt(item=item, page=page, language=config.language)
-        token_count, fallback = count_prompt_tokens(prompt, model)
+        token_count, fallback = count_prompt_tokens(f"{SUMMARY_INSTRUCTIONS}\n\n{prompt}", model)
         token_counts.append(token_count)
         if fallback:
             tokenizer_fallbacks.add(fallback)

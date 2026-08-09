@@ -28,8 +28,8 @@ class CostRow:
 
 MODEL_PRICES = (
     ModelPrice("GPT-5.6 Sol", "gpt-5.6-sol", 5.00, 30.00),
-    ModelPrice("GPT-5.6 Terra", "gpt-5.6-terra", 2.00, 12.00),
-    ModelPrice("GPT-5.6 Luna", "gpt-5.6-luna", 0.20, 1.20),
+    ModelPrice("GPT-5.6 Terra", "gpt-5.6-terra", 2.50, 15.00),
+    ModelPrice("GPT-5.6 Luna", "gpt-5.6-luna", 1.00, 6.00),
     ModelPrice("GPT-5.5", "gpt-5.5", 5.00, 30.00),
 )
 

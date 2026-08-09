@@ -55,7 +55,7 @@ class EstimateTests(unittest.TestCase):
             [row.name for row in rows],
             ["GPT-5.6 Sol", "GPT-5.6 Terra", "GPT-5.6 Luna", "GPT-5.5"],
         )
-        self.assertEqual(rows[2].input_cost, 0.04)
+        self.assertEqual(rows[2].input_cost, 0.20)
 
 
 if __name__ == "__main__":

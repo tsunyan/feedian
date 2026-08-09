@@ -122,6 +122,24 @@ class MainTests(unittest.TestCase):
         self.assertIn("GPT-5.6 Sol", output.getvalue())
         self.assertIn("GPT-5.6 Luna [selected]", output.getvalue())
 
+    def test_estimate_counts_the_shared_developer_instructions(self) -> None:
+        items = [{"_id": 1, "title": "First", "link": "https://example.com/first", "collection": {}}]
+        page = PageFetchResult(url=items[0]["link"], text="Example page text.", title="Example", error=None)
+
+        with TemporaryDirectory() as temp_dir:
+            config = Config(vault_path=temp_dir, sleep_seconds=0)
+            args = parse_args(["--estimate", "--estimate-sample-size", "1"])
+            with (
+                patch.dict(os.environ, {"RAINDROP_TOKEN": "token"}, clear=True),
+                patch("raindian.__main__.RaindropClient.iter_raindrops", return_value=iter(items)),
+                patch("raindian.__main__.fetch_page_text", return_value=page),
+                patch("raindian.__main__.count_prompt_tokens", return_value=(10, None)) as count_tokens,
+                redirect_stdout(StringIO()),
+            ):
+                estimate_bookmarks(config, args)
+
+        self.assertIn("You summarize bookmarked web pages", count_tokens.call_args.args[0])
+
     def test_estimate_count_only_does_not_fetch_pages(self) -> None:
         items = [{"_id": 1, "title": "First", "link": "https://example.com/first", "collection": {}}]
 
