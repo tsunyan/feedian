@@ -217,6 +217,26 @@ class MainTests(unittest.TestCase):
             existing.write_text("", encoding="utf-8")
             self.assertEqual(existing_note_for_item(path, {"_id": 123}), existing)
 
+    def test_existing_note_for_item_prefers_the_newest_llm_summary(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir)
+            no_llm = path / "A no LLM - 123.md"
+            old_llm = path / "B old LLM - 123.md"
+            new_llm = path / "C new LLM - 123.md"
+            no_llm.write_text("---\nraindrop_id: \"123\"\n---\n\nOriginal", encoding="utf-8")
+            old_llm.write_text(
+                '---\nraindrop_id: "123"\nsummary_model: "gpt-5.6-luna"\n'
+                'summary_generated_at: "2026-08-01T00:00:00+00:00"\n---\n\nOld',
+                encoding="utf-8",
+            )
+            new_llm.write_text(
+                '---\nraindrop_id: "123"\nsummary_model: "gpt-5.6-luna"\n'
+                'summary_generated_at: "2026-08-02T00:00:00+00:00"\n---\n\nNew',
+                encoding="utf-8",
+            )
+
+            self.assertEqual(existing_note_for_item(path, {"_id": 123}), new_llm)
+
     def test_llm_run_upgrades_an_existing_no_llm_note(self) -> None:
         item = {"_id": 123, "title": "First", "link": "https://example.com/first", "collection": {}}
         summary = {
@@ -511,6 +531,27 @@ class MainTests(unittest.TestCase):
         self.assertIn("sync-tags: request_interval=0.5s", output.getvalue())
         self.assertIn("elapsed=", output.getvalue())
         client.append_raindrop_tags.assert_called_once_with(5, 123, ["新規タグ", "ai"])
+
+    def test_sync_raindrop_tags_processes_a_duplicate_id_once(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            destination = Path(temp_dir) / "Raindrop"
+            destination.mkdir()
+            for name in ("Older title - 123.md", "Newer title - 123.md"):
+                (destination / name).write_text(
+                    "---\nraindrop_id: \"123\"\nraindrop_collection_id: \"5\"\n"
+                    "summary_model: \"gpt-5.6-luna\"\nllm_tags:\n  - \"ai\"\n---\n",
+                    encoding="utf-8",
+                )
+            config = Config(vault_path=temp_dir, sleep_seconds=0)
+            args = parse_args(["--sync-raindrop-tags"])
+            client = Mock()
+            client.get_raindrop.return_value = {"tags": []}
+
+            result = sync_raindrop_tags(config, args, client)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(client.get_raindrop.call_count, 1)
+        client.append_raindrop_tags.assert_called_once_with(5, 123, ["ai"])
 
     def test_sync_raindrop_tags_dry_run_does_not_call_raindrop(self) -> None:
         with TemporaryDirectory() as temp_dir:

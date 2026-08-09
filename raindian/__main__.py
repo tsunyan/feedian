@@ -10,7 +10,7 @@ import uuid
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .config import Config, load_config
 from .estimate import (
@@ -195,7 +195,54 @@ def existing_note_for_item(destination: Path, item: dict[str, Any]) -> Path | No
     if item_id is None:
         return None
     matches = sorted(destination.glob(f"* - {item_id}.md"))
-    return matches[0] if matches else None
+    return preferred_note_path(matches) if matches else None
+
+
+def preferred_note_path(note_paths: list[Path]) -> Path:
+    return max(note_paths, key=note_preference_key)
+
+
+def note_preference_key(note_path: Path) -> tuple[bool, float, float, str]:
+    try:
+        text = note_path.read_text(encoding="utf-8")
+    except OSError:
+        return (True, 0.0, 0.0, note_path.name)
+
+    frontmatter = _frontmatter_values(text)
+    has_summary = bool(frontmatter.get("summary_model"))
+    generated_at = frontmatter.get("summary_generated_at", "")
+    try:
+        summary_timestamp = datetime.fromisoformat(generated_at.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        summary_timestamp = 0.0
+    try:
+        modified_timestamp = note_path.stat().st_mtime
+    except OSError:
+        modified_timestamp = 0.0
+    return (has_summary, summary_timestamp, modified_timestamp, note_path.name)
+
+
+def unique_note_candidates(
+    note_paths: list[Path],
+    candidate_for_path: Callable[[Path], tuple[Any, ...] | None],
+) -> tuple[list[tuple[Path, tuple[Any, ...]]], int]:
+    candidates: dict[int, tuple[Path, tuple[Any, ...]]] = {}
+    skipped = 0
+    for note_path in note_paths:
+        candidate = candidate_for_path(note_path)
+        if candidate is None:
+            skipped += 1
+            continue
+        raindrop_id = candidate[0]
+        if not isinstance(raindrop_id, int):
+            skipped += 1
+            continue
+        current = candidates.get(raindrop_id)
+        if current is None or note_preference_key(note_path) > note_preference_key(current[0]):
+            candidates[raindrop_id] = (note_path, candidate)
+        if current is not None:
+            skipped += 1
+    return sorted(candidates.values(), key=lambda entry: entry[0].name), skipped
 
 
 def has_llm_summary(note_path: Path) -> bool:
@@ -586,12 +633,10 @@ def sync_raindrop_summaries(config: Config, args: argparse.Namespace, client: Ra
     updated = 0
     skipped = 0
     failed = 0
-    notes = sorted(destination.glob("* - *.md"))
-    for note_path in notes:
-        candidate = summary_sync_candidate(note_path)
-        if candidate is None:
-            skipped += 1
-            continue
+    candidates, skipped = unique_note_candidates(
+        sorted(destination.glob("* - *.md")), summary_sync_candidate
+    )
+    for note_path, candidate in candidates:
         raindrop_id, summary = candidate
         if args.limit is not None and planned >= args.limit:
             break
@@ -656,11 +701,11 @@ def sync_raindrop_tags(config: Config, args: argparse.Namespace, client: Raindro
     updated = 0
     skipped = 0
     failed = 0
-    for note_path in sorted(destination.glob("* - *.md")):
-        candidate = tag_sync_candidate(note_path, config.base_tags or [])
-        if candidate is None:
-            skipped += 1
-            continue
+    candidates, skipped = unique_note_candidates(
+        sorted(destination.glob("* - *.md")),
+        lambda note_path: tag_sync_candidate(note_path, config.base_tags or []),
+    )
+    for note_path, candidate in candidates:
         raindrop_id, collection_id, note_tags = candidate
         if args.limit is not None and planned >= args.limit:
             break
