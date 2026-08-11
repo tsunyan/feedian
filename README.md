@@ -8,6 +8,59 @@ Bookmarks and feeds to Obsidian Markdown notes.
 
 Feedian reads items through source adapters, converts them to a canonical item, optionally asks the OpenAI Responses API for a Japanese summary and tags, and writes one `.md` file per item into a local Obsidian vault. Raindrop.io and Hatena Bookmark exports are currently supported.
 
+## Vault workflow (new)
+
+The current workflow treats the per-vault SQLite database as the canonical local archive. `raw/` and `source/` are generated Obsidian views; the database keeps source metadata, fetched response bytes, extracted content, public Hatena comments, image bytes, and LLM audit records. The database is local-only during normal use, while a verified `.sqlite3.7z` archive is uploaded as a GitHub Release snapshot.
+
+This is designed for a **private archive repository** separate from the Feedian application repository. Do not use `snapshot` with a public repository: Feedian checks that the GitHub repository is private and refuses otherwise.
+
+Initialize an existing vault once. This does not rewrite `raw/`: it first stores every existing `raw/**/*.md` file byte-for-byte in `legacy_artifact` inside SQLite.
+
+```powershell
+feedian init --vault "D:\GitHub\@" --set-default
+feedian migrate --vault "D:\GitHub\@"
+```
+
+Then collect source data without using an LLM and inspect the generated staging view:
+
+```powershell
+feedian sync --vault "D:\GitHub\@" --source hatena
+feedian render --vault "D:\GitHub\@"
+# inspect .feedian\staging\raw before ever using --apply
+```
+
+`render --apply` writes to `raw/`, but protects any file that is not an unchanged Feedian-generated document. This deliberately prevents an existing legacy or hand-edited note from being overwritten.
+
+Create LLM-derived `source/` notes only after raw collection is satisfactory:
+
+```powershell
+$env:OPENAI_API_KEY = "your-openai-api-key"
+feedian ingest --vault "D:\GitHub\@" --model gpt-5.6-terra
+```
+
+The non-LLM weekly pipeline is separate:
+
+```powershell
+feedian run --vault "D:\GitHub\@"
+feedian schedule install --vault "D:\GitHub\@"
+```
+
+`run` performs due provider syncs → raw rendering → a due weekly snapshot; it does not call OpenAI. The default intervals are six hours for RSS and one week for Raindrop/Hatena and snapshots. `schedule install` creates a six-hourly task plus a logon catch-up task. Failed scheduled runs retry every 30 minutes, up to six attempts. Configure the schedule with `feedian schedule install --help`.
+
+Public Hatena comments are stored separately from article content. Feedian derives each comment's public Hatena Star URI, retrieves star totals in batches with Hatena's [official Star API](https://developer.hatena.ne.jp/ja/documents/star/apis/entry/), and sorts rendered comment notes by star count. This enrichment is non-LLM and can also be run independently:
+
+```powershell
+feedian enrich-stars --vault "D:\GitHub\@"
+```
+
+When extraction logic improves, preserved HTTP bytes can be processed again without downloading the source. For example, re-extract all stored PDFs after upgrading pypdf:
+
+```powershell
+feedian reextract --vault "D:\GitHub\@" --media-type application/pdf
+```
+
+For snapshots install [GitHub CLI](https://cli.github.com/) and [7-Zip](https://www.7-zip.org/), authenticate `gh`, and make sure the vault has a private GitHub `origin`. Feedian creates an SQLite-consistent backup, archives it, uploads it to a tag-linked Release, downloads it again, and verifies SHA-256, archive integrity, and SQLite integrity before removing its temporary local archive. `config.json` and `.feedian/snapshot.json` are intended for Git; `.feedian/feedian.sqlite3`, its WAL files, assets, logs, and temporary archives are ignored.
+
 ## Requirements
 
 - Python 3.11+

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from typing import Any
+from dataclasses import dataclass
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -49,6 +50,14 @@ SUMMARY_INSTRUCTIONS = (
 )
 
 
+@dataclass(frozen=True)
+class SummaryAudit:
+    result: dict[str, Any]
+    request: dict[str, Any]
+    response: dict[str, Any]
+    usage: dict[str, int]
+
+
 def summarize_bookmark(
     api_key: str,
     model: str,
@@ -62,33 +71,46 @@ def summarize_bookmark(
     retry_base_seconds: float,
     max_article_chars: int = 10000,
 ) -> dict[str, Any]:
-    prompt = build_prompt(
+    audit = summarize_bookmark_with_audit(
+        api_key=api_key,
+        model=model,
         item=item,
         page=page,
         language=language,
+        timeout_seconds=timeout_seconds,
+        max_output_tokens=max_output_tokens,
+        reasoning_effort=reasoning_effort,
+        max_retries=max_retries,
+        retry_base_seconds=retry_base_seconds,
         max_article_chars=max_article_chars,
     )
-    payload = {
-        "model": model,
-        "instructions": SUMMARY_INSTRUCTIONS,
-        "input": [
-            {
-                "role": "user",
-                "content": [{"type": "input_text", "text": prompt}],
-            }
-        ],
-        "text": {
-            "verbosity": "low",
-            "format": {
-                "type": "json_schema",
-                "name": "bookmark_note",
-                "strict": True,
-                "schema": SUMMARY_SCHEMA,
-            }
-        },
-        "max_output_tokens": max_output_tokens,
-        "reasoning": {"effort": reasoning_effort},
-    }
+    result = dict(audit.result)
+    result[USAGE_FIELD] = audit.usage
+    return result
+
+
+def summarize_bookmark_with_audit(
+    api_key: str,
+    model: str,
+    item: dict[str, Any],
+    page: PageFetchResult,
+    language: str,
+    timeout_seconds: int,
+    max_output_tokens: int,
+    reasoning_effort: str,
+    max_retries: int,
+    retry_base_seconds: float,
+    max_article_chars: int = 10000,
+) -> SummaryAudit:
+    payload = build_summary_request(
+        model=model,
+        item=item,
+        page=page,
+        language=language,
+        max_output_tokens=max_output_tokens,
+        reasoning_effort=reasoning_effort,
+        max_article_chars=max_article_chars,
+    )
     request = Request(
         "https://api.openai.com/v1/responses",
         data=json.dumps(payload).encode("utf-8"),
@@ -117,8 +139,41 @@ def summarize_bookmark(
         result = json.loads(output_text)
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"OpenAI output was not valid JSON: {output_text[:500]}") from exc
-    result[USAGE_FIELD] = extract_usage(data)
-    return result
+    return SummaryAudit(result=result, request=payload, response=data, usage=extract_usage(data))
+
+
+def build_summary_request(
+    *,
+    model: str,
+    item: dict[str, Any],
+    page: PageFetchResult,
+    language: str,
+    max_output_tokens: int,
+    reasoning_effort: str,
+    max_article_chars: int = 10000,
+) -> dict[str, Any]:
+    prompt = build_prompt(item=item, page=page, language=language, max_article_chars=max_article_chars)
+    return {
+        "model": model,
+        "instructions": SUMMARY_INSTRUCTIONS,
+        "input": [
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": prompt}],
+            }
+        ],
+        "text": {
+            "verbosity": "low",
+            "format": {
+                "type": "json_schema",
+                "name": "bookmark_note",
+                "strict": True,
+                "schema": SUMMARY_SCHEMA,
+            }
+        },
+        "max_output_tokens": max_output_tokens,
+        "reasoning": {"effort": reasoning_effort},
+    }
 
 
 def _read_response(request: Request, timeout_seconds: int) -> dict[str, Any]:

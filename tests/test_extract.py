@@ -4,6 +4,8 @@ from urllib.error import HTTPError
 
 from unittest.mock import patch
 
+from pypdf import PdfWriter
+
 from feedian.extract import (
     TextExtractor,
     clean_extracted_text,
@@ -65,6 +67,41 @@ class TextExtractorTests(unittest.TestCase):
 
 
 class StagedExtractionTests(unittest.TestCase):
+    def test_pdf_bytes_are_preserved_when_text_is_not_extractable(self) -> None:
+        output = BytesIO()
+        writer = PdfWriter()
+        writer.add_blank_page(width=100, height=100)
+        writer.write(output)
+        raw = output.getvalue()
+
+        result = self._fetch_static_response(raw, "application/pdf")
+
+        self.assertEqual(result.raw_body, raw)
+        self.assertEqual(result.extraction_method, "pypdf")
+        self.assertIn("OCR", result.error or "")
+
+    @staticmethod
+    def _fetch_static_response(raw: bytes, content_type: str):
+        class Response(BytesIO):
+            status = 200
+            headers = {"Content-Type": content_type}
+
+            def geturl(self):
+                return "https://example.com/document"
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self.close()
+
+        class Opener:
+            def open(self, *_args, **_kwargs):
+                return Response(raw)
+
+        with patch("feedian.extract.validate_fetch_url"), patch("feedian.extract.build_opener", return_value=Opener()):
+            return fetch_page_text("https://example.com/document", timeout_seconds=1, max_chars=1000)
+
     def test_decode_html_honors_shift_jis_meta(self) -> None:
         html = '<meta charset="Shift_JIS"><article>日本語の本文です。</article>'.encode("cp932")
 

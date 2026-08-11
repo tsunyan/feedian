@@ -79,7 +79,7 @@ class MarkdownTests(unittest.TestCase):
         self.assertIn("### Excerpt (Original)\n\nOriginal excerpt", rendered)
         self.assertIn("## Extracted Content (Original)\n\nOriginal extracted body.", rendered)
         self.assertIn('fetch_method: "browser"', rendered)
-        self.assertIn('content_chars: "24"', rendered)
+        self.assertIn("content_chars: 24", rendered)
 
     def test_upsert_raindrop_summary_preserves_manual_note_and_replaces_managed_block(self) -> None:
         original = "My manual note"

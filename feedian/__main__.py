@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, TypeVar
 
 from .canonical import canonical_item_from_metadata
+from .cli import is_modern_command, main as modern_main
 from .config import Config, load_config
 from .estimate import (
     ModelPrice,
@@ -25,6 +26,7 @@ from .estimate import (
     select_sample,
     usage_cost_usd,
 )
+from .env import load_env_file
 from .extract import PageFetchResult, fetch_page_text
 from .llm import SUMMARY_INSTRUCTIONS, USAGE_FIELD, build_prompt, summarize_bookmark
 from .hatena import (
@@ -166,20 +168,6 @@ def require_env(name: str) -> str:
     if not value:
         raise RuntimeError(f"Missing required environment variable: {name}")
     return value
-
-
-def load_env_file(path: Path) -> None:
-    if not path.exists():
-        return
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip().strip('"').strip("'")
-        if key and key not in os.environ:
-            os.environ[key] = value
 
 
 def configure_console_output() -> None:
@@ -1476,7 +1464,10 @@ def _estimate_bookmark_label(item: dict[str, Any]) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     configure_console_output()
-    args = parse_args(argv or sys.argv[1:])
+    command_args = argv if argv is not None else sys.argv[1:]
+    if not command_args or command_args in (["-h"], ["--help"]) or is_modern_command(command_args):
+        return modern_main(command_args)
+    args = parse_args(command_args)
     try:
         load_env_file(Path(".env"))
         config = apply_overrides(load_config(args.config), args)

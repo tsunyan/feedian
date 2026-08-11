@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+from io import BytesIO
 import ipaddress
 import re
 import socket
@@ -15,12 +16,14 @@ from urllib.request import HTTPSHandler, HTTPRedirectHandler, Request, build_ope
 
 from charset_normalizer import from_bytes
 from lxml import html as lxml_html
+from pypdf import PdfReader
 from trafilatura import extract as extract_main_text
 from trafilatura import extract_metadata, html2txt
 from w3lib.encoding import html_to_unicode
 
 
 MAX_HTML_BYTES = 10 * 1024 * 1024
+MAX_DOCUMENT_BYTES = 100 * 1024 * 1024
 MIN_HIGH_CONFIDENCE_CHARS = 200
 
 
@@ -35,6 +38,13 @@ class PageFetchResult:
     content_encoding: str = ""
     content_truncated: bool = False
     discussion_text: str = ""
+    final_url: str = ""
+    media_type: str = ""
+    response_headers: dict[str, str] | None = None
+    http_status: int | None = None
+    raw_body: bytes | None = None
+    rendered_html: str = ""
+    payload_too_large: bool = False
 
 
 @dataclass
@@ -43,6 +53,12 @@ class ExtractedPageParts:
     title: str
     method: str
     discussion_text: str = ""
+
+
+@dataclass(frozen=True)
+class ContentImage:
+    url: str
+    alt_text: str = ""
 
 
 @dataclass(eq=False)
@@ -208,7 +224,14 @@ def fetch_page_text(
         opener = build_opener(HTTPSHandler(context=context), SafeRedirectHandler(allow_private_urls))
         with opener.open(request, timeout=timeout_seconds) as response:
             content_type = response.headers.get("Content-Type", "")
-            raw = response.read(MAX_HTML_BYTES + 1)
+            is_html = "text/html" in content_type or "application/xhtml" in content_type
+            limit = MAX_HTML_BYTES if is_html else MAX_DOCUMENT_BYTES
+            raw = response.read(limit + 1)
+            try:
+                response_headers = {str(key): str(value) for key, value in response.headers.items()}
+            except (AttributeError, TypeError, ValueError):
+                response_headers = {}
+            status = getattr(response, "status", None)
             geturl = getattr(response, "geturl", None)
             response_url = geturl() if callable(geturl) else None
             final_url = response_url if isinstance(response_url, str) else fetch_url
@@ -234,10 +257,40 @@ def fetch_page_text(
     except Exception as exc:
         return PageFetchResult(url=url, text="", error=str(exc))
 
-    truncated = len(raw) > MAX_HTML_BYTES
-    raw = raw[:MAX_HTML_BYTES]
+    too_large = len(raw) > limit
+    if too_large and not is_html:
+        return PageFetchResult(
+            url=url,
+            text="",
+            error=f"document exceeds {MAX_DOCUMENT_BYTES} byte safety limit",
+            final_url=final_url,
+            media_type=content_type,
+            response_headers=response_headers,
+            http_status=status if isinstance(status, int) else None,
+            payload_too_large=True,
+        )
+    truncated = too_large
+    if is_html:
+        raw = raw[:MAX_HTML_BYTES]
+    if "application/pdf" in content_type.lower():
+        result = extract_stored_payload(raw, final_url, content_type)
+        result.url = url
+        result.fetch_method = "http"
+        result.response_headers = response_headers
+        result.http_status = status if isinstance(status, int) else None
+        return result
     if "text/html" not in content_type and "text/plain" not in content_type and "application/xhtml" not in content_type:
-        return PageFetchResult(url=url, text="", error=f"unsupported content type: {content_type or 'unknown'}")
+        return PageFetchResult(
+            url=url,
+            text="",
+            error=f"unsupported content type: {content_type or 'unknown'}",
+            final_url=final_url,
+            media_type=content_type,
+            response_headers=response_headers,
+            http_status=status if isinstance(status, int) else None,
+            raw_body=raw,
+            content_truncated=truncated,
+        )
 
     encoding, decoded = decode_html(raw, content_type)
     if "text/plain" in content_type:
@@ -250,6 +303,11 @@ def fetch_page_text(
             content_encoding=encoding,
             content_truncated=truncated,
             error="HTML download truncated at 10 MiB" if truncated else None,
+            final_url=final_url,
+            media_type=content_type,
+            response_headers=response_headers,
+            http_status=status if isinstance(status, int) else None,
+            raw_body=raw,
         )
 
     http_parts = extract_page_parts(decoded, final_url)
@@ -306,6 +364,12 @@ def fetch_page_text(
         content_encoding=encoding,
         content_truncated=truncated,
         discussion_text=best_discussion,
+        final_url=final_url,
+        media_type=content_type,
+        response_headers=response_headers,
+        http_status=status if isinstance(status, int) else None,
+        raw_body=raw,
+        rendered_html=best_html if fetch_method == "browser" else "",
     )
 
 
@@ -343,6 +407,9 @@ def fetch_page_text_with_browser(
         extraction_method=method,
         content_encoding="browser",
         discussion_text=parts.discussion_text,
+        final_url=rendered_url,
+        media_type="text/html; charset=utf-8",
+        rendered_html=rendered_html,
     )
 
 
@@ -352,6 +419,45 @@ def decode_html(raw: bytes, content_type: str | None) -> tuple[str, str]:
         raw,
         default_encoding="utf-8",
         auto_detect_fun=_detect_encoding,
+    )
+
+
+def extract_stored_payload(raw: bytes, url: str, media_type: str) -> PageFetchResult:
+    """Re-run deterministic extraction from bytes already preserved in SQLite."""
+    normalized_type = media_type.lower()
+    if "application/pdf" in normalized_type:
+        try:
+            reader = PdfReader(BytesIO(raw))
+            pages = [normalize_plain_text(page.extract_text() or "") for page in reader.pages]
+            text = "\n\n---\n\n".join(page for page in pages if page)
+            title = str((reader.metadata.title if reader.metadata else "") or "").strip()
+            warning = None if text else "PDF contains no extractable text; OCR may be required"
+        except Exception as exc:
+            text = ""
+            title = ""
+            warning = f"PDF text extraction failed: {exc}"
+        return PageFetchResult(
+            url=url, final_url=url, text=text, title=title, error=warning,
+            fetch_method="stored", extraction_method="pypdf", media_type=media_type, raw_body=raw,
+        )
+    if "text/html" in normalized_type or "application/xhtml" in normalized_type:
+        encoding, decoded = decode_html(raw, media_type)
+        parts = extract_page_parts(decoded, url)
+        warning = None if parts.text else "no extractable text found"
+        return PageFetchResult(
+            url=url, final_url=url, text=parts.text, title=parts.title, error=warning,
+            fetch_method="stored", extraction_method=parts.method, content_encoding=encoding,
+            discussion_text=parts.discussion_text, media_type=media_type, raw_body=raw,
+        )
+    if "text/plain" in normalized_type:
+        encoding, decoded = decode_html(raw, media_type)
+        return PageFetchResult(
+            url=url, final_url=url, text=normalize_plain_text(decoded), fetch_method="stored",
+            extraction_method="plain-text", content_encoding=encoding, media_type=media_type, raw_body=raw,
+        )
+    return PageFetchResult(
+        url=url, final_url=url, text="", error=f"unsupported content type: {media_type or 'unknown'}",
+        fetch_method="stored", media_type=media_type, raw_body=raw,
     )
 
 
@@ -399,6 +505,69 @@ def extract_page_parts(html: str, url: str) -> ExtractedPageParts:
     if should_use_recall_fallback(precision, recall):
         return ExtractedPageParts(recall, title, "trafilatura-recall-fallback")
     return ExtractedPageParts(precision, title, "trafilatura")
+
+
+def extract_content_images(html: str, url: str) -> list[ContentImage]:
+    """Return distinct, likely editorial images without downloading anything.
+
+    The selector is intentionally conservative: article/main content wins, then
+    a conventional content container, and only then the document body. Ads,
+    trackers, decorative pixels, and data URIs are excluded before storage.
+    """
+    try:
+        document = lxml_html.fromstring(html)
+    except (TypeError, ValueError):
+        return []
+    candidates = document.xpath("//article | //main")
+    if not candidates:
+        candidates = document.xpath(
+            "//*[contains(concat(' ', normalize-space(@class), ' '), ' content ') "
+            "or contains(concat(' ', normalize-space(@class), ' '), ' article ') "
+            "or contains(concat(' ', normalize-space(@class), ' '), ' entry ') "
+            "or contains(concat(' ', normalize-space(@class), ' '), ' post ')]"
+        )
+    container = max(candidates, key=lambda node: len(node.text_content() or ""), default=document)
+    images: list[ContentImage] = []
+    seen: set[str] = set()
+    for image in container.xpath(".//img"):
+        if _is_non_content_image(image):
+            continue
+        source = _image_source(image)
+        if not source or source.startswith(("data:", "blob:")):
+            continue
+        absolute = urljoin(url, source)
+        if absolute in seen:
+            continue
+        seen.add(absolute)
+        images.append(ContentImage(absolute, " ".join(image.get("alt", "").split())))
+    return images
+
+
+def _image_source(image) -> str:
+    for name in ("src", "data-src", "data-original", "data-lazy-src"):
+        value = image.get(name)
+        if value:
+            return value.strip()
+    for name in ("srcset", "data-srcset"):
+        srcset = image.get(name)
+        if srcset:
+            # The last srcset candidate conventionally has the greatest width.
+            return srcset.split(",")[-1].strip().split()[0]
+    return ""
+
+
+def _is_non_content_image(image) -> bool:
+    attributes = " ".join(
+        value or "" for value in (image.get("class"), image.get("id"), image.get("role"), image.get("aria-label"))
+    ).lower()
+    if re.search(r"(?:^|[-_\s])(ad|ads|advert|advertisement|banner|promo|sponsor|tracking|pixel)(?:$|[-_\s])", attributes):
+        return True
+    try:
+        width = int(image.get("width", "0"))
+        height = int(image.get("height", "0"))
+    except ValueError:
+        return False
+    return 0 < width <= 10 and 0 < height <= 10
 
 
 def clean_extracted_text(text: str, url: str) -> str:

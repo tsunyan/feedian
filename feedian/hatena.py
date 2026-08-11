@@ -24,6 +24,7 @@ from .retry import run_with_retries
 
 SEARCH_API_URL = "https://b.hatena.ne.jp/my/search/json"
 ENTRY_INFO_API_URL = "https://b.hatena.ne.jp/entry/jsonlite/"
+STAR_ENTRY_API_URL = "https://s.hatena.ne.jp/entry.json"
 # The search API requires a non-empty full-text query. Searching both URL
 # schemes covers the HTTP(S) bookmark URLs Feedian can turn into web notes.
 SEARCH_QUERIES = ("https", "http")
@@ -35,12 +36,14 @@ class HatenaPublicComment:
     comment: str
     tags: list[str] = field(default_factory=list)
     timestamp: str = ""
+    star_url: str = ""
 
 
 @dataclass(frozen=True)
 class HatenaEntryDiscussion:
     entry_url: str = ""
     bookmark_count: int = 0
+    entry_id: str = ""
     comments: list[HatenaPublicComment] = field(default_factory=list)
 
 
@@ -70,6 +73,7 @@ def fetch_hatena_entry_discussion(
     except URLError as exc:
         raise RuntimeError(f"Hatena entry API network error: {exc.reason}") from exc
     raw_comments = data.get("bookmarks")
+    entry_id = str(data.get("eid") or "").strip()
     comments: list[HatenaPublicComment] = []
     if isinstance(raw_comments, list):
         for raw in raw_comments:
@@ -86,14 +90,70 @@ def fetch_hatena_entry_discussion(
                     comment=comment,
                     tags=tags,
                     timestamp=str(raw.get("timestamp") or "").strip(),
+                    star_url=_hatena_comment_star_url(
+                        str(raw.get("user") or "").strip(),
+                        str(raw.get("timestamp") or "").strip(),
+                        entry_id,
+                    ),
                 )
             )
     count = data.get("count")
     return HatenaEntryDiscussion(
         entry_url=str(data.get("entry_url") or "").strip(),
         bookmark_count=count if isinstance(count, int) and count >= 0 else 0,
+        entry_id=entry_id,
         comments=comments,
     )
+
+
+def fetch_hatena_star_counts(
+    uris: list[str], *, timeout_seconds: int = 30, batch_size: int = 40
+) -> dict[str, int]:
+    unique_uris = list(dict.fromkeys(uri for uri in uris if uri))
+    # The API omits requested URIs that have no public stars. They are valid zeroes,
+    # not failed lookups.
+    counts: dict[str, int] = {uri: 0 for uri in unique_uris}
+    for offset in range(0, len(unique_uris), max(1, batch_size)):
+        batch = unique_uris[offset : offset + max(1, batch_size)]
+        request = Request(
+            f"{STAR_ENTRY_API_URL}?{urlencode([('uri', uri) for uri in batch])}",
+            headers={"Accept": "application/json", "User-Agent": "feedian/0.1 (+https://github.com/tsunyan/feedian)"},
+            method="GET",
+        )
+        data = _read_entry_json(request, timeout_seconds)
+        entries = data.get("entries")
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict) or not isinstance(entry.get("uri"), str):
+                continue
+            total = _star_objects_count(entry.get("stars"))
+            colored = entry.get("colored_stars")
+            if isinstance(colored, list):
+                for group in colored:
+                    if isinstance(group, dict):
+                        total += _star_objects_count(group.get("stars"))
+            counts[str(entry["uri"])] = total
+    return counts
+
+
+def _hatena_comment_star_url(user: str, timestamp: str, entry_id: str) -> str:
+    date = "".join(character for character in timestamp[:10] if character.isdigit())
+    if not user or len(date) != 8 or not entry_id:
+        return ""
+    return f"https://b.hatena.ne.jp/{user}/{date}#bookmark-{entry_id}"
+
+
+def _star_objects_count(value: object) -> int:
+    if not isinstance(value, list):
+        return 0
+    total = 0
+    for star in value:
+        if not isinstance(star, dict):
+            continue
+        count = star.get("count", 1)
+        total += count if isinstance(count, int) and count > 0 else 1
+    return total
 
 
 def _read_entry_json(request: Request, timeout_seconds: int) -> dict[str, Any]:

@@ -325,9 +325,16 @@ def yaml_frontmatter(values: dict[str, Any]) -> str:
         if value is None or value == "":
             continue
         if isinstance(value, list):
-            lines.append(f"{key}:")
-            for item in value:
-                lines.append(f"  - {quote_yaml_scalar(str(item))}")
+            if not value:
+                lines.append(f"{key}: []")
+            else:
+                lines.append(f"{key}:")
+                for item in value:
+                    lines.append(f"  - {quote_yaml_scalar(str(item))}")
+        elif isinstance(value, bool):
+            lines.append(f"{key}: {'true' if value else 'false'}")
+        elif isinstance(value, (int, float)):
+            lines.append(f"{key}: {value}")
         else:
             lines.append(f"{key}: {quote_yaml_scalar(str(value))}")
     return "\n".join(lines)
