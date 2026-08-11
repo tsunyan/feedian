@@ -40,7 +40,7 @@ collection、nested、limit の絞り込みを適用するため、後続の通�
 
 ## トークン数と料金の見積り
 
-ページを取得できる各サンプルについて、Raindian は次を実行する。
+ページを取得できる各サンプルについて、Feedian は次を実行する。
 
 1. 通常処理と同じ URL 安全性チェック、本文抽出、長さ制限、タイムアウト、再試行設定で
    ページ本文を取得する。
@@ -71,7 +71,7 @@ collection、nested、limit の絞り込みを適用するため、後続の通�
 ではない。同じモデル・推論設定の usage 記録がある場合、典型値はその
 `output_tokens / input_tokens` の合計比率を使う。
 
-LLM による要約が成功すると、`<vault_path>/<output_folder>/.raindian-usage.jsonl` に
+LLM による要約が成功すると、`<vault_path>/<output_folder>/.feedian-usage.jsonl` に
 JSON 1行を追記する。ここにはトークン数、モデルと推論設定、当時の単価、リクエストごとの
 概算USDを保存する。ページ本文やURLは保存しない。見積りで使うのは、同条件の記録にある
 入力・出力トークン数だけであり、単価スナップショットは後からの料金集計に使う。

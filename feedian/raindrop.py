@@ -79,7 +79,7 @@ class RaindropClient:
                 "Authorization": f"Bearer {self.token}",
                 "Accept": "application/json",
                 "Content-Type": "application/json",
-                "User-Agent": "raindian/0.1",
+                "User-Agent": "feedian/0.1",
             },
             method="PUT",
         )
@@ -103,7 +103,7 @@ class RaindropClient:
                 "Authorization": f"Bearer {self.token}",
                 "Accept": "application/json",
                 "Content-Type": "application/json",
-                "User-Agent": "raindian/0.1",
+                "User-Agent": "feedian/0.1",
             },
             method="PUT",
         )
@@ -126,7 +126,7 @@ class RaindropClient:
             headers={
                 "Authorization": f"Bearer {self.token}",
                 "Accept": "application/json",
-                "User-Agent": "raindian/0.1",
+                "User-Agent": "feedian/0.1",
             },
             method="GET",
         )

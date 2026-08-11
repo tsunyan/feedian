@@ -7,7 +7,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import Mock, patch
 
-from raindian.__main__ import (
+from feedian.__main__ import (
     estimate_bookmarks,
     existing_note_for_item,
     list_collections,
@@ -19,17 +19,17 @@ from raindian.__main__ import (
     usage_record_exists,
     write_note_atomically,
 )
-from raindian.config import Config
-from raindian.estimate import MODEL_PRICES, PriceRefresh
-from raindian.extract import PageFetchResult
-from raindian.recovery import PendingTransaction, load_pending, save_pending
-from raindian.progress import ProgressReporter
+from feedian.config import Config
+from feedian.estimate import MODEL_PRICES, PriceRefresh
+from feedian.extract import PageFetchResult
+from feedian.recovery import PendingTransaction, load_pending, save_pending
+from feedian.progress import ProgressReporter
 
 
 class MainTests(unittest.TestCase):
     def setUp(self) -> None:
         self.price_refresh = patch(
-            "raindian.__main__.refresh_model_prices",
+            "feedian.__main__.refresh_model_prices",
             return_value=PriceRefresh(prices=MODEL_PRICES, source="official", warning=None),
         )
         self.price_refresh.start()
@@ -49,7 +49,7 @@ class MainTests(unittest.TestCase):
         with TemporaryDirectory() as temp_dir:
             destination = Path(temp_dir) / "Raindrop"
             destination.mkdir()
-            (destination / ".raindian-usage.jsonl").write_text(
+            (destination / ".feedian-usage.jsonl").write_text(
                 '{"transaction_id":"txn-a"}\nnot-json\n',
                 encoding="utf-8",
             )
@@ -65,13 +65,13 @@ class MainTests(unittest.TestCase):
             args = parse_args(["--skip-page-fetch"])
             with (
                 patch.dict(os.environ, {"RAINDROP_TOKEN": "token", "OPENAI_API_KEY": "key"}),
-                patch("raindian.__main__.RaindropClient.iter_raindrops", return_value=iter([item])),
+                patch("feedian.__main__.RaindropClient.iter_raindrops", return_value=iter([item])),
                 patch(
-                    "raindian.__main__.ensure_usage_log_readable",
+                    "feedian.__main__.ensure_usage_log_readable",
                     side_effect=OSError("drive offline"),
                     create=True,
                 ),
-                patch("raindian.__main__.summarize_bookmark") as summarize,
+                patch("feedian.__main__.summarize_bookmark") as summarize,
             ):
                 result = process_bookmarks(config, args)
 
@@ -89,7 +89,7 @@ class MainTests(unittest.TestCase):
             "key_points": [],
             "tags": [],
             "content_type": "link",
-            "_raindian_usage": {"input_tokens": 10, "output_tokens": 2, "total_tokens": 12},
+            "_feedian_usage": {"input_tokens": 10, "output_tokens": 2, "total_tokens": 12},
         }
 
         with TemporaryDirectory() as temp_dir:
@@ -99,10 +99,10 @@ class MainTests(unittest.TestCase):
             args = parse_args(["--skip-page-fetch"])
             with (
                 patch.dict(os.environ, {"RAINDROP_TOKEN": "token", "OPENAI_API_KEY": "key"}),
-                patch("raindian.__main__.PENDING_STATE_ROOT", state_root, create=True),
-                patch("raindian.__main__.RaindropClient.iter_raindrops", return_value=iter(items)),
-                patch("raindian.__main__.summarize_bookmark", return_value=summary) as summarize,
-                patch("raindian.__main__.write_note_atomically", side_effect=OSError("drive offline")),
+                patch("feedian.__main__.PENDING_STATE_ROOT", state_root, create=True),
+                patch("feedian.__main__.RaindropClient.iter_raindrops", return_value=iter(items)),
+                patch("feedian.__main__.summarize_bookmark", return_value=summary) as summarize,
+                patch("feedian.__main__.write_note_atomically", side_effect=OSError("drive offline")),
             ):
                 result = process_bookmarks(config, args)
 
@@ -129,13 +129,13 @@ class MainTests(unittest.TestCase):
             args = parse_args(["--skip-page-fetch"])
             with (
                 patch.dict(os.environ, {"RAINDROP_TOKEN": "token", "OPENAI_API_KEY": "key"}),
-                patch("raindian.__main__.PENDING_STATE_ROOT", state_root, create=True),
-                patch("raindian.__main__.RaindropClient.iter_raindrops", return_value=iter([item])),
-                patch("raindian.__main__.summarize_bookmark") as summarize,
+                patch("feedian.__main__.PENDING_STATE_ROOT", state_root, create=True),
+                patch("feedian.__main__.RaindropClient.iter_raindrops", return_value=iter([item])),
+                patch("feedian.__main__.summarize_bookmark") as summarize,
             ):
                 result = process_bookmarks(config, args)
 
-            usage = (destination / ".raindian-usage.jsonl").read_text(encoding="utf-8")
+            usage = (destination / ".feedian-usage.jsonl").read_text(encoding="utf-8")
 
         self.assertEqual(result, 0)
         self.assertIn("txn-1", usage)
@@ -153,7 +153,7 @@ class MainTests(unittest.TestCase):
             "key_points": [],
             "tags": [],
             "content_type": "link",
-            "_raindian_usage": {"input_tokens": 10, "output_tokens": 2, "total_tokens": 12},
+            "_feedian_usage": {"input_tokens": 10, "output_tokens": 2, "total_tokens": 12},
         }
 
         with TemporaryDirectory() as temp_dir:
@@ -163,10 +163,10 @@ class MainTests(unittest.TestCase):
             args = parse_args(["--skip-page-fetch"])
             with (
                 patch.dict(os.environ, {"RAINDROP_TOKEN": "token", "OPENAI_API_KEY": "key"}),
-                patch("raindian.__main__.PENDING_STATE_ROOT", state_root),
-                patch("raindian.__main__.RaindropClient.iter_raindrops", return_value=iter(items)),
-                patch("raindian.__main__.summarize_bookmark", return_value=summary) as summarize,
-                patch("raindian.__main__.append_usage_record", side_effect=OSError("drive offline")),
+                patch("feedian.__main__.PENDING_STATE_ROOT", state_root),
+                patch("feedian.__main__.RaindropClient.iter_raindrops", return_value=iter(items)),
+                patch("feedian.__main__.summarize_bookmark", return_value=summary) as summarize,
+                patch("feedian.__main__.append_usage_record", side_effect=OSError("drive offline")),
             ):
                 result = process_bookmarks(config, args)
 
@@ -184,7 +184,7 @@ class MainTests(unittest.TestCase):
             destination.mkdir()
             state_root = Path(temp_dir) / "state"
             usage_record = {"transaction_id": "txn-1", "raindrop_id": 123}
-            (destination / ".raindian-usage.jsonl").write_text(
+            (destination / ".feedian-usage.jsonl").write_text(
                 json.dumps(usage_record) + "\n",
                 encoding="utf-8",
             )
@@ -199,13 +199,13 @@ class MainTests(unittest.TestCase):
             args = parse_args(["--skip-page-fetch"])
             with (
                 patch.dict(os.environ, {"RAINDROP_TOKEN": "token", "OPENAI_API_KEY": "key"}),
-                patch("raindian.__main__.PENDING_STATE_ROOT", state_root),
-                patch("raindian.__main__.RaindropClient.iter_raindrops", return_value=iter([item])),
-                patch("raindian.__main__.summarize_bookmark") as summarize,
+                patch("feedian.__main__.PENDING_STATE_ROOT", state_root),
+                patch("feedian.__main__.RaindropClient.iter_raindrops", return_value=iter([item])),
+                patch("feedian.__main__.summarize_bookmark") as summarize,
             ):
                 result = process_bookmarks(config, args)
 
-            usage_lines = (destination / ".raindian-usage.jsonl").read_text(encoding="utf-8").splitlines()
+            usage_lines = (destination / ".feedian-usage.jsonl").read_text(encoding="utf-8").splitlines()
 
         self.assertEqual(result, 0)
         self.assertEqual(usage_lines, [json.dumps(usage_record)])
@@ -223,6 +223,31 @@ class MainTests(unittest.TestCase):
 
         self.assertEqual(args.progress, "plain")
         self.assertTrue(args.verbose)
+
+    def test_collection_progress_uses_previous_count_and_reports_delta(self) -> None:
+        items = [
+            {"_id": 1, "title": "First", "link": "https://example.com/first", "collection": {}},
+            {"_id": 2, "title": "Second", "link": "https://example.com/second", "collection": {}},
+            {"_id": 3, "title": "Third", "link": "https://example.com/third", "collection": {}},
+        ]
+        with TemporaryDirectory() as temp_dir:
+            config = Config(vault_path=temp_dir, sleep_seconds=0)
+            args = parse_args(["--dry-run", "--progress", "plain"])
+            output = StringIO()
+            reporter = ProgressReporter("plain", stream=output, plain_interval_seconds=0)
+            with (
+                patch.dict(os.environ, {"RAINDROP_TOKEN": "token"}),
+                patch("feedian.__main__.RaindropClient.iter_raindrops", return_value=iter(items)),
+                patch("feedian.__main__.load_raindrop_collection_count", return_value=2),
+                patch("feedian.__main__.save_raindrop_collection_count") as save_count,
+                reporter,
+            ):
+                result = process_bookmarks(config, args, reporter)
+
+        self.assertEqual(result, 0)
+        self.assertIn("process: collecting Raindrop bookmarks 0/~2", output.getvalue())
+        self.assertIn("process: collected=3 Δ+1", output.getvalue())
+        save_count.assert_called_once_with("token", 0, True, 3)
 
     def test_existing_note_for_item_prefers_the_newest_llm_summary(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -263,8 +288,8 @@ class MainTests(unittest.TestCase):
             args = parse_args(["--skip-page-fetch"])
             with (
                 patch.dict(os.environ, {"RAINDROP_TOKEN": "token", "OPENAI_API_KEY": "key"}),
-                patch("raindian.__main__.RaindropClient.iter_raindrops", return_value=iter([item])),
-                patch("raindian.__main__.summarize_bookmark", return_value=summary),
+                patch("feedian.__main__.RaindropClient.iter_raindrops", return_value=iter([item])),
+                patch("feedian.__main__.summarize_bookmark", return_value=summary),
             ):
                 result = process_bookmarks(config, args)
 
@@ -289,8 +314,8 @@ class MainTests(unittest.TestCase):
             args = parse_args(["--skip-page-fetch"])
             with (
                 patch.dict(os.environ, {"RAINDROP_TOKEN": "token", "OPENAI_API_KEY": "key"}),
-                patch("raindian.__main__.RaindropClient.iter_raindrops", return_value=iter([item])),
-                patch("raindian.__main__.summarize_bookmark", return_value=summary),
+                patch("feedian.__main__.RaindropClient.iter_raindrops", return_value=iter([item])),
+                patch("feedian.__main__.summarize_bookmark", return_value=summary),
             ):
                 result = process_bookmarks(config, args)
 
@@ -315,8 +340,8 @@ class MainTests(unittest.TestCase):
             args = parse_args(["--rename-existing"])
             with (
                 patch.dict(os.environ, {"RAINDROP_TOKEN": "token", "OPENAI_API_KEY": "key"}),
-                patch("raindian.__main__.RaindropClient.iter_raindrops", return_value=iter([item])),
-                patch("raindian.__main__.summarize_bookmark") as summarize,
+                patch("feedian.__main__.RaindropClient.iter_raindrops", return_value=iter([item])),
+                patch("feedian.__main__.summarize_bookmark") as summarize,
             ):
                 result = process_bookmarks(config, args)
 
@@ -346,8 +371,8 @@ class MainTests(unittest.TestCase):
             args = parse_args(["--rename-existing", "--skip-page-fetch"])
             with (
                 patch.dict(os.environ, {"RAINDROP_TOKEN": "token", "OPENAI_API_KEY": "key"}),
-                patch("raindian.__main__.RaindropClient.iter_raindrops", return_value=iter([item])),
-                patch("raindian.__main__.summarize_bookmark", return_value=summary),
+                patch("feedian.__main__.RaindropClient.iter_raindrops", return_value=iter([item])),
+                patch("feedian.__main__.summarize_bookmark", return_value=summary),
             ):
                 result = process_bookmarks(config, args)
 
@@ -370,7 +395,7 @@ class MainTests(unittest.TestCase):
             args = parse_args(["--no-llm", "--skip-page-fetch"])
             with (
                 patch.dict(os.environ, {"RAINDROP_TOKEN": "token"}, clear=True),
-                patch("raindian.__main__.RaindropClient.iter_raindrops", return_value=iter([item])),
+                patch("feedian.__main__.RaindropClient.iter_raindrops", return_value=iter([item])),
             ):
                 result = process_bookmarks(config, args)
 
@@ -411,8 +436,8 @@ class MainTests(unittest.TestCase):
             args = parse_args(["--skip-page-fetch"])
             with (
                 patch.dict(os.environ, {"RAINDROP_TOKEN": "token", "OPENAI_API_KEY": "key"}),
-                patch("raindian.__main__.RaindropClient.iter_raindrops", return_value=iter(items)),
-                patch("raindian.__main__.summarize_bookmark", side_effect=[RuntimeError("rate limited"), summary]),
+                patch("feedian.__main__.RaindropClient.iter_raindrops", return_value=iter(items)),
+                patch("feedian.__main__.summarize_bookmark", side_effect=[RuntimeError("rate limited"), summary]),
             ):
                 result = process_bookmarks(config, args)
 
@@ -429,7 +454,7 @@ class MainTests(unittest.TestCase):
             "key_points": [],
             "tags": [],
             "content_type": "link",
-            "_raindian_usage": {
+            "_feedian_usage": {
                 "input_tokens": 120,
                 "cached_input_tokens": 20,
                 "output_tokens": 34,
@@ -443,12 +468,12 @@ class MainTests(unittest.TestCase):
             args = parse_args(["--skip-page-fetch"])
             with (
                 patch.dict(os.environ, {"RAINDROP_TOKEN": "token", "OPENAI_API_KEY": "key"}),
-                patch("raindian.__main__.RaindropClient.iter_raindrops", return_value=iter([item])),
-                patch("raindian.__main__.summarize_bookmark", return_value=summary),
+                patch("feedian.__main__.RaindropClient.iter_raindrops", return_value=iter([item])),
+                patch("feedian.__main__.summarize_bookmark", return_value=summary),
             ):
                 result = process_bookmarks(config, args)
 
-            usage_path = Path(temp_dir) / "Raindrop" / ".raindian-usage.jsonl"
+            usage_path = Path(temp_dir) / "Raindrop" / ".feedian-usage.jsonl"
             record = json.loads(usage_path.read_text(encoding="utf-8"))
 
         self.assertEqual(result, 0)
@@ -609,9 +634,9 @@ class MainTests(unittest.TestCase):
             args = parse_args(["--dry-run"])
             with (
                 patch.dict(os.environ, {"RAINDROP_TOKEN": "token"}, clear=True),
-                patch("raindian.__main__.RaindropClient.iter_raindrops", return_value=iter(items)),
-                patch("raindian.__main__.fetch_page_text") as fetch_page,
-                patch("raindian.__main__.summarize_bookmark") as summarize,
+                patch("feedian.__main__.RaindropClient.iter_raindrops", return_value=iter(items)),
+                patch("feedian.__main__.fetch_page_text") as fetch_page,
+                patch("feedian.__main__.summarize_bookmark") as summarize,
             ):
                 result = process_bookmarks(config, args)
 
@@ -630,10 +655,10 @@ class MainTests(unittest.TestCase):
             output = StringIO()
             with (
                 patch.dict(os.environ, {"RAINDROP_TOKEN": "token"}, clear=True),
-                patch("raindian.__main__.RaindropClient.iter_raindrops", return_value=iter(items)),
-                patch("raindian.__main__.fetch_page_text", return_value=page) as fetch_page,
-                patch("raindian.__main__.summarize_bookmark") as summarize,
-                patch("raindian.__main__.count_prompt_tokens", return_value=(10, None)),
+                patch("feedian.__main__.RaindropClient.iter_raindrops", return_value=iter(items)),
+                patch("feedian.__main__.fetch_page_text", return_value=page) as fetch_page,
+                patch("feedian.__main__.summarize_bookmark") as summarize,
+                patch("feedian.__main__.count_prompt_tokens", return_value=(10, None)),
                 redirect_stdout(output),
             ):
                 result = estimate_bookmarks(config, args)
@@ -660,9 +685,9 @@ class MainTests(unittest.TestCase):
             args = parse_args(["--estimate", "--estimate-sample-size", "1"])
             with (
                 patch.dict(os.environ, {"RAINDROP_TOKEN": "token"}, clear=True),
-                patch("raindian.__main__.RaindropClient.iter_raindrops", return_value=iter(items)),
-                patch("raindian.__main__.fetch_page_text", return_value=page),
-                patch("raindian.__main__.count_prompt_tokens", return_value=(10, None)) as count_tokens,
+                patch("feedian.__main__.RaindropClient.iter_raindrops", return_value=iter(items)),
+                patch("feedian.__main__.fetch_page_text", return_value=page),
+                patch("feedian.__main__.count_prompt_tokens", return_value=(10, None)) as count_tokens,
                 redirect_stdout(StringIO()),
             ):
                 estimate_bookmarks(config, args)
@@ -680,7 +705,7 @@ class MainTests(unittest.TestCase):
         with TemporaryDirectory() as temp_dir:
             destination = Path(temp_dir) / "Raindrop"
             destination.mkdir()
-            usage_path = destination / ".raindian-usage.jsonl"
+            usage_path = destination / ".feedian-usage.jsonl"
             usage_path.write_text(
                 "".join(json.dumps(record) + "\n" for record in usage_records),
                 encoding="utf-8",
@@ -690,9 +715,9 @@ class MainTests(unittest.TestCase):
             output = StringIO()
             with (
                 patch.dict(os.environ, {"RAINDROP_TOKEN": "token"}, clear=True),
-                patch("raindian.__main__.RaindropClient.iter_raindrops", return_value=iter(items)),
-                patch("raindian.__main__.fetch_page_text", return_value=page),
-                patch("raindian.__main__.count_prompt_tokens", return_value=(100, None)),
+                patch("feedian.__main__.RaindropClient.iter_raindrops", return_value=iter(items)),
+                patch("feedian.__main__.fetch_page_text", return_value=page),
+                patch("feedian.__main__.count_prompt_tokens", return_value=(100, None)),
                 redirect_stdout(output),
             ):
                 result = estimate_bookmarks(config, args)
@@ -708,8 +733,8 @@ class MainTests(unittest.TestCase):
             args = parse_args(["--estimate", "--estimate-sample-size", "0"])
             with (
                 patch.dict(os.environ, {"RAINDROP_TOKEN": "token"}, clear=True),
-                patch("raindian.__main__.RaindropClient.iter_raindrops", return_value=iter(items)),
-                patch("raindian.__main__.fetch_page_text") as fetch_page,
+                patch("feedian.__main__.RaindropClient.iter_raindrops", return_value=iter(items)),
+                patch("feedian.__main__.fetch_page_text") as fetch_page,
             ):
                 result = estimate_bookmarks(config, args)
 
@@ -724,8 +749,8 @@ class MainTests(unittest.TestCase):
             args = parse_args(["--estimate", "--estimate-sample-size", "1", "--skip-page-fetch"])
             with (
                 patch.dict(os.environ, {"RAINDROP_TOKEN": "token"}, clear=True),
-                patch("raindian.__main__.RaindropClient.iter_raindrops", return_value=iter(items)),
-                patch("raindian.__main__.fetch_page_text") as fetch_page,
+                patch("feedian.__main__.RaindropClient.iter_raindrops", return_value=iter(items)),
+                patch("feedian.__main__.fetch_page_text") as fetch_page,
                 redirect_stdout(StringIO()),
             ):
                 result = estimate_bookmarks(config, args)
@@ -743,8 +768,8 @@ class MainTests(unittest.TestCase):
             output = StringIO()
             with (
                 patch.dict(os.environ, {"RAINDROP_TOKEN": "token"}, clear=True),
-                patch("raindian.__main__.RaindropClient.iter_raindrops", return_value=iter(items)),
-                patch("raindian.__main__.fetch_page_text", return_value=failed_page),
+                patch("feedian.__main__.RaindropClient.iter_raindrops", return_value=iter(items)),
+                patch("feedian.__main__.fetch_page_text", return_value=failed_page),
                 redirect_stdout(output),
             ):
                 result = estimate_bookmarks(config, args)
@@ -761,8 +786,8 @@ class MainTests(unittest.TestCase):
             output = StringIO()
             with (
                 patch.dict(os.environ, {"RAINDROP_TOKEN": "token"}, clear=True),
-                patch("raindian.__main__.RaindropClient.iter_raindrops", return_value=iter(())),
-                patch("raindian.__main__.fetch_page_text") as fetch_page,
+                patch("feedian.__main__.RaindropClient.iter_raindrops", return_value=iter(())),
+                patch("feedian.__main__.fetch_page_text") as fetch_page,
                 redirect_stdout(output),
             ):
                 result = estimate_bookmarks(config, args)

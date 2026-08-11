@@ -2,7 +2,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from raindian.recovery import PendingTransaction, load_pending, save_pending
+from feedian.recovery import PendingTransaction, load_pending, save_pending
 
 
 class RecoveryTests(unittest.TestCase):

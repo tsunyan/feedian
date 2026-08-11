@@ -1,8 +1,8 @@
 import unittest
 from unittest.mock import patch
 
-from raindian.extract import PageFetchResult
-from raindian.llm import SUMMARY_INSTRUCTIONS, build_prompt, extract_output_text, summarize_bookmark
+from feedian.extract import PageFetchResult
+from feedian.llm import SUMMARY_INSTRUCTIONS, build_prompt, extract_output_text, summarize_bookmark
 
 
 class LlmTests(unittest.TestCase):
@@ -22,7 +22,7 @@ class LlmTests(unittest.TestCase):
         }
         self.assertEqual(extract_output_text(data), '{"summary":"ok"}')
 
-    @patch("raindian.llm.urlopen")
+    @patch("feedian.llm.urlopen")
     def test_summary_request_limits_output_and_reasoning(self, mock_urlopen) -> None:
         response = mock_urlopen.return_value.__enter__.return_value
         response.read.return_value = (
@@ -52,7 +52,7 @@ class LlmTests(unittest.TestCase):
         self.assertEqual(payload["text"]["verbosity"], "low")
         self.assertIn("untrusted reference data", payload["instructions"])
         self.assertEqual(
-            summary["_raindian_usage"],
+            summary["_feedian_usage"],
             {
                 "input_tokens": 120,
                 "cached_input_tokens": 20,

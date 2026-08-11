@@ -157,7 +157,7 @@ def refresh_model_prices(
 
 
 def _fetch_official_text(url: str, timeout_seconds: int) -> str:
-    request = Request(url, headers={"User-Agent": "Raindian/1.0"})
+    request = Request(url, headers={"User-Agent": "Feedian/1.0"})
     with urlopen(request, timeout=timeout_seconds) as response:
         return response.read().decode("utf-8")
 

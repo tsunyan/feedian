@@ -44,7 +44,7 @@ unchanged API results.
 
 ## Token and Cost Estimate
 
-For every sampled bookmark with a fetchable page, Raindian:
+For every sampled bookmark with a fetchable page, Feedian:
 
 1. fetches page content using the normal URL-safety, extraction, length, timeout, and
    retry settings;
@@ -53,12 +53,12 @@ For every sampled bookmark with a fetchable page, Raindian:
 
 No `OPENAI_API_KEY` is required. The `tiktoken` package is a normal, version-pinned
 dependency. The preferred encoding is selected by `encoding_for_model`; when a model
-is unknown to the installed tokenizer, Raindian uses `o200k_base` and states that
+is unknown to the installed tokenizer, Feedian uses `o200k_base` and states that
 fallback in its output.
 
 The mean measured input-token count is multiplied by the total target bookmark count.
 Each model's total is calculated using that projected input plus the configured
-`max_output_tokens` for every target item. At the beginning of each run, Raindian reads
+`max_output_tokens` for every target item. At the beginning of each run, Feedian reads
 the official OpenAI model catalog and the published Markdown pages for its recommended
 models. It also includes the model configured by `openai_model`, which is visibly marked
 `selected`. If the catalog or prices cannot be fetched or parsed, it reports
@@ -80,7 +80,7 @@ replacement for measured API usage. When matching usage records exist, their agg
 typical estimate.
 
 Successful LLM summaries append one JSON line to
-`<vault_path>/<output_folder>/.raindian-usage.jsonl`. It records token counts, model and
+`<vault_path>/<output_folder>/.feedian-usage.jsonl`. It records token counts, model and
 reasoning settings, the price snapshot, and the request's estimated USD cost. It does
 not record page text or URLs. The estimate uses only matching records' input and output
 token counts; the price snapshot is retained for later cost aggregation.

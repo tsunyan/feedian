@@ -1,6 +1,6 @@
 .env
 config.json
-.raindian-state.json
+.feedian-state.json
 __pycache__/
 *.pyc
 .pytest_cache/

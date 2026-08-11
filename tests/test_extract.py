@@ -1,6 +1,6 @@
 import unittest
 
-from raindian.extract import TextExtractor
+from feedian.extract import TextExtractor
 
 
 class TextExtractorTests(unittest.TestCase):

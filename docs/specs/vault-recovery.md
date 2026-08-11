@@ -8,11 +8,11 @@ when the outage occurs.
 
 ## Normal flow
 
-Before every OpenAI summary request, Raindian reads the usage log in the output
+Before every OpenAI summary request, Feedian reads the usage log in the output
 folder. A read failure is treated as an unavailable vault and stops the command
 before the request is made.
 
-After a successful OpenAI response, Raindian creates a local, atomic pending
+After a successful OpenAI response, Feedian creates a local, atomic pending
 record containing the rendered Markdown, the usage record, the destination
 path, and a transaction identifier. It then writes the note to the vault and
 appends the usage record. Once both succeed, it removes the pending record.
@@ -23,7 +23,7 @@ Any Markdown write failure or usage-log write failure stops the command. The
 pending record remains local; it contains no fetched page text beyond the
 rendered note and does not accumulate during successful processing.
 
-On the next non-dry-run command, Raindian first attempts to complete the
+On the next non-dry-run command, Feedian first attempts to complete the
 pending record. The usage record carries a transaction identifier, so recovery
 does not append it twice if a prior append succeeded just before interruption.
 Only after recovery succeeds does normal bookmark processing continue.

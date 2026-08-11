@@ -8,23 +8,36 @@ from typing import TextIO
 from rich.console import Console
 from rich.progress import (
     BarColumn,
+    MofNCompleteColumn,
     Progress,
     SpinnerColumn,
+    Task,
     TaskID,
     TaskProgressColumn,
     TextColumn,
     TimeElapsedColumn,
     TimeRemainingColumn,
 )
+from rich.text import Text
 
 
 PROGRESS_MODES = ("auto", "rich", "plain", "off")
+
+
+class _KnownOrUnknownTotalColumn(MofNCompleteColumn):
+    def render(self, task: Task) -> Text:
+        if task.total is None:
+            return Text(f"{int(task.completed)}/???", style="progress.download")
+        if task.fields.get("estimated_total"):
+            return Text(f"{int(task.completed)}/~{int(task.total)}", style="progress.download")
+        return super().render(task)
 
 
 @dataclass
 class _PlainTask:
     description: str
     total: int | None
+    estimated_total: bool = False
     completed: int = 0
     started_at: float = 0.0
     last_reported_at: float = 0.0
@@ -58,6 +71,7 @@ class ProgressReporter:
                 TextColumn("{task.description}"),
                 BarColumn(),
                 TaskProgressColumn(),
+                _KnownOrUnknownTotalColumn(),
                 TimeElapsedColumn(),
                 TimeRemainingColumn(),
                 console=self._console,
@@ -70,19 +84,30 @@ class ProgressReporter:
         if self._progress is not None:
             self._progress.stop()
 
-    def start_task(self, description: str, *, total: int | None = None) -> None:
+    def start_task(
+        self,
+        description: str,
+        *,
+        total: int | None = None,
+        estimated_total: bool = False,
+    ) -> None:
         if self.mode == "off":
             return
         if self.mode == "rich":
             assert self._progress is not None
             if self._rich_task_id is not None:
                 self._progress.remove_task(self._rich_task_id)
-            self._rich_task_id = self._progress.add_task(description, total=total)
+            self._rich_task_id = self._progress.add_task(
+                description,
+                total=total,
+                estimated_total=estimated_total,
+            )
             return
         now = time.monotonic()
         self._plain_task = _PlainTask(
             description=description,
             total=total,
+            estimated_total=estimated_total,
             started_at=now,
             last_reported_at=now,
         )
@@ -99,7 +124,11 @@ class ProgressReporter:
             return
         self._plain_task.completed += amount
         now = time.monotonic()
-        complete = self._plain_task.total is not None and self._plain_task.completed >= self._plain_task.total
+        complete = (
+            self._plain_task.total is not None
+            and not self._plain_task.estimated_total
+            and self._plain_task.completed >= self._plain_task.total
+        )
         if complete or now - self._plain_task.last_reported_at >= self.plain_interval_seconds:
             self._write(self._plain_text(self._plain_task))
             self._plain_task.last_reported_at = now
@@ -128,7 +157,8 @@ class ProgressReporter:
         elapsed = max(0.0, time.monotonic() - task.started_at)
         if task.total is None:
             return f"{task.description} processed={task.completed} elapsed={_format_duration(elapsed)}"
-        text = f"{task.description} {task.completed}/{task.total} elapsed={_format_duration(elapsed)}"
+        total = f"~{task.total}" if task.estimated_total else str(task.total)
+        text = f"{task.description} {task.completed}/{total} elapsed={_format_duration(elapsed)}"
         if task.completed <= 0 or elapsed <= 0:
             return text
         rate = task.completed / elapsed

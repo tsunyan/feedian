@@ -20,8 +20,8 @@
 ### Task 1: Add configuration and a per-client request interval
 
 **Files:**
-- Modify: `raindian/config.py`, `config.example.json`
-- Modify: `raindian/raindrop.py`
+- Modify: `feedian/config.py`, `config.example.json`
+- Modify: `feedian/raindrop.py`
 - Test: `tests/test_config.py`, `tests/test_raindrop.py`
 
 - [ ] Write failing tests for the `0.5` default and two client requests separated by the configured interval.
@@ -32,7 +32,7 @@
 ### Task 2: Honor Raindrop reset headers on 429
 
 **Files:**
-- Modify: `raindian/retry.py`
+- Modify: `feedian/retry.py`
 - Test: `tests/test_retry.py`
 
 - [ ] Write a failing 429 test with `X-RateLimit-Reset` later than `Retry-After`.
@@ -42,7 +42,7 @@
 ### Task 3: Surface sync pacing and document it
 
 **Files:**
-- Modify: `raindian/__main__.py`, `README.md`
+- Modify: `feedian/__main__.py`, `README.md`
 - Test: `tests/test_main.py`
 
 - [ ] Write failing tests asserting both sync commands print `request_interval=0.5s` and still print `elapsed=`.

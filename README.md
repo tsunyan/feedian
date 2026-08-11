@@ -1,4 +1,4 @@
-# Raindian
+# Feedian
 
 ![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)
 ![Dependencies](https://img.shields.io/badge/dependencies-tiktoken-4C8CBF)
@@ -6,7 +6,7 @@
 
 Raindrop.io bookmarks to Obsidian Markdown notes.
 
-`Raindian` (Raindrop -> Obsidian) reads bookmarks from the Raindrop.io REST API, fetches each linked page, optionally asks the OpenAI Responses API for a Japanese summary and tags, and writes one `.md` file per bookmark into a local Obsidian vault.
+`Feedian` (Raindrop -> Obsidian) reads bookmarks from the Raindrop.io REST API, fetches each linked page, optionally asks the OpenAI Responses API for a Japanese summary and tags, and writes one `.md` file per bookmark into a local Obsidian vault.
 
 ## Requirements
 
@@ -49,7 +49,7 @@ Or copy `.env.example` to `.env` and edit it. Omit `OPENAI_API_KEY` when using `
 Run a dry run first:
 
 ```powershell
-python -m raindian --config config.json --limit 3 --dry-run
+python -m feedian --config config.json --limit 3 --dry-run
 ```
 
 Dry runs query Raindrop to list the target bookmarks, but do not fetch linked pages, call OpenAI, or write files. An OpenAI API key is not required for a dry run.
@@ -57,7 +57,7 @@ Dry runs query Raindrop to list the target bookmarks, but do not fetch linked pa
 Create notes:
 
 ```powershell
-python -m raindian --config config.json --limit 10
+python -m feedian --config config.json --limit 10
 ```
 
 ## Config
@@ -108,23 +108,23 @@ The estimate is intentionally broad. `max_article_chars` limits fetched page tex
 Use `--estimate` to calculate a project-specific estimate without calling an OpenAI model API or writing notes. It needs `RAINDROP_TOKEN`, fetches a representative sample of linked pages, builds the same prompts used for normal processing, and counts their input tokens locally with `tiktoken`. It also reads the public OpenAI model documentation to refresh prices; this does not require `OPENAI_API_KEY` or incur model API charges.
 
 ```powershell
-python -m raindian --config config.json --estimate
+python -m feedian --config config.json --estimate
 ```
 
 The default sample size is `10%`, with a minimum of 20 pages when the target has at least 20 bookmarks. Samples are proportional to Raindrop collections and evenly spaced within each collection's API order.
 
 ```powershell
 # Use exactly 50 sampled pages.
-python -m raindian --config config.json --estimate --estimate-sample-size 50
+python -m feedian --config config.json --estimate --estimate-sample-size 50
 
 # Use 20% of the target bookmarks (at least 20 pages).
-python -m raindian --config config.json --estimate --estimate-sample-size 20%
+python -m feedian --config config.json --estimate --estimate-sample-size 20%
 
 # Do not fetch pages; use the generic 2,000-10,000 input-token range instead.
-python -m raindian --config config.json --estimate --estimate-sample-size 0
+python -m feedian --config config.json --estimate --estimate-sample-size 0
 
 # Estimate metadata and excerpts only, without fetching linked pages.
-python -m raindian --config config.json --estimate --skip-page-fetch
+python -m feedian --config config.json --estimate --skip-page-fetch
 ```
 
 The command reports its current phase while it runs: official price refresh, bookmark collection, every 50 collected bookmarks, sample selection, each page fetch, and cost calculation. On each run it reads the [official OpenAI model catalog](https://developers.openai.com/api/docs/models) and prices for its recommended models, then also includes the configured `openai_model` (or `OPENAI_MODEL` override) and labels it `selected`. The `gpt-5.6` alias maps to Sol. If the catalog cannot be read or parsed, it prints `price_source=fallback` and uses the built-in price table instead. When pages are sampled, the table shows both a typical and a maximum estimate. The typical estimate uses the aggregate `output_tokens / input_tokens` ratio from matching usage records when available; otherwise it uses the initial `input-matched` assumption that output tokens equal the measured mean input tokens. The maximum estimate uses `max_output_tokens`. A failed page fetch still estimates the fallback prompt made from Raindrop metadata and the fetch error. Server-side request framing, reasoning tokens, or future price changes can still make the final bill differ.
@@ -142,58 +142,58 @@ The command reports its current phase while it runs: official price refresh, boo
 - Raindrop and OpenAI requests retry transient 408, 409, 425, 429, 5xx, and network failures with bounded exponential backoff.
 - Raindrop note and tag syncs pace each HTTP request independently at `sync_request_interval_seconds`. On a 429 response, the retry waits for the later of `Retry-After` and Raindrop's `X-RateLimit-Reset` time before retrying. Each sync prints its request interval at start and `elapsed=<seconds>s` when complete.
 - Long-running commands show their phase and progress automatically. `--progress auto` (the default) uses Rich progress bars in an interactive terminal and periodic plain-text updates elsewhere. Use `--progress rich`, `--progress plain`, or `--progress off` to override this choice; add `--verbose` to include individual bookmark names.
-- Before each OpenAI summary request, Raindian reads the usage log to confirm the vault is available. If the vault cannot be read or a Markdown or usage write fails, it stops before making further OpenAI requests.
-- After an LLM response, Raindian temporarily stores at most one pending note under `~/.raindian/pending` until both the Markdown note and usage record are stored in the vault. The next LLM run automatically completes this pending write without requesting another summary; the local pending file is then removed.
-- Successful LLM summaries append a JSON line with `operation: "summarize"` and a transaction ID to `<vault_path>/<output_folder>/.raindian-usage.jsonl`. Each line contains token usage, model and reasoning settings, a price snapshot, and the request's estimated USD cost; it does not contain page text or URLs.
+- Before each OpenAI summary request, Feedian reads the usage log to confirm the vault is available. If the vault cannot be read or a Markdown or usage write fails, it stops before making further OpenAI requests.
+- After an LLM response, Feedian temporarily stores at most one pending note under `~/.feedian/pending` until both the Markdown note and usage record are stored in the vault. The next LLM run automatically completes this pending write without requesting another summary; the local pending file is then removed.
+- Successful LLM summaries append a JSON line with `operation: "summarize"` and a transaction ID to `<vault_path>/<output_folder>/.feedian-usage.jsonl`. Each line contains token usage, model and reasoning settings, a price snapshot, and the request's estimated USD cost; it does not contain page text or URLs.
 
 ## Useful Commands
 
 List collections:
 
 ```powershell
-python -m raindian --config config.json --list-collections
+python -m feedian --config config.json --list-collections
 ```
 
 Process one collection:
 
 ```powershell
-python -m raindian --config config.json --collection 123456 --limit 20
+python -m feedian --config config.json --collection 123456 --limit 20
 ```
 
 Upgrade `--no-llm` notes with LLM summaries and rename notes to their Japanese titles. Existing LLM notes are renamed from their saved frontmatter title without another OpenAI call:
 
 ```powershell
-python -m raindian --config config.json --rename-existing
+python -m feedian --config config.json --rename-existing
 ```
 
 Preview copying existing Japanese LLM summaries into Raindrop notes. This reads local Markdown only and does not call OpenAI or modify Raindrop:
 
 ```powershell
-python -m raindian --config config.json --sync-raindrop-summary --dry-run
+python -m feedian --config config.json --sync-raindrop-summary --dry-run
 ```
 
-Apply the summary sync. Raindian appends or updates only its managed `Raindian Summary` block in each Raindrop note, preserving any manual note text:
+Apply the summary sync. Feedian appends or updates only its managed `Feedian Summary` block in each Raindrop note, preserving any manual note text:
 
 ```powershell
-python -m raindian --config config.json --sync-raindrop-summary
+python -m feedian --config config.json --sync-raindrop-summary
 ```
 
 Preview tags from existing LLM notes before adding them to the matching Raindrop items:
 
 ```powershell
-python -m raindian --config config.json --sync-raindrop-tags --dry-run
+python -m feedian --config config.json --sync-raindrop-tags --dry-run
 ```
 
-Apply the tag sync. Raindian excludes `base_tags`, reads the item's current Raindrop tags, and appends only missing tags. It never replaces or removes existing Raindrop tags:
+Apply the tag sync. Feedian excludes `base_tags`, reads the item's current Raindrop tags, and appends only missing tags. It never replaces or removes existing Raindrop tags:
 
 ```powershell
-python -m raindian --config config.json --sync-raindrop-tags
+python -m feedian --config config.json --sync-raindrop-tags
 ```
 
 Use a different vault without editing config:
 
 ```powershell
-python -m raindian --config config.json --vault "C:\Users\you\Documents\Obsidian\Vault"
+python -m feedian --config config.json --vault "C:\Users\you\Documents\Obsidian\Vault"
 ```
 
 ## License

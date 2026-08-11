@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from raindian.config import Config, load_config
+from feedian.config import Config, load_config
 
 
 class ConfigTests(unittest.TestCase):

@@ -170,7 +170,7 @@ def fetch_page_text(
     request = Request(
         url,
         headers={
-            "User-Agent": "raindian/0.1 (+https://github.com/) Python urllib",
+            "User-Agent": "feedian/0.1 (+https://github.com/) Python urllib",
             "Accept": "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.1",
         },
         method="GET",

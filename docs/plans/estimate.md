@@ -4,7 +4,7 @@
 
 **Goal:** Add a read-only `--estimate` command that samples representative bookmark pages and projects costs for all supported OpenAI models.
 
-**Architecture:** Keep CLI orchestration in `raindian/__main__.py`; add `raindian/estimate.py` for pure sample parsing, stratified selection, token counting, pricing, and output rendering. Estimate mode reuses normal page extraction and prompt construction without calling OpenAI.
+**Architecture:** Keep CLI orchestration in `feedian/__main__.py`; add `feedian/estimate.py` for pure sample parsing, stratified selection, token counting, pricing, and output rendering. Estimate mode reuses normal page extraction and prompt construction without calling OpenAI.
 
 **Tech Stack:** Python 3.11+, standard library, `tiktoken`, unittest, Raindrop REST client.
 
@@ -20,8 +20,8 @@
 
 ## File Structure
 
-- Create `raindian/estimate.py`: pure sample parsing, allocation, token counting, projections, formatting.
-- Modify `raindian/__main__.py`: options, validation, and estimate route.
+- Create `feedian/estimate.py`: pure sample parsing, allocation, token counting, projections, formatting.
+- Modify `feedian/__main__.py`: options, validation, and estimate route.
 - Create `tests/test_estimate.py`: unit plus mocked route coverage.
 - Modify `tests/test_main.py`: option-conflict coverage.
 - Create `requirements.txt`: pinned `tiktoken` runtime dependency.
@@ -29,7 +29,7 @@
 
 ### Task 1: Estimation Primitives
 
-**Files:** `raindian/estimate.py`, `tests/test_estimate.py`
+**Files:** `feedian/estimate.py`, `tests/test_estimate.py`
 
 **Interfaces:** `parse_sample_size(value: str, population: int) -> int`; `select_sample(items: list[dict[str, Any]], sample_size: int) -> list[dict[str, Any]]`; `count_prompt_tokens(prompt: str, model: str) -> tuple[int, str | None]`; `refresh_model_prices(selected_model: str, timeout_seconds: int) -> PriceRefresh`; `projected_costs(population: int, input_tokens_per_item: float, max_output_tokens: int, prices: Sequence[ModelPrice]) -> list[CostRow]`.
 
@@ -41,7 +41,7 @@
 
 ### Task 2: Read-Only CLI Flow
 
-**Files:** `raindian/__main__.py`, `tests/test_main.py`, `tests/test_estimate.py`
+**Files:** `feedian/__main__.py`, `tests/test_main.py`, `tests/test_estimate.py`
 
 **Interfaces:** New `estimate_bookmarks(config: Config, args: argparse.Namespace) -> int` consumes Task 1 functions.
 
@@ -58,5 +58,5 @@
 
 - [x] **Step 1: Add `tiktoken` as a pinned Python 3.11-compatible requirement.** Replaced standard-library-only badge/copy and documented `pip install -r requirements.txt`.
 - [x] **Step 2: Document estimate commands.** Included default, absolute, percentage, and count-only forms; documented `RAINDROP_TOKEN`, sampled pages, and billing limitations.
-- [x] **Step 3: Verify.** `python -m unittest discover -s tests -v`, `python -m raindian --help`, and `git diff --check` passed.
+- [x] **Step 3: Verify.** `python -m unittest discover -s tests -v`, `python -m feedian --help`, and `git diff --check` passed.
 - [x] **Step 4: Commit.** Committed as `c21fba9 docs: explain sampled cost estimates`.

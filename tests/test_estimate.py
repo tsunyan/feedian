@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from raindian.estimate import (
+from feedian.estimate import (
     MODEL_CATALOG_URL,
     MODEL_DOCS_BASE_URL,
     MODEL_PRICES,

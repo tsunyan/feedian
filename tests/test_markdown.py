@@ -1,7 +1,7 @@
 import unittest
 
-from raindian.extract import PageFetchResult
-from raindian.markdown import (
+from feedian.extract import PageFetchResult
+from feedian.markdown import (
     merge_tags,
     note_filename,
     render_note,
@@ -81,7 +81,7 @@ class MarkdownTests(unittest.TestCase):
         self.assertIn("My manual note", replaced)
         self.assertIn("更新後の要約", replaced)
         self.assertNotIn("最初の要約", replaced)
-        self.assertEqual(replaced.count("<!-- raindian:summary:start -->"), 1)
+        self.assertEqual(replaced.count("<!-- feedian:summary:start -->"), 1)
 
 if __name__ == "__main__":
     unittest.main()

@@ -9,7 +9,7 @@ from .extract import PageFetchResult
 from .retry import run_with_retries
 
 
-USAGE_FIELD = "_raindian_usage"
+USAGE_FIELD = "_feedian_usage"
 
 
 SUMMARY_SCHEMA: dict[str, Any] = {

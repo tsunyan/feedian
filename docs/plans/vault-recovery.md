@@ -4,7 +4,7 @@
 
 **Goal:** Stop before an OpenAI request when the vault is unavailable and recover the one completed LLM result that could not be written to the vault.
 
-**Architecture:** A new recovery module persists one local transaction per output directory under `~/.raindian/pending`. `process_bookmarks` validates the usage log before every LLM request, saves a pending transaction after receiving the response, writes the Markdown and usage record to the vault, and deletes the transaction only after both succeed.
+**Architecture:** A new recovery module persists one local transaction per output directory under `~/.feedian/pending`. `process_bookmarks` validates the usage log before every LLM request, saves a pending transaction after receiving the response, writes the Markdown and usage record to the vault, and deletes the transaction only after both succeed.
 
 **Tech Stack:** Python standard library and the existing `unittest` suite.
 
@@ -20,7 +20,7 @@
 ### Task 1: Add local pending-transaction primitives
 
 **Files:**
-- Create: `raindian/recovery.py`
+- Create: `feedian/recovery.py`
 - Test: `tests/test_recovery.py`
 
 **Interfaces:**
@@ -41,7 +41,7 @@ self.assertIsNone(load_pending(other_destination, state_root=state_root))
 
 ```python
 def pending_path(destination: Path, state_root: Path | None = None) -> Path:
-    root = state_root or (Path.home() / ".raindian" / "pending")
+    root = state_root or (Path.home() / ".feedian" / "pending")
     digest = hashlib.sha256(str(destination.resolve()).encode("utf-8")).hexdigest()
     return root / f"{digest}.json"
 ```
@@ -55,7 +55,7 @@ Run `python -m unittest tests.test_recovery -v`, then commit `feat: persist pend
 ### Task 2: Make usage records idempotent
 
 **Files:**
-- Modify: `raindian/__main__.py:248-278`
+- Modify: `feedian/__main__.py:248-278`
 - Test: `tests/test_main.py`
 
 **Interfaces:**
@@ -82,7 +82,7 @@ Run `python -m unittest tests.test_main -v`, then commit `feat: make usage recor
 ### Task 3: Guard LLM calls and recover pending writes
 
 **Files:**
-- Modify: `raindian/__main__.py:319-490`
+- Modify: `feedian/__main__.py:319-490`
 - Test: `tests/test_main.py`
 
 **Interfaces:**
@@ -92,8 +92,8 @@ Run `python -m unittest tests.test_main -v`, then commit `feat: make usage recor
 - [ ] **Step 1: Add failing process tests**
 
 ```python
-with patch("raindian.__main__.ensure_usage_log_readable", side_effect=OSError("drive offline")), \
-     patch("raindian.__main__.summarize_bookmark") as summarize:
+with patch("feedian.__main__.ensure_usage_log_readable", side_effect=OSError("drive offline")), \
+     patch("feedian.__main__.summarize_bookmark") as summarize:
     self.assertEqual(process_bookmarks(config, args), 1)
 summarize.assert_not_called()
 ```
@@ -124,7 +124,7 @@ Run `python -m unittest tests.test_main tests.test_recovery -v`, then commit `fe
 
 - [ ] **Step 1: Document the failure behavior**
 
-State that Raindian stops before further OpenAI requests, keeps one completed item under `~/.raindian/pending`, and flushes it automatically on the next LLM run.
+State that Feedian stops before further OpenAI requests, keeps one completed item under `~/.feedian/pending`, and flushes it automatically on the next LLM run.
 
 - [ ] **Step 2: Run final verification and commit**
 

@@ -17,7 +17,7 @@ class PendingTransaction:
 
 
 def pending_path(destination: Path, state_root: Path | None = None) -> Path:
-    root = state_root or (Path.home() / ".raindian" / "pending")
+    root = state_root or (Path.home() / ".feedian" / "pending")
     canonical_destination = str(destination.resolve())
     digest = hashlib.sha256(canonical_destination.encode("utf-8")).hexdigest()
     return root / f"{digest}.json"

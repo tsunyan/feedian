@@ -34,8 +34,8 @@ WINDOWS_RESERVED_NAMES = {
     "LPT9",
 }
 MAX_FILENAME_TITLE_CHARS = 60
-RAINDIAN_SUMMARY_START = "<!-- raindian:summary:start -->"
-RAINDIAN_SUMMARY_END = "<!-- raindian:summary:end -->"
+FEEDIAN_SUMMARY_START = "<!-- feedian:summary:start -->"
+FEEDIAN_SUMMARY_END = "<!-- feedian:summary:end -->"
 
 
 def note_filename(item: dict[str, Any], title: str | None = None) -> str:
@@ -131,19 +131,19 @@ def render_note(
 
 
 def upsert_raindrop_summary(note: str, summary: str) -> str:
-    """Replace only Raindian's managed summary block in a Raindrop note."""
+    """Replace only Feedian's managed summary block in a Raindrop note."""
     summary = summary.strip()
     block = "\n".join(
         [
-            RAINDIAN_SUMMARY_START,
-            "## Raindian Summary",
+            FEEDIAN_SUMMARY_START,
+            "## Feedian Summary",
             "",
             summary,
-            RAINDIAN_SUMMARY_END,
+            FEEDIAN_SUMMARY_END,
         ]
     )
     pattern = re.compile(
-        rf"{re.escape(RAINDIAN_SUMMARY_START)}.*?{re.escape(RAINDIAN_SUMMARY_END)}",
+        rf"{re.escape(FEEDIAN_SUMMARY_START)}.*?{re.escape(FEEDIAN_SUMMARY_END)}",
         flags=re.DOTALL,
     )
     if pattern.search(note):

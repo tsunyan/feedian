@@ -30,16 +30,17 @@ from .markdown import normalize_tag, note_filename, render_note, upsert_raindrop
 from .progress import PROGRESS_MODES, ProgressReporter
 from .raindrop import RaindropClient
 from .recovery import PendingTransaction, load_pending, remove_pending, save_pending
+from .source_state import load_raindrop_collection_count, save_raindrop_collection_count
 
 
 NON_CONTENT_TAGS = frozenset({"x", "sns"})
-PENDING_STATE_ROOT = Path.home() / ".raindian" / "pending"
+PENDING_STATE_ROOT = Path.home() / ".feedian" / "pending"
 T = TypeVar("T")
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        prog="raindian",
+        prog="feedian",
         description="Export Raindrop.io bookmarks as summarized Obsidian Markdown notes.",
     )
     parser.add_argument("--config", default="config.json", help="Path to config JSON.")
@@ -362,12 +363,12 @@ def build_usage_record(
 
 
 def append_usage_record(destination: Path, record: dict[str, Any]) -> None:
-    with (destination / ".raindian-usage.jsonl").open("a", encoding="utf-8", newline="\n") as usage_file:
+    with (destination / ".feedian-usage.jsonl").open("a", encoding="utf-8", newline="\n") as usage_file:
         usage_file.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
 
 
 def usage_record_exists(destination: Path, transaction_id: str) -> bool:
-    usage_path = destination / ".raindian-usage.jsonl"
+    usage_path = destination / ".feedian-usage.jsonl"
     if not usage_path.exists():
         return False
     with usage_path.open(encoding="utf-8") as usage_file:
@@ -382,7 +383,7 @@ def usage_record_exists(destination: Path, transaction_id: str) -> bool:
 
 
 def ensure_usage_log_readable(destination: Path) -> None:
-    usage_path = destination / ".raindian-usage.jsonl"
+    usage_path = destination / ".feedian-usage.jsonl"
     with usage_path.open("a+", encoding="utf-8", newline="\n") as usage_file:
         usage_file.seek(0)
         usage_file.read(1)
@@ -409,7 +410,7 @@ def usage_output_ratio(
     model: str,
     reasoning_effort: str,
 ) -> tuple[float, int] | None:
-    usage_path = destination / ".raindian-usage.jsonl"
+    usage_path = destination / ".feedian-usage.jsonl"
     if not usage_path.exists():
         return None
     input_total = 0
@@ -504,12 +505,40 @@ def process_bookmarks(
         limit=args.limit,
     )
     if reporter is not None:
-        reporter.start_task("process: collecting Raindrop bookmarks")
+        previous_count = None
+        if args.limit is None:
+            previous_count = load_raindrop_collection_count(
+                raindrop_token,
+                config.collection_id,
+                config.nested,
+            )
+        collection_total = args.limit if args.limit is not None else previous_count
+        reporter.start_task(
+            "process: collecting Raindrop bookmarks",
+            total=collection_total,
+            estimated_total=previous_count is not None,
+        )
         items = list(tracked_items(items, reporter))
+        collected = len(items)
+        if args.limit is None:
+            report(reporter, f"process: collected={collected}{_format_count_delta(collected, previous_count)}")
+            try:
+                save_raindrop_collection_count(
+                    raindrop_token,
+                    config.collection_id,
+                    config.nested,
+                    collected,
+                )
+            except OSError as exc:
+                report(reporter, f"process: count cache warning: {exc}")
         reporter.start_task("process: generating Obsidian notes", total=len(items))
 
-    for item in tracked_items(items, reporter):
+    for item in items:
         processed += 1
+        # Count every bookmark as soon as its processing starts, including
+        # bookmarks that will be skipped because their note already exists.
+        if reporter is not None:
+            reporter.advance()
         existing = existing_note_for_item(destination, item)
         target = existing or (destination / note_filename(item))
         existing_path = existing or (target if target.exists() else None)
@@ -665,6 +694,13 @@ def process_bookmarks(
         f"failed={failed} elapsed={elapsed_seconds:.1f}s"
     )
     return 1 if failed else 0
+
+
+def _format_count_delta(current: int, previous: int | None) -> str:
+    if previous is None:
+        return ""
+    delta = current - previous
+    return " Δ±0" if delta == 0 else f" Δ{delta:+d}"
 
 
 def sync_raindrop_summaries(

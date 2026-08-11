@@ -2,7 +2,7 @@ import json
 import unittest
 from unittest.mock import MagicMock, patch
 
-from raindian.raindrop import RaindropClient
+from feedian.raindrop import RaindropClient
 
 
 class RaindropClientTests(unittest.TestCase):
@@ -12,7 +12,7 @@ class RaindropClientTests(unittest.TestCase):
         context_manager = MagicMock()
         context_manager.__enter__.return_value = response
 
-        with patch("raindian.raindrop.urlopen", return_value=context_manager) as urlopen_mock:
+        with patch("feedian.raindrop.urlopen", return_value=context_manager) as urlopen_mock:
             client = RaindropClient(token="token", max_retries=0)
             client.update_raindrop_note(123, "Japanese summary")
 
@@ -27,7 +27,7 @@ class RaindropClientTests(unittest.TestCase):
         context_manager = MagicMock()
         context_manager.__enter__.return_value = response
 
-        with patch("raindian.raindrop.urlopen", return_value=context_manager) as urlopen_mock:
+        with patch("feedian.raindrop.urlopen", return_value=context_manager) as urlopen_mock:
             client = RaindropClient(token="token", max_retries=0)
             client.append_raindrop_tags(5, 123, ["ai", "new-tag"])
 
@@ -46,9 +46,9 @@ class RaindropClientTests(unittest.TestCase):
         context_manager.__enter__.return_value = response
 
         with (
-            patch("raindian.raindrop.urlopen", return_value=context_manager),
-            patch("raindian.raindrop.time.monotonic", side_effect=[0.0, 0.0]),
-            patch("raindian.raindrop.time.sleep") as sleep,
+            patch("feedian.raindrop.urlopen", return_value=context_manager),
+            patch("feedian.raindrop.time.monotonic", side_effect=[0.0, 0.0]),
+            patch("feedian.raindrop.time.sleep") as sleep,
         ):
             client = RaindropClient(token="token", max_retries=0, request_interval_seconds=0.5)
             client.update_raindrop_note(123, "one")

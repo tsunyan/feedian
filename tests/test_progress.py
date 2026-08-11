@@ -2,7 +2,7 @@ import io
 import unittest
 from unittest.mock import Mock
 
-from raindian.progress import ProgressReporter
+from feedian.progress import ProgressReporter
 
 
 class ProgressReporterTests(unittest.TestCase):
@@ -26,6 +26,26 @@ class ProgressReporterTests(unittest.TestCase):
         output = stream.getvalue()
         self.assertIn("sync: scanning notes 0/2", output)
         self.assertIn("sync: scanning notes 2/2", output)
+
+    def test_rich_mode_shows_completed_count_when_total_is_unknown(self) -> None:
+        stream = io.StringIO()
+        reporter = ProgressReporter("rich", stream=stream)
+
+        with reporter:
+            reporter.start_task("process: collecting bookmarks")
+            reporter.advance(50)
+
+        self.assertIn("50/???", stream.getvalue())
+
+    def test_rich_mode_marks_a_previous_total_as_approximate(self) -> None:
+        stream = io.StringIO()
+        reporter = ProgressReporter("rich", stream=stream)
+
+        with reporter:
+            reporter.start_task("process: collecting bookmarks", total=3163, estimated_total=True)
+            reporter.advance(50)
+
+        self.assertIn("50/~3163", stream.getvalue())
 
 
 if __name__ == "__main__":

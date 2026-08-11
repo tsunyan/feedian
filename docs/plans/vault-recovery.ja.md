@@ -2,11 +2,11 @@
 
 **目的:** 書庫が利用不可ならOpenAI API呼び出し前に停止し、書き込みできなかった完了済みLLM応答1件を復旧できるようにする。
 
-**構成:** `raindian/recovery.py` が書庫ごとに1件の保留トランザクションを `~/.raindian/pending` へ保持する。通常処理はLLM呼び出し前にusageログを読み、応答後はローカル保留、Markdown、usageの順に処理する。再実行時は保留を先に反映し、トランザクションIDでusageの二重追記を防ぐ。
+**構成:** `feedian/recovery.py` が書庫ごとに1件の保留トランザクションを `~/.feedian/pending` へ保持する。通常処理はLLM呼び出し前にusageログを読み、応答後はローカル保留、Markdown、usageの順に処理する。再実行時は保留を先に反映し、トランザクションIDでusageの二重追記を防ぐ。
 
 ## 実装順
 
-- [ ] 保留データの原子的保存・復元・削除・書庫パスごとの分離を `raindian/recovery.py` と `tests/test_recovery.py` に追加する。
+- [ ] 保留データの原子的保存・復元・削除・書庫パスごとの分離を `feedian/recovery.py` と `tests/test_recovery.py` に追加する。
 - [ ] usageレコードの生成と追記を分け、新規レコードに `transaction_id` を加え、IDの存在確認で重複追記を防ぐ。
 - [ ] 通常LLM処理の各リクエスト直前にusageログを読み、失敗ならAPI呼び出しをせず終了する。
 - [ ] LLM応答後はローカル保留を先に保存し、Markdownまたはusageへの書き込みが失敗したら保留を残して即停止する。
