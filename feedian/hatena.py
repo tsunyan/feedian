@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import os
@@ -107,33 +108,42 @@ def fetch_hatena_entry_discussion(
 
 
 def fetch_hatena_star_counts(
-    uris: list[str], *, timeout_seconds: int = 30, batch_size: int = 40
+    uris: list[str], *, timeout_seconds: int = 30, batch_size: int = 40, workers: int = 4
 ) -> dict[str, int]:
     unique_uris = list(dict.fromkeys(uri for uri in uris if uri))
     # The API omits requested URIs that have no public stars. They are valid zeroes,
     # not failed lookups.
     counts: dict[str, int] = {uri: 0 for uri in unique_uris}
-    for offset in range(0, len(unique_uris), max(1, batch_size)):
-        batch = unique_uris[offset : offset + max(1, batch_size)]
+    batches = [
+        unique_uris[offset : offset + max(1, batch_size)]
+        for offset in range(0, len(unique_uris), max(1, batch_size))
+    ]
+
+    def fetch_batch(batch: list[str]) -> dict[str, Any]:
         request = Request(
             f"{STAR_ENTRY_API_URL}?{urlencode([('uri', uri) for uri in batch])}",
             headers={"Accept": "application/json", "User-Agent": "feedian/0.1 (+https://github.com/tsunyan/feedian)"},
             method="GET",
         )
-        data = _read_entry_json(request, timeout_seconds)
-        entries = data.get("entries")
-        if not isinstance(entries, list):
-            continue
-        for entry in entries:
-            if not isinstance(entry, dict) or not isinstance(entry.get("uri"), str):
+        return _read_entry_json(request, timeout_seconds)
+
+    worker_count = max(1, min(len(batches) or 1, workers))
+    with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="feedian-stars") as executor:
+        responses = executor.map(fetch_batch, batches)
+        for data in responses:
+            entries = data.get("entries")
+            if not isinstance(entries, list):
                 continue
-            total = _star_objects_count(entry.get("stars"))
-            colored = entry.get("colored_stars")
-            if isinstance(colored, list):
-                for group in colored:
-                    if isinstance(group, dict):
-                        total += _star_objects_count(group.get("stars"))
-            counts[str(entry["uri"])] = total
+            for entry in entries:
+                if not isinstance(entry, dict) or not isinstance(entry.get("uri"), str):
+                    continue
+                total = _star_objects_count(entry.get("stars"))
+                colored = entry.get("colored_stars")
+                if isinstance(colored, list):
+                    for group in colored:
+                        if isinstance(group, dict):
+                            total += _star_objects_count(group.get("stars"))
+                counts[str(entry["uri"])] = total
     return counts
 
 

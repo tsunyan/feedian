@@ -344,6 +344,117 @@ class VaultStore:
         self._refresh_comment_fts(comment_id, body, " ".join(tags or []))
         return comment_id, changed
 
+    def upsert_comments(
+        self,
+        *,
+        provider: str,
+        resource_id: str,
+        comments: list[dict[str, Any]],
+        refresh_fts: bool = True,
+    ) -> list[tuple[str, bool]]:
+        """Upsert one resource's comments in a single durable transaction."""
+        if not comments:
+            return []
+        if any(not str(comment.get("author") or "") for comment in comments):
+            raise ValueError("Comment author must not be empty.")
+
+        existing_rows = self.connection.execute(
+            """
+            SELECT c.comment_id, c.author, c.removed_at, cr.star_count, cr.content_hash
+            FROM comment AS c
+            LEFT JOIN comment_revision AS cr ON cr.comment_revision_id = c.current_revision_id
+            WHERE c.provider = ? AND c.resource_id = ?
+            """,
+            (provider, resource_id),
+        ).fetchall()
+        existing_by_author = {str(row["author"]): row for row in existing_rows}
+        results: list[tuple[str, bool] | None] = [None] * len(comments)
+        pending: list[tuple[int, str, str, str, int | None, str, str, sqlite3.Row | None]] = []
+
+        for index, comment in enumerate(comments):
+            author = str(comment.get("author") or "")
+            body = str(comment.get("body") or "")
+            tags = [str(tag) for tag in (comment.get("tags") or [])]
+            metadata = dict(comment.get("metadata") or {})
+            existing = existing_by_author.get(author)
+            star_count = comment.get("star_count")
+            if star_count is None and existing is not None and existing["star_count"] is not None:
+                star_count = int(existing["star_count"])
+            elif star_count is not None:
+                star_count = int(star_count)
+            tags_json = stable_json(tags)
+            metadata_json = stable_json(metadata)
+            content_hash = sha256_bytes(
+                stable_json(
+                    {
+                        "body": body,
+                        "tags": tags_json,
+                        "star_count": star_count,
+                        "metadata": metadata_json,
+                    }
+                ).encode("utf-8")
+            )
+            if (
+                existing is not None
+                and existing["removed_at"] is None
+                and existing["content_hash"] == content_hash
+            ):
+                results[index] = (str(existing["comment_id"]), False)
+                continue
+            pending.append(
+                (index, author, body, tags_json, star_count, metadata_json, content_hash, existing)
+            )
+
+        if not pending:
+            return [result for result in results if result is not None]
+
+        now = utc_now()
+        with self.transaction() as connection:
+            for index, author, body, tags_json, star_count, metadata_json, content_hash, existing in pending:
+                if existing is None:
+                    comment_id = uuid7()
+                    current_hash = None
+                    connection.execute(
+                        """
+                        INSERT INTO comment(comment_id, provider, resource_id, author, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (comment_id, provider, resource_id, author, now, now),
+                    )
+                else:
+                    comment_id = str(existing["comment_id"])
+                    current_hash = str(existing["content_hash"]) if existing["content_hash"] else None
+                    connection.execute(
+                        "UPDATE comment SET updated_at = ?, removed_at = NULL WHERE comment_id = ?",
+                        (now, comment_id),
+                    )
+                changed = current_hash != content_hash
+                if changed:
+                    revision_id = uuid7()
+                    connection.execute(
+                        """
+                        INSERT INTO comment_revision(comment_revision_id, comment_id, body, tags_json, star_count,
+                                                     metadata_json, content_hash, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (revision_id, comment_id, body, tags_json, star_count, metadata_json, content_hash, now),
+                    )
+                    connection.execute(
+                        "UPDATE comment SET current_revision_id = ? WHERE comment_id = ?",
+                        (revision_id, comment_id),
+                    )
+                if refresh_fts:
+                    try:
+                        connection.execute("DELETE FROM comment_fts WHERE comment_id = ?", (comment_id,))
+                        connection.execute(
+                            "INSERT INTO comment_fts(comment_id, body, tags) VALUES (?, ?, ?)",
+                            (comment_id, body, " ".join(json.loads(tags_json))),
+                        )
+                    except sqlite3.OperationalError:
+                        pass
+                results[index] = (comment_id, changed)
+        return [result for result in results if result is not None]
+
     def create_sync_run(self, providers: list[str], settings_fingerprint: str) -> str:
         run_id = uuid7()
         with self.transaction() as connection:
@@ -355,6 +466,20 @@ class VaultStore:
                 (run_id, stable_json(providers), settings_fingerprint, utc_now()),
             )
         return run_id
+
+    def fail_interrupted_sync_runs(self) -> int:
+        """Close runs left active by a terminated process before starting again."""
+        now = utc_now()
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE sync_run
+                SET status = 'failed', error = coalesce(error, 'interrupted before the next sync'), finished_at = ?
+                WHERE status = 'running'
+                """,
+                (now,),
+            )
+        return int(cursor.rowcount)
 
     def finish_sync_run(self, run_id: str, *, status: str, error: str | None = None) -> None:
         if status not in {"completed", "failed", "partial"}:

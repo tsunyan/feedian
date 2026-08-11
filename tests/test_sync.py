@@ -52,6 +52,28 @@ def test_sync_stores_provider_page_and_hatena_comments(monkeypatch, tmp_path) ->
         store.close()
 
 
+def test_sync_marks_a_previous_running_process_as_interrupted(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr("feedian.sync._provider_items", lambda *_args: iter(()))
+    config = VaultConfig(providers={"hatena": VaultConfig().providers["hatena"]})
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        interrupted_id = store.create_sync_run(["hatena"], "old")
+
+        report = sync_vault(store, config, source="hatena", fetch_comments=False)
+
+        interrupted = store.connection.execute(
+            "SELECT status, error, finished_at FROM sync_run WHERE sync_run_id = ?",
+            (interrupted_id,),
+        ).fetchone()
+        assert interrupted["status"] == "failed"
+        assert interrupted["error"] == "interrupted before the next sync"
+        assert interrupted["finished_at"]
+        assert report.run_id != interrupted_id
+        assert store.latest_sync_run()["status"] == "completed"
+    finally:
+        store.close()
+
+
 def test_sync_skips_recent_page_fetches(monkeypatch, tmp_path) -> None:
     item = CanonicalItem(source="hatena", source_id="hatena-1", content_key="url:one", url="https://example.test/a", title="A")
     monkeypatch.setattr("feedian.sync._provider_items", lambda *_args: iter([(item, b"{}")] ))

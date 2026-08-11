@@ -36,6 +36,7 @@ def sync_vault(
     force_fetch: bool = False,
     progress: Callable[[int, CanonicalItem], None] | None = None,
 ) -> SyncReport:
+    store.fail_interrupted_sync_runs()
     providers = _selected_providers(config, source)
     fingerprint = sha256_bytes(
         stable_json(
@@ -192,23 +193,26 @@ def _store_page(store: VaultStore, resource_id: str, page: PageFetchResult, conf
 
 
 def _store_hatena_discussion(store: VaultStore, resource_id: str, discussion: HatenaEntryDiscussion) -> None:
-    for comment in discussion.comments:
-        if not comment.user:
-            continue
-        store.upsert_comment(
-            provider="hatena",
-            resource_id=resource_id,
-            author=comment.user,
-            body=comment.comment,
-            tags=comment.tags,
-            metadata={
-                "timestamp": comment.timestamp,
-                "entry_url": discussion.entry_url,
-                "entry_id": discussion.entry_id,
-                "star_url": comment.star_url,
-                "bookmark_count": discussion.bookmark_count,
-            },
-        )
+    store.upsert_comments(
+        provider="hatena",
+        resource_id=resource_id,
+        comments=[
+            {
+                "author": comment.user,
+                "body": comment.comment,
+                "tags": comment.tags,
+                "metadata": {
+                    "timestamp": comment.timestamp,
+                    "entry_url": discussion.entry_url,
+                    "entry_id": discussion.entry_id,
+                    "star_url": comment.star_url,
+                    "bookmark_count": discussion.bookmark_count,
+                },
+            }
+            for comment in discussion.comments
+            if comment.user
+        ],
+    )
 
 
 def _store_hatena_comments_parallel(

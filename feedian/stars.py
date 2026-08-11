@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import Callable
 
@@ -35,18 +36,32 @@ def enrich_hatena_stars(
         batch = rows[offset : offset + 500]
         star_urls = [str(json.loads(str(row["metadata_json"])).get("star_url") or "") for row in batch]
         counts = fetch_hatena_star_counts(star_urls)
+        updates: dict[tuple[str, str], list[dict[str, object]]] = defaultdict(list)
         for row, star_url in zip(batch, star_urls):
             metadata = json.loads(str(row["metadata_json"]))
             if not star_url or star_url not in counts:
                 unavailable += 1
             else:
-                store.upsert_comment(
-                    provider=str(row["provider"]), resource_id=str(row["resource_id"]), author=str(row["author"]),
-                    body=str(row["body"]), tags=[str(tag) for tag in json.loads(str(row["tags_json"]))],
-                    star_count=counts[star_url], metadata=metadata,
+                key = (str(row["provider"]), str(row["resource_id"]))
+                updates[key].append(
+                    {
+                        "author": str(row["author"]),
+                        "body": str(row["body"]),
+                        "tags": [str(tag) for tag in json.loads(str(row["tags_json"]))],
+                        "star_count": counts[star_url],
+                        "metadata": metadata,
+                    }
                 )
                 updated += 1
             processed += 1
             if progress is not None:
                 progress(processed)
+        for (provider, resource_id), comments in updates.items():
+            # Star enrichment changes ranking metadata, not searchable text.
+            store.upsert_comments(
+                provider=provider,
+                resource_id=resource_id,
+                comments=comments,
+                refresh_fts=False,
+            )
     return StarEnrichmentReport(len(rows), updated, unavailable)

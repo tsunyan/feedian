@@ -147,6 +147,31 @@ def test_comment_refresh_preserves_an_existing_star_count(tmp_path) -> None:
         store.close()
 
 
+def test_store_upserts_a_resource_comment_batch_without_duplicate_revisions(tmp_path) -> None:
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        item = store.upsert_canonical_item(_item())
+        comments = [
+            {"author": "alice", "body": "first", "tags": ["one"], "star_count": 4},
+            {"author": "bob", "body": "second", "tags": ["two"]},
+        ]
+
+        first = store.upsert_comments(
+            provider="hatena", resource_id=item.resource_id or "", comments=comments
+        )
+        second = store.upsert_comments(
+            provider="hatena", resource_id=item.resource_id or "", comments=comments
+        )
+
+        assert [changed for _, changed in first] == [True, True]
+        assert [changed for _, changed in second] == [False, False]
+        assert store.connection.execute("SELECT COUNT(*) FROM comment").fetchone()[0] == 2
+        assert store.connection.execute("SELECT COUNT(*) FROM comment_revision").fetchone()[0] == 2
+        assert store.connection.execute("SELECT COUNT(*) FROM comment_fts").fetchone()[0] == 2
+    finally:
+        store.close()
+
+
 def test_store_imports_legacy_markdown_as_exact_bytes_once(tmp_path) -> None:
     raw = tmp_path / "raw" / "Hatena"
     raw.mkdir(parents=True)
