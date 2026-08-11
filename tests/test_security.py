@@ -1,6 +1,7 @@
 import socket
 import unittest
 from unittest.mock import Mock, patch
+from urllib.request import Request
 
 from feedian.extract import (
     MAX_HTML_BYTES,
@@ -76,6 +77,26 @@ class FetchSecurityTests(unittest.TestCase):
                 {},
                 "http://192.168.1.1/admin",
             )
+
+    @patch("feedian.extract.validate_fetch_url")
+    def test_permanent_redirect_preserves_get_and_validates_destination(self, validate_fetch_url) -> None:
+        handler = SafeRedirectHandler(allow_private_urls=False)
+        request = Request("https://example.com/old", method="GET")
+
+        redirected = handler.redirect_request(
+            request,
+            None,
+            308,
+            "Permanent Redirect",
+            {},
+            "/new",
+        )
+
+        validate_fetch_url.assert_called_once_with(
+            "https://example.com/new", allow_private_urls=False
+        )
+        self.assertEqual(redirected.full_url, "https://example.com/new")
+        self.assertEqual(redirected.get_method(), "GET")
 
 
 if __name__ == "__main__":

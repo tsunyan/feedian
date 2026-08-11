@@ -75,7 +75,15 @@ class SafeRedirectHandler(HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         destination = urljoin(req.full_url, newurl)
         validate_fetch_url(destination, allow_private_urls=self.allow_private_urls)
-        return super().redirect_request(req, fp, code, msg, headers, destination)
+        # Python 3.12's urllib follows 307 but does not recognize 308. Both
+        # preserve the request method, so treat 308 as 307 after validating
+        # the destination. Feedian only issues GET/HEAD content requests.
+        redirect_code = 307 if code == 308 else code
+        return super().redirect_request(req, fp, redirect_code, msg, headers, destination)
+
+    # urllib does not dispatch 308 responses to HTTPRedirectHandler on the
+    # supported Python version. Reuse its loop detection and Location parsing.
+    http_error_308 = HTTPRedirectHandler.http_error_302
 
 
 class TextExtractor(HTMLParser):
