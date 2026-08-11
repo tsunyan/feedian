@@ -14,6 +14,7 @@ from feedian.__main__ import (
     main,
     parse_args,
     process_bookmarks,
+    process_hatena_export,
     sync_raindrop_tags,
     sync_raindrop_summaries,
     usage_record_exists,
@@ -22,6 +23,7 @@ from feedian.__main__ import (
 from feedian.config import Config
 from feedian.estimate import MODEL_PRICES, PriceRefresh
 from feedian.extract import PageFetchResult
+from feedian.hatena import HatenaEntryDiscussion, HatenaPublicComment
 from feedian.recovery import PendingTransaction, load_pending, save_pending
 from feedian.progress import ProgressReporter
 
@@ -34,6 +36,12 @@ class MainTests(unittest.TestCase):
         )
         self.price_refresh.start()
         self.addCleanup(self.price_refresh.stop)
+        self.comments_fetch = patch(
+            "feedian.__main__.fetch_url_comments",
+            return_value=HatenaEntryDiscussion(),
+        )
+        self.comments_fetch.start()
+        self.addCleanup(self.comments_fetch.stop)
 
     def test_write_note_atomically_replaces_existing_note(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -249,6 +257,109 @@ class MainTests(unittest.TestCase):
         self.assertIn("process: collected=3 Δ+1", output.getvalue())
         save_count.assert_called_once_with("token", 0, True, 3)
 
+    def test_hatena_source_creates_canonical_markdown_without_llm(self) -> None:
+        atom = """<feed xmlns="http://www.w3.org/2005/Atom" xmlns:dc="http://purl.org/dc/elements/1.1/">
+<entry><title>Hatena item</title><link rel="related" href="https://example.com/hatena" />
+<summary>保存コメント</summary><dc:subject>python</dc:subject></entry></feed>"""
+        with TemporaryDirectory() as temp_dir:
+            export_path = Path(temp_dir) / "hatena.atom"
+            export_path.write_text(atom, encoding="utf-8")
+            config = Config(vault_path=temp_dir, sleep_seconds=0)
+            args = parse_args(
+                ["--source", "hatena", "--input", str(export_path), "--no-llm", "--skip-page-fetch"]
+            )
+            reporter = ProgressReporter("plain", stream=StringIO(), plain_interval_seconds=0)
+
+            with (
+                patch(
+                    "feedian.__main__.fetch_url_comments",
+                    return_value=HatenaEntryDiscussion(),
+                ),
+                reporter,
+            ):
+                result = process_hatena_export(config, args, reporter)
+
+            notes = list((Path(temp_dir) / "Hatena").glob("*.md"))
+            text = notes[0].read_text(encoding="utf-8")
+
+        self.assertEqual(result, 0)
+        self.assertEqual(len(notes), 1)
+        self.assertIn('source_type: "hatena"', text)
+        self.assertIn('content_key: "url:', text)
+        self.assertIn("### Comment (Original)\n\n保存コメント", text)
+        self.assertNotIn("## Summary", text)
+        self.assertNotIn("summary_generated_at:", text)
+
+    def test_raindrop_source_writes_linked_hatena_comments_note(self) -> None:
+        item = {
+            "_id": 123,
+            "title": "Raindrop item",
+            "link": "https://example.com/article",
+            "collection": {},
+        }
+        public = HatenaEntryDiscussion(
+            entry_url="https://b.hatena.ne.jp/entry/s/example.com/article",
+            bookmark_count=2,
+            comments=[HatenaPublicComment("alice", "Hatena voice")],
+        )
+        with TemporaryDirectory() as temp_dir:
+            config = Config(vault_path=temp_dir, sleep_seconds=0)
+            args = parse_args(["--no-llm", "--skip-page-fetch"])
+            with (
+                patch.dict(os.environ, {"RAINDROP_TOKEN": "token"}),
+                patch("feedian.__main__.RaindropClient.iter_raindrops", return_value=iter([item])),
+                patch("feedian.__main__.fetch_url_comments", return_value=public) as fetch_comments,
+            ):
+                result = process_bookmarks(config, args)
+
+            notes = sorted((Path(temp_dir) / "Raindrop").glob("*.md"))
+            main_note = next(path for path in notes if not path.name.endswith(".comments.md"))
+            comments_note = next(path for path in notes if path.name.endswith(".comments.md"))
+            main_text = main_note.read_text(encoding="utf-8")
+            comments_text = comments_note.read_text(encoding="utf-8")
+
+        self.assertEqual(result, 0)
+        fetch_comments.assert_called_once_with(config, item["link"], None)
+        self.assertIn(f"[[{comments_note.stem}]]", main_text)
+        self.assertIn(f"[[{main_note.stem}]]", comments_text)
+        self.assertIn('source_type: "raindrop"', comments_text)
+        self.assertIn("Hatena voice", comments_text)
+
+    def test_hatena_source_writes_linked_comments_note(self) -> None:
+        atom = """<feed xmlns="http://www.w3.org/2005/Atom"><entry><title>Hatena item</title>
+<link rel="related" href="https://example.com/hatena" /></entry></feed>"""
+        page = PageFetchResult(
+            url="https://example.com/hatena",
+            text="Main article",
+            discussion_text="Page reply",
+        )
+        public = HatenaEntryDiscussion(
+            bookmark_count=2,
+            comments=[HatenaPublicComment("alice", "Hatena voice")],
+        )
+        with TemporaryDirectory() as temp_dir:
+            export_path = Path(temp_dir) / "hatena.atom"
+            export_path.write_text(atom, encoding="utf-8")
+            config = Config(vault_path=temp_dir, sleep_seconds=0)
+            args = parse_args(["--source", "hatena", "--input", str(export_path), "--no-llm"])
+            with (
+                patch("feedian.__main__.fetch_page_text", return_value=page),
+                patch("feedian.__main__.fetch_url_comments", return_value=public),
+            ):
+                result = process_hatena_export(config, args)
+
+            notes = sorted((Path(temp_dir) / "Hatena").glob("*.md"))
+            main_note = next(path for path in notes if not path.name.endswith(".comments.md"))
+            comments_note = next(path for path in notes if path.name.endswith(".comments.md"))
+            main_text = main_note.read_text(encoding="utf-8")
+            comments_text = comments_note.read_text(encoding="utf-8")
+
+        self.assertEqual(result, 0)
+        self.assertIn(f"[[{comments_note.stem}]]", main_text)
+        self.assertIn(f"[[{main_note.stem}]]", comments_text)
+        self.assertIn("Page reply", comments_text)
+        self.assertIn("Hatena voice", comments_text)
+
     def test_existing_note_for_item_prefers_the_newest_llm_summary(self) -> None:
         with TemporaryDirectory() as temp_dir:
             path = Path(temp_dir)
@@ -333,7 +444,14 @@ class MainTests(unittest.TestCase):
             destination.mkdir()
             old_path = destination / "Original foreign title - 123.md"
             old_path.write_text(
-                '---\ntitle: "日本語のタイトル"\nsummary_model: "gpt-5.6-luna"\n---\n\nSummary',
+                '---\ntitle: "日本語のタイトル"\nsummary_model: "gpt-5.6-luna"\n---\n\n'
+                'Summary\n\n[[Original foreign title - 123.comments]]',
+                encoding="utf-8",
+            )
+            old_comments = destination / "Original foreign title - 123.comments.md"
+            old_comments.write_text(
+                '---\nparent: "[[Original foreign title - 123]]"\n---\n\n'
+                '[[Original foreign title - 123]]',
                 encoding="utf-8",
             )
             config = Config(vault_path=temp_dir, sleep_seconds=0)
@@ -346,8 +464,13 @@ class MainTests(unittest.TestCase):
                 result = process_bookmarks(config, args)
 
             new_path = destination / "日本語のタイトル - 123.md"
+            new_comments = destination / "日本語のタイトル - 123.comments.md"
             self.assertTrue(new_path.exists())
+            self.assertTrue(new_comments.exists())
             self.assertFalse(old_path.exists())
+            self.assertFalse(old_comments.exists())
+            self.assertIn(f"[[{new_comments.stem}]]", new_path.read_text(encoding="utf-8"))
+            self.assertIn(f"[[{new_path.stem}]]", new_comments.read_text(encoding="utf-8"))
             summarize.assert_not_called()
 
         self.assertEqual(result, 0)

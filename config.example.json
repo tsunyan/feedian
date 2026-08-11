@@ -1,6 +1,11 @@
 {
   "vault_path": "C:\\Users\\you\\Documents\\Obsidian\\Vault",
   "output_folder": "Raindrop",
+  "hatena_input": "",
+  "hatena_output_folder": "Hatena",
+  "hatena_base_tags": ["hatena", "bookmark"],
+  "hatena_request_interval_seconds": 0.3,
+  "hatena_fetch_public_comments": true,
   "collection_id": 0,
   "nested": true,
   "per_page": 50,

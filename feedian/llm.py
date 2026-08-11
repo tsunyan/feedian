@@ -60,8 +60,14 @@ def summarize_bookmark(
     reasoning_effort: str,
     max_retries: int,
     retry_base_seconds: float,
+    max_article_chars: int = 10000,
 ) -> dict[str, Any]:
-    prompt = build_prompt(item=item, page=page, language=language)
+    prompt = build_prompt(
+        item=item,
+        page=page,
+        language=language,
+        max_article_chars=max_article_chars,
+    )
     payload = {
         "model": model,
         "instructions": SUMMARY_INSTRUCTIONS,
@@ -120,18 +126,28 @@ def _read_response(request: Request, timeout_seconds: int) -> dict[str, Any]:
         return json.loads(response.read().decode("utf-8"))
 
 
-def build_prompt(item: dict[str, Any], page: PageFetchResult, language: str) -> str:
+def build_prompt(
+    item: dict[str, Any],
+    page: PageFetchResult,
+    language: str,
+    max_article_chars: int | None = None,
+) -> str:
     metadata = {
+        "source": item.get("_feedian_source") or "raindrop",
+        "source_id": item.get("_feedian_source_id") or item.get("_id"),
         "title": item.get("title"),
         "url": item.get("link"),
         "domain": item.get("domain"),
         "type": item.get("type"),
-        "raindrop_tags": item.get("tags") or [],
+        "source_tags": item.get("tags") or [],
         "excerpt": item.get("excerpt"),
-        "note": item.get("note"),
+        "comment": item.get("note"),
         "created": item.get("created"),
+        "private": item.get("private"),
     }
     content = page.text or item.get("excerpt") or ""
+    if max_article_chars is not None:
+        content = content[:max_article_chars]
     if page.error and not content:
         content = f"Page text unavailable. Fetch error: {page.error}"
     return (

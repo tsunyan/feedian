@@ -10,6 +10,11 @@ from typing import Any
 class Config:
     vault_path: str
     output_folder: str = "Raindrop"
+    hatena_input: str = ""
+    hatena_output_folder: str = "Hatena"
+    hatena_base_tags: list[str] | None = None
+    hatena_request_interval_seconds: float = 0.3
+    hatena_fetch_public_comments: bool = True
     collection_id: int = 0
     nested: bool = True
     per_page: int = 50
@@ -29,6 +34,8 @@ class Config:
     def __post_init__(self) -> None:
         if self.base_tags is None:
             self.base_tags = ["raindrop", "bookmark"]
+        if self.hatena_base_tags is None:
+            self.hatena_base_tags = ["hatena", "bookmark"]
         self.per_page = max(1, min(int(self.per_page), 50))
         self.max_article_chars = max(1000, int(self.max_article_chars))
         self.max_output_tokens = max(100, int(self.max_output_tokens))
@@ -39,9 +46,14 @@ class Config:
         self.request_timeout_seconds = max(1, int(self.request_timeout_seconds))
         self.sleep_seconds = max(0.0, float(self.sleep_seconds))
         self.sync_request_interval_seconds = max(0.0, float(self.sync_request_interval_seconds))
+        self.hatena_request_interval_seconds = max(0.0, float(self.hatena_request_interval_seconds))
 
     def model_copy(self) -> "Config":
-        return replace(self, base_tags=list(self.base_tags or []))
+        return replace(
+            self,
+            base_tags=list(self.base_tags or []),
+            hatena_base_tags=list(self.hatena_base_tags or []),
+        )
 
 
 def load_config(path: str | Path) -> Config:

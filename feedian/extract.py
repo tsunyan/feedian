@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 import ipaddress
 import re
 import socket
@@ -9,8 +10,18 @@ from html import unescape
 from html.parser import HTMLParser
 from typing import Iterable
 from urllib.error import HTTPError, URLError
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, urlunparse
 from urllib.request import HTTPSHandler, HTTPRedirectHandler, Request, build_opener
+
+from charset_normalizer import from_bytes
+from lxml import html as lxml_html
+from trafilatura import extract as extract_main_text
+from trafilatura import extract_metadata, html2txt
+from w3lib.encoding import html_to_unicode
+
+
+MAX_HTML_BYTES = 10 * 1024 * 1024
+MIN_HIGH_CONFIDENCE_CHARS = 200
 
 
 @dataclass
@@ -19,9 +30,22 @@ class PageFetchResult:
     text: str
     title: str = ""
     error: str | None = None
+    fetch_method: str = ""
+    extraction_method: str = ""
+    content_encoding: str = ""
+    content_truncated: bool = False
+    discussion_text: str = ""
 
 
 @dataclass
+class ExtractedPageParts:
+    text: str
+    title: str
+    method: str
+    discussion_text: str = ""
+
+
+@dataclass(eq=False)
 class TextCandidate:
     priority: int
     parts: list[str]
@@ -162,13 +186,17 @@ def fetch_page_text(
     max_chars: int,
     allow_private_urls: bool = False,
 ) -> PageFetchResult:
+    # max_chars remains in the public call signature for compatibility. Extracted
+    # text is stored in full; the limit is applied only when building an LLM prompt.
+    _ = max_chars
+    fetch_url = resolve_content_url(url)
     try:
-        validate_fetch_url(url, allow_private_urls=allow_private_urls)
+        validate_fetch_url(fetch_url, allow_private_urls=allow_private_urls)
     except ValueError as exc:
         return PageFetchResult(url=url, text="", error=f"blocked URL: {exc}")
 
     request = Request(
-        url,
+        fetch_url,
         headers={
             "User-Agent": "feedian/0.1 (+https://github.com/) Python urllib",
             "Accept": "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.1",
@@ -180,26 +208,368 @@ def fetch_page_text(
         opener = build_opener(HTTPSHandler(context=context), SafeRedirectHandler(allow_private_urls))
         with opener.open(request, timeout=timeout_seconds) as response:
             content_type = response.headers.get("Content-Type", "")
-            raw = response.read(max_chars * 4)
+            raw = response.read(MAX_HTML_BYTES + 1)
+            geturl = getattr(response, "geturl", None)
+            response_url = geturl() if callable(geturl) else None
+            final_url = response_url if isinstance(response_url, str) else fetch_url
     except HTTPError as exc:
+        if exc.code in {401, 403, 406}:
+            try:
+                return fetch_page_text_with_browser(
+                    original_url=url,
+                    fetch_url=fetch_url,
+                    timeout_seconds=timeout_seconds,
+                    allow_private_urls=allow_private_urls,
+                    initial_error=f"HTTP {exc.code}",
+                )
+            except Exception as browser_exc:
+                return PageFetchResult(
+                    url=url,
+                    text="",
+                    error=f"HTTP {exc.code}; browser fallback failed: {browser_exc}",
+                )
         return PageFetchResult(url=url, text="", error=f"HTTP {exc.code}")
     except URLError as exc:
         return PageFetchResult(url=url, text="", error=str(exc.reason))
     except Exception as exc:
         return PageFetchResult(url=url, text="", error=str(exc))
 
+    truncated = len(raw) > MAX_HTML_BYTES
+    raw = raw[:MAX_HTML_BYTES]
     if "text/html" not in content_type and "text/plain" not in content_type and "application/xhtml" not in content_type:
         return PageFetchResult(url=url, text="", error=f"unsupported content type: {content_type or 'unknown'}")
 
-    encoding = charset_from_content_type(content_type) or "utf-8"
-    decoded = raw.decode(encoding, errors="replace")
+    encoding, decoded = decode_html(raw, content_type)
     if "text/plain" in content_type:
-        return PageFetchResult(url=url, text=normalize_plain_text(decoded)[:max_chars], title="")
+        text = normalize_plain_text(decoded)
+        return PageFetchResult(
+            url=url,
+            text=text,
+            fetch_method="http",
+            extraction_method="plain-text",
+            content_encoding=encoding,
+            content_truncated=truncated,
+            error="HTML download truncated at 10 MiB" if truncated else None,
+        )
 
-    parser = TextExtractor()
-    parser.feed(decoded)
-    parser.close()
-    return PageFetchResult(url=url, text=parser.text[:max_chars], title=parser.title)
+    http_parts = extract_page_parts(decoded, final_url)
+    best_text = http_parts.text
+    best_title = http_parts.title
+    best_method = http_parts.method
+    best_discussion = http_parts.discussion_text
+    best_html = decoded
+    fetch_method = "http"
+    browser_error: str | None = None
+    if should_render_with_browser(http_parts.text, decoded, http_parts.title):
+        try:
+            rendered_html, rendered_url, rendered_title = render_html_with_browser(
+                fetch_url,
+                timeout_seconds=timeout_seconds,
+                allow_private_urls=allow_private_urls,
+            )
+            browser_parts = extract_page_parts(rendered_html, rendered_url)
+            if text_quality_score(browser_parts.text) > text_quality_score(best_text):
+                best_text = browser_parts.text
+                best_title = browser_parts.title or rendered_title
+                best_method = browser_parts.method
+                best_discussion = browser_parts.discussion_text
+                best_html = rendered_html
+                fetch_method = "browser"
+        except Exception as exc:
+            browser_error = str(exc)
+
+    if not best_text:
+        all_text = normalize_plain_text(html2txt(best_html) or "")
+        if text_quality_score(all_text) > text_quality_score(best_text):
+            best_text = all_text
+            best_method = "trafilatura-html2txt"
+
+    warning: str | None = None
+    if truncated:
+        warning = "HTML download truncated at 10 MiB"
+    if not best_text:
+        warning = "no extractable text found"
+        if browser_error:
+            warning += f"; browser fallback failed: {browser_error}"
+    elif not is_high_confidence_text(best_text):
+        warning = f"low-confidence extraction: {len(best_text)} characters"
+        if browser_error:
+            warning += f"; browser fallback failed: {browser_error}"
+
+    return PageFetchResult(
+        url=url,
+        text=best_text,
+        title=best_title,
+        error=warning,
+        fetch_method=fetch_method,
+        extraction_method=best_method,
+        content_encoding=encoding,
+        content_truncated=truncated,
+        discussion_text=best_discussion,
+    )
+
+
+def fetch_page_text_with_browser(
+    *,
+    original_url: str,
+    fetch_url: str,
+    timeout_seconds: int,
+    allow_private_urls: bool,
+    initial_error: str,
+) -> PageFetchResult:
+    rendered_html, rendered_url, rendered_title = render_html_with_browser(
+        fetch_url,
+        timeout_seconds=timeout_seconds,
+        allow_private_urls=allow_private_urls,
+    )
+    parts = extract_page_parts(rendered_html, rendered_url)
+    text, title, method = parts.text, parts.title, parts.method
+    if not text:
+        all_text = normalize_plain_text(html2txt(rendered_html) or "")
+        if text_quality_score(all_text) > text_quality_score(text):
+            text = all_text
+            method = "trafilatura-html2txt"
+    warning = None
+    if not text:
+        warning = f"{initial_error}; no extractable text found after browser fallback"
+    elif not is_high_confidence_text(text):
+        warning = f"{initial_error}; low-confidence browser extraction: {len(text)} characters"
+    return PageFetchResult(
+        url=original_url,
+        text=text,
+        title=title or rendered_title,
+        error=warning,
+        fetch_method="browser",
+        extraction_method=method,
+        content_encoding="browser",
+        discussion_text=parts.discussion_text,
+    )
+
+
+def decode_html(raw: bytes, content_type: str | None) -> tuple[str, str]:
+    return html_to_unicode(
+        content_type,
+        raw,
+        default_encoding="utf-8",
+        auto_detect_fun=_detect_encoding,
+    )
+
+
+def _detect_encoding(raw: bytes) -> str | None:
+    match = from_bytes(raw).best()
+    return match.encoding if match is not None else None
+
+
+def extract_html(html: str, url: str) -> tuple[str, str, str]:
+    parts = extract_page_parts(html, url)
+    return parts.text, parts.title, parts.method
+
+
+def extract_page_parts(html: str, url: str) -> ExtractedPageParts:
+    if (urlparse(url).hostname or "").lower() == "anond.hatelabo.jp":
+        specialized = extract_anond_parts(html, url)
+        if specialized.text:
+            return specialized
+    precision_text = extract_main_text(
+        html,
+        url=url,
+        output_format="markdown",
+        include_comments=False,
+        include_tables=True,
+        include_formatting=True,
+        include_links=True,
+        favor_precision=True,
+        deduplicate=False,
+    )
+    recall_text = extract_main_text(
+        html,
+        url=url,
+        output_format="markdown",
+        include_comments=False,
+        include_tables=True,
+        include_formatting=True,
+        include_links=True,
+        favor_recall=True,
+        deduplicate=False,
+    )
+    metadata = extract_metadata(html, default_url=url)
+    title = str(metadata.title or "").strip() if metadata is not None else ""
+    precision = clean_extracted_text(normalize_plain_text(precision_text or ""), url)
+    recall = clean_extracted_text(normalize_plain_text(recall_text or ""), url)
+    if should_use_recall_fallback(precision, recall):
+        return ExtractedPageParts(recall, title, "trafilatura-recall-fallback")
+    return ExtractedPageParts(precision, title, "trafilatura")
+
+
+def clean_extracted_text(text: str, url: str) -> str:
+    """Remove narrowly identified publisher boilerplate from extracted Markdown."""
+    text = re.sub(r"(?im)^[ \t]*Advertisement[ \t]*$", "", text)
+    hostname = (urlparse(url).hostname or "").lower()
+    if hostname == "47news.jp" or hostname.endswith(".47news.jp"):
+        text = re.sub(
+            r"(?ims)\n?^(?:#{1,6}[ \t]*)?ピックアップ求人情報[ \t]*$.*\Z",
+            "",
+            text,
+        )
+    return normalize_plain_text(text)
+
+
+def extract_anond_parts(html: str, url: str) -> ExtractedPageParts:
+    try:
+        document = lxml_html.fromstring(html)
+    except (TypeError, ValueError):
+        return ExtractedPageParts("", "", "trafilatura")
+    body_nodes = document.xpath(
+        "//div[contains(concat(' ', normalize-space(@class), ' '), ' day ')]"
+        "/div[contains(concat(' ', normalize-space(@class), ' '), ' body ')]"
+    )
+    discussion_nodes = document.xpath(
+        "//div[contains(concat(' ', normalize-space(@class), ' '), ' day ')]"
+        "/div[contains(concat(' ', normalize-space(@class), ' '), ' refererlist ')]"
+    )
+    if not body_nodes:
+        return ExtractedPageParts("", "", "trafilatura")
+    body = body_nodes[0]
+    for unwanted in body.xpath(
+        ".//script | .//style | .//*[contains(concat(' ', normalize-space(@class), ' '), ' ad-in-entry-block ')]"
+        " | .//*[contains(concat(' ', normalize-space(@class), ' '), ' sectionfooter ')]"
+        " | .//*[contains(concat(' ', normalize-space(@class), ' '), ' share-button ')]"
+    ):
+        unwanted.drop_tree()
+    text = normalize_plain_text(body.text_content())
+    discussion = ""
+    if discussion_nodes:
+        discussion_html = lxml_html.tostring(discussion_nodes[0], encoding="unicode")
+        discussion = normalize_plain_text(
+            extract_main_text(
+                discussion_html,
+                url=url,
+                output_format="markdown",
+                include_comments=True,
+                include_tables=True,
+                include_formatting=True,
+                include_links=True,
+                favor_recall=True,
+                deduplicate=False,
+            )
+            or discussion_nodes[0].text_content()
+        )
+    metadata = extract_metadata(html, default_url=url)
+    title = str(metadata.title or "").strip() if metadata is not None else ""
+    return ExtractedPageParts(text, title, "anond-dom", discussion)
+
+
+def should_render_with_browser(text: str, html: str, title: str = "") -> bool:
+    compact_length = len(re.sub(r"\s+", "", text))
+    if not text:
+        return True
+    if text.count("\ufffd") / max(1, len(text)) >= 0.001:
+        return True
+    normalized_title = re.sub(r"\s+", "", title)
+    normalized_text = re.sub(r"\s+", "", text)
+    if compact_length >= 40 and normalized_title and normalized_title in normalized_text:
+        return False
+    if compact_length < 80:
+        return True
+    if compact_length < MIN_HIGH_CONFIDENCE_CHARS and re.search(
+        r"<(?:div|main)[^>]+id=[\"'](?:app|root|__next|__nuxt)[\"']",
+        html,
+        re.IGNORECASE,
+    ):
+        return True
+    return False
+
+
+def should_use_recall_fallback(precision: str, recall: str) -> bool:
+    precision_length = len(re.sub(r"\s+", "", precision))
+    recall_length = len(re.sub(r"\s+", "", recall))
+    if not precision:
+        return bool(recall)
+    return precision_length < 120 and recall_length >= 500 and recall_length >= precision_length * 3
+
+
+def is_high_confidence_text(text: str) -> bool:
+    compact_length = len(re.sub(r"\s+", "", text))
+    if compact_length < MIN_HIGH_CONFIDENCE_CHARS:
+        return False
+    return text.count("\ufffd") / max(1, len(text)) < 0.001
+
+
+def text_quality_score(text: str) -> tuple[int, int, int]:
+    compact_length = len(re.sub(r"\s+", "", text))
+    replacement_count = text.count("\ufffd")
+    return (int(is_high_confidence_text(text)), -replacement_count, compact_length)
+
+
+def resolve_content_url(url: str) -> str:
+    parsed = urlparse(url)
+    if (parsed.hostname or "").lower() == "megalodon.jp" and not parsed.path.startswith("/ref/"):
+        return urlunparse(parsed._replace(path=f"/ref{parsed.path}"))
+    return url
+
+
+_browser_runtime = None
+_browser = None
+_validated_browser_hosts: set[tuple[str, bool]] = set()
+
+
+def render_html_with_browser(
+    url: str,
+    *,
+    timeout_seconds: int,
+    allow_private_urls: bool,
+) -> tuple[str, str, str]:
+    global _browser_runtime, _browser
+    if _browser is None:
+        from playwright.sync_api import sync_playwright
+
+        _browser_runtime = sync_playwright().start()
+        _browser = _browser_runtime.chromium.launch(headless=True)
+    page = _browser.new_page(locale="ja-JP")
+
+    def route_request(route) -> None:
+        request = route.request
+        if request.resource_type in {"image", "media", "font", "stylesheet"}:
+            route.abort()
+            return
+        parsed = urlparse(request.url)
+        if parsed.scheme in {"data", "blob", "about"}:
+            route.continue_()
+            return
+        host_key = (f"{parsed.scheme}://{parsed.hostname}:{parsed.port or ''}", allow_private_urls)
+        try:
+            if host_key not in _validated_browser_hosts:
+                validate_fetch_url(request.url, allow_private_urls=allow_private_urls)
+                _validated_browser_hosts.add(host_key)
+        except ValueError:
+            route.abort()
+            return
+        route.continue_()
+
+    page.route("**/*", route_request)
+    try:
+        response = page.goto(url, wait_until="domcontentloaded", timeout=timeout_seconds * 1000)
+        if response is not None and response.status >= 400:
+            raise RuntimeError(f"browser HTTP {response.status}")
+        page.wait_for_timeout(1500)
+        final_url = page.url
+        validate_fetch_url(final_url, allow_private_urls=allow_private_urls)
+        return page.content(), final_url, page.title()
+    finally:
+        page.close()
+
+
+def close_browser() -> None:
+    global _browser_runtime, _browser
+    if _browser is not None:
+        _browser.close()
+        _browser = None
+    if _browser_runtime is not None:
+        _browser_runtime.stop()
+        _browser_runtime = None
+
+
+atexit.register(close_browser)
 
 
 def validate_fetch_url(url: str, allow_private_urls: bool = False) -> None:

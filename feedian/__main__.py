@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, TypeVar
 
+from .canonical import canonical_item_from_metadata
 from .config import Config, load_config
 from .estimate import (
     ModelPrice,
@@ -26,7 +27,22 @@ from .estimate import (
 )
 from .extract import PageFetchResult, fetch_page_text
 from .llm import SUMMARY_INSTRUCTIONS, USAGE_FIELD, build_prompt, summarize_bookmark
-from .markdown import normalize_tag, note_filename, render_note, upsert_raindrop_summary
+from .hatena import (
+    HatenaEntryDiscussion,
+    fetch_hatena_bookmarks,
+    fetch_hatena_entry_discussion,
+    load_hatena_export,
+)
+from .markdown import (
+    canonical_note_filename,
+    comments_note_filename,
+    normalize_tag,
+    note_filename,
+    render_canonical_note,
+    render_comments_note,
+    render_note,
+    upsert_raindrop_summary,
+)
 from .progress import PROGRESS_MODES, ProgressReporter
 from .raindrop import RaindropClient
 from .recovery import PendingTransaction, load_pending, remove_pending, save_pending
@@ -38,11 +54,37 @@ PENDING_STATE_ROOT = Path.home() / ".feedian" / "pending"
 T = TypeVar("T")
 
 
+def fetch_url_comments(
+    config: Config,
+    url: str,
+    reporter: ProgressReporter | None = None,
+) -> HatenaEntryDiscussion:
+    if not config.hatena_fetch_public_comments or not url:
+        return HatenaEntryDiscussion()
+    try:
+        return fetch_hatena_entry_discussion(
+            url,
+            timeout_seconds=config.request_timeout_seconds,
+            max_retries=config.max_retries,
+            retry_base_seconds=config.retry_base_seconds,
+        )
+    except Exception as exc:
+        report(reporter, f"  Hatena comments warning: {exc}", verbose=True)
+        return HatenaEntryDiscussion()
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="feedian",
-        description="Export Raindrop.io bookmarks as summarized Obsidian Markdown notes.",
+        description="Export bookmarks and feeds as summarized Obsidian Markdown notes.",
     )
+    parser.add_argument(
+        "--source",
+        choices=("raindrop", "hatena"),
+        default="raindrop",
+        help="Source adapter to run (default: raindrop).",
+    )
+    parser.add_argument("--input", dest="source_input", help="Input file or URL for file/feed sources.")
     parser.add_argument("--config", default="config.json", help="Path to config JSON.")
     parser.add_argument("--vault", help="Override Obsidian vault path.")
     parser.add_argument("--folder", help="Override output folder inside the vault.")
@@ -51,7 +93,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Preview Raindrop items without fetching pages, calling OpenAI, or writing files.",
+        help="Preview source items without fetching pages, calling OpenAI, or writing files.",
     )
     parser.add_argument("--force", action="store_true", help="Overwrite existing notes.")
     parser.add_argument(
@@ -67,7 +109,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--skip-page-fetch",
         action="store_true",
-        help="Use only Raindrop metadata and excerpt.",
+        help="Use only source metadata, comments, and excerpts.",
     )
     parser.add_argument(
         "--no-llm",
@@ -110,7 +152,10 @@ def apply_overrides(config: Config, args: argparse.Namespace) -> Config:
     if args.vault:
         values.vault_path = args.vault
     if args.folder:
-        values.output_folder = args.folder
+        if args.source == "hatena":
+            values.hatena_output_folder = args.folder
+        else:
+            values.output_folder = args.folder
     if args.collection is not None:
         values.collection_id = args.collection
     return values
@@ -147,6 +192,7 @@ def configure_console_output() -> None:
 def fallback_summary(item: dict[str, Any], page: PageFetchResult) -> dict[str, Any]:
     tags = item.get("tags") or []
     excerpt = (item.get("excerpt") or "").strip()
+    note = (item.get("note") or "").strip()
     text = page.text.strip() or excerpt
     first_paragraph = ""
     for part in text.split("\n"):
@@ -156,7 +202,7 @@ def fallback_summary(item: dict[str, Any], page: PageFetchResult) -> dict[str, A
             break
     return {
         "note_title": item.get("title") or item.get("link") or "Untitled bookmark",
-        "summary": excerpt or first_paragraph or "Summary unavailable.",
+        "summary": excerpt or note or first_paragraph or "Summary unavailable.",
         "key_points": [],
         "tags": tags[:8],
         "content_type": item.get("type") or "link",
@@ -198,6 +244,11 @@ def collection_parent_id(item: dict[str, Any]) -> int:
 def output_dir(config: Config) -> Path:
     vault = Path(config.vault_path).expanduser()
     return vault / config.output_folder
+
+
+def source_output_dir(config: Config, source: str) -> Path:
+    vault = Path(config.vault_path).expanduser()
+    return vault / (config.hatena_output_folder if source == "hatena" else config.output_folder)
 
 
 def existing_note_for_item(destination: Path, item: dict[str, Any]) -> Path | None:
@@ -313,7 +364,24 @@ def rename_existing_note(note_path: Path, destination: Path, item: dict[str, Any
         return note_path
     if target.exists():
         raise FileExistsError(f"rename target already exists: {target}")
-    note_path.replace(target)
+    old_comments = destination / comments_note_filename(note_path.name)
+    if not old_comments.exists():
+        note_path.replace(target)
+        return target
+
+    target_comments = destination / comments_note_filename(target.name)
+    if target_comments.exists():
+        raise FileExistsError(f"comments rename target already exists: {target_comments}")
+    try:
+        comments_text = old_comments.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise RuntimeError(f"could not read comments note for rename: {old_comments}") from exc
+    updated_note = text.replace(f"[[{old_comments.stem}]]", f"[[{target_comments.stem}]]")
+    updated_comments = comments_text.replace(f"[[{note_path.stem}]]", f"[[{target.stem}]]")
+    write_note_atomically(target_comments, updated_comments)
+    write_note_atomically(target, updated_note)
+    old_comments.unlink()
+    note_path.unlink()
     return target
 
 
@@ -340,11 +408,14 @@ def build_usage_record(
     price_source: str,
     transaction_id: str | None = None,
 ) -> dict[str, Any]:
-    return {
+    source = str(item.get("_feedian_source") or "raindrop")
+    source_id = item.get("_feedian_source_id") or item.get("_id")
+    record = {
         "recorded_at": datetime.now(timezone.utc).isoformat(),
         "transaction_id": transaction_id or str(uuid.uuid4()),
         "operation": "summarize",
-        "raindrop_id": item.get("_id"),
+        "source": source,
+        "source_id": source_id,
         "model": model,
         "reasoning_effort": reasoning_effort,
         "max_output_tokens": max_output_tokens,
@@ -360,6 +431,9 @@ def build_usage_record(
         "output_per_million_usd": price.output_per_million if price else None,
         "estimated_cost_usd": usage_cost_usd(usage, price) if price else None,
     }
+    if source == "raindrop":
+        record["raindrop_id"] = item.get("_id")
+    return record
 
 
 def append_usage_record(destination: Path, record: dict[str, Any]) -> None:
@@ -577,6 +651,12 @@ def process_bookmarks(
             if page.error:
                 report(reporter, f"  page fetch warning: {page.error}", verbose=True)
 
+        public_comments = (
+            fetch_url_comments(config, str(item.get("link") or ""), reporter)
+            if not args.dry_run
+            else HatenaEntryDiscussion()
+        )
+
         if args.no_llm or args.dry_run:
             summary = fallback_summary(item, page)
         else:
@@ -598,6 +678,7 @@ def process_bookmarks(
                     reasoning_effort=config.openai_reasoning_effort,
                     max_retries=config.max_retries,
                     retry_base_seconds=config.retry_base_seconds,
+                    max_article_chars=config.max_article_chars,
                 )
             except Exception as exc:
                 report(reporter, f"  summary warning: {exc}")
@@ -619,6 +700,11 @@ def process_bookmarks(
                 rename_source = existing
         report(reporter, f"  note: {target}", verbose=True)
 
+        canonical = canonical_item_from_metadata(item)
+        has_comments = bool(page.discussion_text.strip() or public_comments.comments)
+        comments_target = destination / comments_note_filename(target.name)
+        comments_stem = comments_target.stem if has_comments else None
+
         markdown = render_note(
             item=item,
             page=page,
@@ -626,6 +712,18 @@ def process_bookmarks(
             base_tags=config.base_tags,
             generated_at=now,
             model=None if args.no_llm else model,
+            comments_note=comments_stem,
+        )
+        comments_markdown = (
+            render_comments_note(
+                canonical,
+                page,
+                public_comments,
+                main_note=target.name,
+                generated_at=now,
+            )
+            if has_comments
+            else None
         )
         usage_record: dict[str, Any] | None = None
         if isinstance(usage, dict):
@@ -654,6 +752,8 @@ def process_bookmarks(
             report(reporter, f"  dry-run: would write {len(markdown)} characters", verbose=True)
         else:
             try:
+                if comments_markdown is not None:
+                    write_note_atomically(comments_target, comments_markdown)
                 write_note_atomically(target, markdown)
             except Exception as exc:
                 report(reporter, f"  write warning: {exc}")
@@ -661,7 +761,10 @@ def process_bookmarks(
                 break
             if rename_source is not None:
                 try:
+                    old_comments = destination / comments_note_filename(rename_source.name)
                     rename_source.unlink()
+                    if old_comments != comments_target and old_comments.exists():
+                        old_comments.unlink()
                     renamed += 1
                 except OSError as exc:
                     report(reporter, f"  rename warning: could not remove old note: {exc}")
@@ -701,6 +804,236 @@ def _format_count_delta(current: int, previous: int | None) -> str:
         return ""
     delta = current - previous
     return " Δ±0" if delta == 0 else f" Δ{delta:+d}"
+
+
+def process_hatena_export(
+    config: Config,
+    args: argparse.Namespace,
+    reporter: ProgressReporter | None = None,
+) -> int:
+    started_at = time.perf_counter()
+    location = (args.source_input or config.hatena_input).strip()
+    hatena_id = ""
+    hatena_api_key = ""
+    if not location:
+        hatena_id = require_env("HATENA_ID")
+        hatena_api_key = require_env("HATENA_API_KEY")
+    openai_key = "" if args.no_llm or args.dry_run else require_env("OPENAI_API_KEY")
+    model = os.environ.get("OPENAI_MODEL", config.openai_model)
+    usage_price: ModelPrice | None = None
+    usage_price_source = "unavailable"
+    if not args.no_llm and not args.dry_run:
+        report(reporter, "usage: phase=refreshing-model-prices")
+        price_refresh = refresh_model_prices(
+            model,
+            timeout_seconds=min(config.request_timeout_seconds, 10),
+            include_recommended=False,
+        )
+        pricing_model = comparison_model(model)
+        usage_price = next((price for price in price_refresh.prices if price.model == pricing_model), None)
+        usage_price_source = "fallback" if pricing_model in price_refresh.fallback_models else price_refresh.source
+        report(reporter, f"usage: price_source={usage_price_source}")
+        if price_refresh.warning:
+            report(reporter, f"usage: price_refresh_warning={price_refresh.warning}")
+
+    destination = source_output_dir(config, "hatena")
+    if not args.dry_run:
+        destination.mkdir(parents=True, exist_ok=True)
+        if not args.no_llm:
+            recover_pending_transaction(destination)
+    if args.dry_run:
+        report(reporter, "dry-run: page fetching and OpenAI calls are disabled")
+
+    if location:
+        if reporter is not None:
+            reporter.start_task("process: loading Hatena export", total=1)
+        canonical_items = load_hatena_export(
+            location,
+            timeout_seconds=config.request_timeout_seconds,
+            allow_private_urls=config.allow_private_urls,
+        )
+        if args.limit is not None:
+            canonical_items = canonical_items[: max(0, args.limit)]
+        if reporter is not None:
+            reporter.advance()
+    else:
+        if reporter is not None:
+            reporter.start_task("process: exporting Hatena bookmarks")
+        reported_count = 0
+
+        def on_page(collected: int, total: int) -> None:
+            nonlocal reported_count
+            if reporter is not None:
+                if total > 0:
+                    reporter.set_total(total)
+                reporter.advance(max(0, collected - reported_count))
+            reported_count = collected
+
+        canonical_items = fetch_hatena_bookmarks(
+            hatena_id,
+            hatena_api_key,
+            limit=args.limit,
+            timeout_seconds=config.request_timeout_seconds,
+            max_retries=config.max_retries,
+            retry_base_seconds=config.retry_base_seconds,
+            request_interval_seconds=config.hatena_request_interval_seconds,
+            on_page=on_page,
+        )
+    if reporter is not None:
+        reporter.start_task("process: generating Obsidian notes", total=len(canonical_items))
+
+    processed = created = renamed = skipped = failed = 0
+    now = datetime.now(timezone.utc).isoformat()
+    for canonical in canonical_items:
+        processed += 1
+        if reporter is not None:
+            reporter.advance()
+        item = canonical.as_bookmark_metadata()
+        existing_matches = sorted(destination.glob(f"* - {canonical.source_id}.md"))
+        existing = preferred_note_path(existing_matches) if existing_matches else None
+        target = existing or (destination / canonical_note_filename(canonical))
+        if existing is not None and not args.force:
+            if should_upgrade_note(existing, args):
+                report(reporter, f"upgrade no-llm note: {existing}", verbose=True)
+            else:
+                report(reporter, f"skip existing: {existing}", verbose=True)
+                skipped += 1
+                continue
+
+        report(reporter, f"process: {canonical.title or canonical.url}", verbose=True)
+        page = PageFetchResult(url=canonical.url, text="", title="", error=None)
+        if not args.dry_run and not args.skip_page_fetch and canonical.url:
+            page = fetch_page_text(
+                canonical.url,
+                timeout_seconds=config.request_timeout_seconds,
+                max_chars=config.max_article_chars,
+                allow_private_urls=config.allow_private_urls,
+            )
+            if page.error:
+                report(reporter, f"  page fetch warning: {page.error}", verbose=True)
+
+        public_discussion = HatenaEntryDiscussion()
+        if not args.dry_run:
+            public_discussion = fetch_url_comments(config, canonical.url, reporter)
+
+        if args.no_llm or args.dry_run:
+            summary = fallback_summary(item, page)
+        else:
+            try:
+                ensure_usage_log_readable(destination)
+                summary = summarize_bookmark(
+                    api_key=openai_key,
+                    model=model,
+                    item=item,
+                    page=page,
+                    language=config.language,
+                    timeout_seconds=config.request_timeout_seconds,
+                    max_output_tokens=config.max_output_tokens,
+                    reasoning_effort=config.openai_reasoning_effort,
+                    max_retries=config.max_retries,
+                    retry_base_seconds=config.retry_base_seconds,
+                    max_article_chars=config.max_article_chars,
+                )
+            except Exception as exc:
+                report(reporter, f"  summary warning: {exc}")
+                failed += 1
+                continue
+        usage = summary.pop(USAGE_FIELD, None)
+
+        rename_source: Path | None = None
+        desired = destination / canonical_note_filename(canonical, title=str(summary.get("note_title") or ""))
+        if existing is None:
+            target = desired
+        elif args.rename_existing and desired != existing:
+            if desired.exists():
+                report(reporter, f"  rename warning: rename target already exists: {desired}")
+                failed += 1
+                continue
+            target = desired
+            rename_source = existing
+
+        has_discussion = bool(page.discussion_text.strip() or public_discussion.comments)
+        comments_target = destination / comments_note_filename(target.name)
+        comments_stem = comments_target.stem if has_discussion else None
+        markdown = render_canonical_note(
+            item=canonical,
+            page=page,
+            summary=summary,
+            base_tags=config.hatena_base_tags,
+            generated_at=now,
+            model=None if args.no_llm else model,
+            comments_note=comments_stem,
+        )
+        comments_markdown = (
+            render_comments_note(
+                canonical,
+                page,
+                public_discussion,
+                main_note=target.name,
+                generated_at=now,
+            )
+            if has_discussion
+            else None
+        )
+        usage_record: dict[str, Any] | None = None
+        if isinstance(usage, dict):
+            usage_record = build_usage_record(
+                item=item,
+                model=model,
+                reasoning_effort=config.openai_reasoning_effort,
+                max_output_tokens=config.max_output_tokens,
+                usage=usage,
+                price=usage_price,
+                price_source=usage_price_source,
+            )
+            try:
+                save_pending(
+                    destination,
+                    PendingTransaction(
+                        transaction_id=str(usage_record["transaction_id"]),
+                        target=target,
+                        markdown=markdown,
+                        usage_record=usage_record,
+                    ),
+                    state_root=PENDING_STATE_ROOT,
+                )
+            except OSError as exc:
+                report(reporter, f"  pending recovery warning: {exc}")
+                failed += 1
+                break
+
+        if args.dry_run:
+            report(reporter, f"  dry-run: would write {len(markdown)} characters", verbose=True)
+            continue
+        try:
+            if comments_markdown is not None:
+                write_note_atomically(comments_target, comments_markdown)
+            write_note_atomically(target, markdown)
+            if rename_source is not None:
+                old_comments = destination / comments_note_filename(rename_source.name)
+                rename_source.unlink()
+                if old_comments != comments_target and old_comments.exists():
+                    old_comments.unlink()
+                renamed += 1
+            created += 1
+            if usage_record is not None:
+                append_usage_record(destination, usage_record)
+                remove_pending(destination, state_root=PENDING_STATE_ROOT)
+        except OSError as exc:
+            report(reporter, f"  write warning: {exc}")
+            failed += 1
+            break
+        item_interval = max(config.sleep_seconds, config.hatena_request_interval_seconds)
+        if item_interval > 0:
+            time.sleep(item_interval)
+
+    elapsed_seconds = time.perf_counter() - started_at
+    report(
+        reporter,
+        f"done: source=hatena processed={processed} created={created} renamed={renamed} "
+        f"skipped={skipped} failed={failed} elapsed={elapsed_seconds:.1f}s",
+    )
+    return 1 if failed else 0
 
 
 def sync_raindrop_summaries(
@@ -1020,7 +1353,12 @@ def estimate_bookmarks(
                 failures[page.error] += 1
             if config.sleep_seconds > 0:
                 time.sleep(config.sleep_seconds)
-        prompt = build_prompt(item=item, page=page, language=config.language)
+        prompt = build_prompt(
+            item=item,
+            page=page,
+            language=config.language,
+            max_article_chars=config.max_article_chars,
+        )
         token_count, fallback = count_prompt_tokens(f"{SUMMARY_INSTRUCTIONS}\n\n{prompt}", model)
         token_counts.append(token_count)
         if fallback:
@@ -1147,7 +1485,12 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError("Choose either --sync-raindrop-summary or --sync-raindrop-tags.")
         if args.estimate and (args.dry_run or args.list_collections or sync_actions):
             raise ValueError("--estimate cannot be combined with --dry-run, --list-collections, or sync options.")
+        if args.source == "hatena" and (args.estimate or args.list_collections or sync_actions or args.collection is not None):
+            raise ValueError("Hatena source does not support Raindrop collection, estimate, list, or sync options.")
         reporter = ProgressReporter(args.progress, verbose=args.verbose)
+        if args.source == "hatena":
+            with reporter:
+                return process_hatena_export(config, args, reporter)
         if args.list_collections:
             raindrop_token = require_env("RAINDROP_TOKEN")
             client = RaindropClient(

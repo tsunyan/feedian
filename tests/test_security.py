@@ -2,7 +2,13 @@ import socket
 import unittest
 from unittest.mock import Mock, patch
 
-from feedian.extract import SafeRedirectHandler, fetch_page_text, validate_fetch_url
+from feedian.extract import (
+    MAX_HTML_BYTES,
+    ExtractedPageParts,
+    SafeRedirectHandler,
+    fetch_page_text,
+    validate_fetch_url,
+)
 
 
 class FetchSecurityTests(unittest.TestCase):
@@ -17,18 +23,36 @@ class FetchSecurityTests(unittest.TestCase):
 
         self.assertIn("only http and https", result.error or "")
 
+    @patch(
+        "feedian.extract.render_html_with_browser",
+        return_value=(
+            "<article>" + ("Public content with enough article detail. " * 20) + "</article>",
+            "https://example.com/article",
+            "Public page",
+        ),
+    )
+    @patch(
+        "feedian.extract.extract_page_parts",
+        return_value=ExtractedPageParts("Public content " * 30, "", "trafilatura"),
+    )
     @patch("feedian.extract.build_opener")
     @patch("feedian.extract.socket.getaddrinfo")
-    def test_public_url_is_fetched_through_safe_opener(self, getaddrinfo, build_opener) -> None:
+    def test_public_url_is_fetched_through_safe_opener(
+        self, getaddrinfo, build_opener, extract_html, render_browser
+    ) -> None:
         getaddrinfo.return_value = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))]
         response = Mock()
         response.headers.get.return_value = "text/html; charset=utf-8"
-        response.read.return_value = b"<article><p>Public content</p></article>"
+        response.read.return_value = (
+            b"<article><p>Public content with enough article detail for reliable extraction. " * 10
+            + b"</p></article>"
+        )
         build_opener.return_value.open.return_value.__enter__.return_value = response
 
         result = fetch_page_text("https://example.com/article", timeout_seconds=1, max_chars=1000)
 
-        self.assertEqual(result.text, "Public content")
+        self.assertIn("Public content", result.text)
+        response.read.assert_called_once_with(MAX_HTML_BYTES + 1)
         build_opener.return_value.open.assert_called_once()
 
     @patch("feedian.extract.socket.getaddrinfo")

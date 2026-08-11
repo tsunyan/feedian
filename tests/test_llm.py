@@ -76,6 +76,14 @@ class LlmTests(unittest.TestCase):
     def test_summary_instructions_exclude_source_platform_tags(self) -> None:
         self.assertIn("Do not use source or platform names as tags", SUMMARY_INSTRUCTIONS)
 
+    def test_prompt_limits_only_llm_page_text(self) -> None:
+        page = PageFetchResult(url="https://example.com", text="abcdefghij")
+
+        prompt = build_prompt({}, page, "ja", max_article_chars=4)
+
+        self.assertIn("abcd\n</untrusted_page_text>", prompt)
+        self.assertEqual(page.text, "abcdefghij")
+
 
 if __name__ == "__main__":
     unittest.main()

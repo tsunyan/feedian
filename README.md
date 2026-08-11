@@ -1,24 +1,25 @@
 # Feedian
 
 ![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)
-![Dependencies](https://img.shields.io/badge/dependencies-tiktoken-4C8CBF)
+![Dependencies](https://img.shields.io/badge/dependencies-see%20requirements.txt-4C8CBF)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
 
-Raindrop.io bookmarks to Obsidian Markdown notes.
+Bookmarks and feeds to Obsidian Markdown notes.
 
-`Feedian` (Raindrop -> Obsidian) reads bookmarks from the Raindrop.io REST API, fetches each linked page, optionally asks the OpenAI Responses API for a Japanese summary and tags, and writes one `.md` file per bookmark into a local Obsidian vault.
+Feedian reads items through source adapters, converts them to a canonical item, optionally asks the OpenAI Responses API for a Japanese summary and tags, and writes one `.md` file per item into a local Obsidian vault. Raindrop.io and Hatena Bookmark exports are currently supported.
 
 ## Requirements
 
 - Python 3.11+
-- A Raindrop.io access token
+- A Raindrop.io access token when using the Raindrop adapter
 - An OpenAI API key for AI summaries and tags (optional with `--no-llm`, `--dry-run`, or `--estimate`)
 - A local Obsidian vault folder
 
-Install the required tokenizer:
+Install the Python dependencies and the lightweight headless Chromium runtime:
 
 ```powershell
 python -m pip install -r requirements.txt
+python -m playwright install chromium --only-shell
 ```
 
 For personal use, Raindrop.io lets you copy a test token from your application settings in the App Management Console. Use that value as `RAINDROP_TOKEN`.
@@ -60,6 +61,54 @@ Create notes:
 python -m feedian --config config.json --limit 10
 ```
 
+## Hatena Bookmark
+
+Get your Hatena API key as follows:
+
+1. Sign in to Hatena and open the [posting email address settings](https://www.hatena.ne.jp/my/config/mail/upload).
+2. Find the API key shown on that page. If the posting address is displayed in a form such as `API_KEY.HATENA_ID@...`, use only the `API_KEY` part. Hatena's [official WSSE authentication documentation](https://developer.hatena.ne.jp/ja/documents/auth/apis/wsse/) also describes where to find it.
+3. Set your Hatena ID and API key in `.env`:
+
+```dotenv
+HATENA_ID=your-hatena-id
+HATENA_API_KEY=your-hatena-api-key
+```
+
+The API key is not your Hatena account password. Do not paste it into issues or chat, and do not commit `.env`; this repository's `.gitignore` excludes it.
+
+Then export all indexed bookmarks, including private bookmarks, and create notes:
+
+```powershell
+python -m feedian --config config.json --source hatena --dry-run
+python -m feedian --config config.json --source hatena --no-llm
+python -m feedian --config config.json --source hatena
+```
+
+Both normal mode and `--no-llm` fetch each bookmarked URL and store the full extracted page text under `Extracted Content (Original)`. `--no-llm` omits AI summaries, key points, and AI-generated tags; normal mode adds them to the same note. Use `--skip-page-fetch` only when you want Hatena metadata without the linked-page content. HTML downloads have a 10 MiB safety limit. `max_article_chars` limits only the text sent to OpenAI, not the text stored in Markdown. The same extraction pipeline is used by the Raindrop adapter.
+
+For a staged quality check, increase `--limit` without `--force`. Existing notes are skipped, so each run adds only the newly included bookmarks:
+
+```powershell
+feedian --source hatena --no-llm --limit 100
+feedian --source hatena --no-llm --limit 500
+feedian --source hatena --no-llm --limit 1000
+```
+
+Feedian decodes HTML with HTTP and HTML charset declarations plus statistical detection, extracts the main article with Trafilatura, and uses headless Chromium when the first result is empty, corrupted, or appears to be a JavaScript shell. Notes record `fetch_method`, `extraction_method`, `content_encoding`, and `content_chars` in frontmatter for review.
+
+For every source item with a URL, Feedian also reads public bookmark comments from Hatena's official entry-information API. Page-level replies (currently separated explicitly for Hatena Anonymous Diary) and public Hatena comments are written to a sibling `*.comments.md` note linked from the main note. Comment and reply text is preserved but is not sent to the summary LLM. Set `hatena_fetch_public_comments` to `false` to disable the extra API request per item.
+
+Feedian uses Hatena's authenticated My Bookmark Full-text Search API. Because that API requires a search query, Feedian searches the `https` and `http` URL schemes separately, requests up to 100 results per page, and removes duplicate URLs. It then converts every result to a canonical item before writing it to `hatena_output_folder` (default: `Hatena`). Hatena notes preserve comments, tags encoded at the start of comments, snippets, timestamps, and private flags. The search index is asynchronous, so a newly added bookmark may not appear immediately. Use Hatena's manual export when you need an authoritative full backup rather than an indexed export.
+
+For a manual backup or migration, [Hatena also officially supports](https://b.hatena.ne.jp/help/entry/port) exporting bookmark HTML, Atom, and RSS 1.0. Pass a downloaded export with `--input`:
+
+```powershell
+python -m feedian --config config.json --source hatena --input "C:\Users\you\Downloads\hatena-bookmarks.atom" --dry-run
+python -m feedian --config config.json --source hatena --input "C:\Users\you\Downloads\hatena-bookmarks.atom"
+```
+
+The `--input` adapter also accepts an HTTP(S) RSS/Atom URL. Private bookmarks are included only when the selected file or URL contains them.
+
 ## Config
 
 See `config.example.json`.
@@ -68,6 +117,11 @@ Important fields:
 
 - `vault_path`: Absolute path to your Obsidian vault.
 - `output_folder`: Folder inside the vault where notes are written.
+- `hatena_input`: Optional default path or URL for a Hatena Atom, RSS 1.0, or bookmark HTML export.
+- `hatena_output_folder`: Folder inside the vault for Hatena notes (default: `Hatena`).
+- `hatena_base_tags`: Tags added to every Hatena note.
+- `hatena_request_interval_seconds`: Minimum delay between authenticated Hatena export requests (default: `0.3`).
+- `hatena_fetch_public_comments`: Fetch public Hatena comments for URLs from every source and write a linked comments note (default: `true`).
 - `collection_id`: Raindrop collection ID. Use `0` for all bookmarks.
 - `nested`: Include nested collections when reading a collection.
 - `base_tags`: Tags added to every generated note.
@@ -136,7 +190,7 @@ The command reports its current phase while it runs: official price refresh, boo
 - New LLM-generated filenames use the Japanese note title and include the Raindrop item ID to avoid collisions. Use `--rename-existing` to rename existing LLM notes from their stored note titles and to rename `--no-llm` notes when they are upgraded.
 - Notes preserve the original Raindrop title and excerpt, and store the cleaned linked-page text as `Extracted Content (Original)`. Existing notes are not backfilled automatically.
 - If a web page cannot be fetched, the tool still uses Raindrop metadata such as title and excerpt.
-- HTML extraction prioritizes `article` and `main`, then article-like `class` / `id` values. Navigation, headers, footers, sidebars, ads, related links, comments, and cookie banners are excluded when identifiable from HTML structure or attributes.
+- HTML decoding uses w3lib and charset-normalizer. Main-content extraction uses Trafilatura in precision-oriented mode, with a Playwright headless-browser fallback for empty, corrupted, or JavaScript-shell static HTML. A short static article whose title and body were extracted is not replaced merely because the rendered page is longer; this avoids preferring ad-heavy browser output.
 - Page fetching accepts only `http` and `https` URLs and rejects local/private network addresses by default, including after redirects. Set `allow_private_urls` only for a trusted internal bookmark collection.
 - Linked-page text and bookmark metadata are treated as untrusted reference data when sent to the LLM; instructions in them are not followed.
 - Raindrop and OpenAI requests retry transient 408, 409, 425, 429, 5xx, and network failures with bounded exponential backoff.

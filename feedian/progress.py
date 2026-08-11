@@ -133,6 +133,21 @@ class ProgressReporter:
             self._write(self._plain_text(self._plain_task))
             self._plain_task.last_reported_at = now
 
+    def set_total(self, total: int, *, estimated_total: bool = False) -> None:
+        if self.mode == "off":
+            return
+        if self.mode == "rich":
+            if self._progress is not None and self._rich_task_id is not None:
+                self._progress.update(
+                    self._rich_task_id,
+                    total=total,
+                    estimated_total=estimated_total,
+                )
+            return
+        if self._plain_task is not None:
+            self._plain_task.total = total
+            self._plain_task.estimated_total = estimated_total
+
     def log(self, message: str) -> None:
         if self.mode == "off":
             return
