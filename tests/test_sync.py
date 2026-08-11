@@ -91,3 +91,31 @@ def test_sync_reports_each_processed_item(monkeypatch, tmp_path) -> None:
         assert seen == [(1, "0"), (2, "1")]
     finally:
         store.close()
+
+
+def test_sync_fetches_comments_concurrently_and_stores_results(monkeypatch, tmp_path) -> None:
+    items = [
+        CanonicalItem(source="hatena", source_id=str(index), content_key=f"url:{index}", url=f"https://example.test/{index}")
+        for index in range(3)
+    ]
+    monkeypatch.setattr("feedian.sync._provider_items", lambda *_args: iter((item, b"{}") for item in items))
+    monkeypatch.setattr(
+        "feedian.sync.fetch_hatena_entry_discussion",
+        lambda url: HatenaEntryDiscussion(
+            entry_url=url,
+            entry_id=url.rsplit("/", 1)[-1],
+            comments=[HatenaPublicComment(user="alice-" + url[-1], comment="voice", timestamp="2026/08/12 00:00")],
+        ),
+    )
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        report = sync_vault(
+            store,
+            VaultConfig(providers={"hatena": VaultConfig().providers["hatena"]}),
+            source="hatena",
+            fetch_pages=False,
+        )
+        assert report.failed == 0
+        assert store.status_counts()["comment"] == 3
+    finally:
+        store.close()

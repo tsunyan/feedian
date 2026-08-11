@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Callable, Iterable
 
@@ -50,6 +51,7 @@ def sync_vault(
     )
     run_id = store.create_sync_run(providers, fingerprint)
     processed = changed = failed = fetched = 0
+    comment_targets: list[tuple[str, str, str]] = []
     try:
         for provider in providers:
             for item, raw_payload in _provider_items(config, provider, limit):
@@ -68,7 +70,7 @@ def sync_vault(
                         _store_page(store, stored.resource_id, page, config)
                         fetched += 1
                     if stored.resource_id and fetch_comments and item.url:
-                        _store_hatena_comments(store, stored.resource_id, item.url)
+                        comment_targets.append((stored.source_item_id, stored.resource_id, item.url))
                     store.record_sync_item(run_id, stored.source_item_id, "completed")
                     changed += int(stored.changed)
                 except Exception as exc:
@@ -77,6 +79,12 @@ def sync_vault(
                 finally:
                     if progress is not None:
                         progress(processed, item)
+        failed += _store_hatena_comments_parallel(
+            store,
+            run_id,
+            comment_targets,
+            workers=int(config.fetch.get("comment_workers", 8)),
+        )
         store.finish_sync_run(run_id, status="partial" if failed else "completed")
     except Exception as exc:
         store.finish_sync_run(run_id, status="failed", error=str(exc))
@@ -161,12 +169,15 @@ def _store_page(store: VaultStore, resource_id: str, page: PageFetchResult, conf
     if not html:
         return
     max_bytes = int(config.fetch.get("document_max_bytes", 100 * 1024 * 1024))
-    for image in extract_content_images(html, page.final_url or page.url):
-        downloaded = fetch_image(
-            image.url,
-            max_bytes=max_bytes,
-            allow_private_urls=bool(config.fetch.get("allow_private_hosts")),
-        )
+    images = extract_content_images(html, page.final_url or page.url)
+    worker_count = max(1, min(len(images) or 1, int(config.fetch.get("asset_workers", 6))))
+
+    def download_image(image):
+        return image, fetch_image(image.url, max_bytes=max_bytes, allow_private_urls=False)
+
+    with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="feedian-assets") as executor:
+        downloaded_images = list(executor.map(download_image, images))
+    for image, downloaded in downloaded_images:
         if downloaded.body is None:
             continue
         store.put_asset(
@@ -180,8 +191,7 @@ def _store_page(store: VaultStore, resource_id: str, page: PageFetchResult, conf
         )
 
 
-def _store_hatena_comments(store: VaultStore, resource_id: str, url: str) -> None:
-    discussion = fetch_hatena_entry_discussion(url)
+def _store_hatena_discussion(store: VaultStore, resource_id: str, discussion: HatenaEntryDiscussion) -> None:
     for comment in discussion.comments:
         if not comment.user:
             continue
@@ -199,6 +209,36 @@ def _store_hatena_comments(store: VaultStore, resource_id: str, url: str) -> Non
                 "bookmark_count": discussion.bookmark_count,
             },
         )
+
+
+def _store_hatena_comments_parallel(
+    store: VaultStore,
+    run_id: str,
+    targets: list[tuple[str, str, str]],
+    *,
+    workers: int,
+) -> int:
+    if not targets:
+        return 0
+
+    def fetch_target(target: tuple[str, str, str]):
+        source_item_id, resource_id, url = target
+        try:
+            return source_item_id, resource_id, fetch_hatena_entry_discussion(url), None
+        except Exception as exc:
+            return source_item_id, resource_id, None, exc
+
+    failures = 0
+    worker_count = max(1, min(len(targets), workers))
+    with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="feedian-comments") as executor:
+        results = executor.map(fetch_target, targets)
+        for source_item_id, resource_id, discussion, error in results:
+            if error is not None or discussion is None:
+                failures += 1
+                store.record_sync_item(run_id, source_item_id, "failed", str(error))
+                continue
+            _store_hatena_discussion(store, resource_id, discussion)
+    return failures
 
 
 def _required_env(name: str) -> str:

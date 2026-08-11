@@ -123,6 +123,30 @@ def test_store_versions_comments_only_when_comment_content_changes(tmp_path) -> 
         store.close()
 
 
+def test_comment_refresh_preserves_an_existing_star_count(tmp_path) -> None:
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        item = store.upsert_canonical_item(_item())
+        store.upsert_comment(
+            provider="hatena", resource_id=item.resource_id or "", author="alice", body="first", star_count=9,
+            metadata={"timestamp": "one"},
+        )
+        store.upsert_comment(
+            provider="hatena", resource_id=item.resource_id or "", author="alice", body="first", star_count=None,
+            metadata={"timestamp": "two"},
+        )
+        current = store.connection.execute(
+            """
+            SELECT cr.star_count FROM comment AS c
+            JOIN comment_revision AS cr ON cr.comment_revision_id = c.current_revision_id
+            WHERE c.author = 'alice'
+            """
+        ).fetchone()[0]
+        assert current == 9
+    finally:
+        store.close()
+
+
 def test_store_imports_legacy_markdown_as_exact_bytes_once(tmp_path) -> None:
     raw = tmp_path / "raw" / "Hatena"
     raw.mkdir(parents=True)

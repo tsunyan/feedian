@@ -38,6 +38,8 @@ class VaultConfig:
             "html_max_bytes": 10 * 1024 * 1024,
             "document_max_bytes": 100 * 1024 * 1024,
             "refresh_days": 30,
+            "asset_workers": 6,
+            "comment_workers": 8,
             "allow_private_hosts": [],
         }
     )

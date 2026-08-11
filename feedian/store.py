@@ -285,11 +285,25 @@ class VaultStore:
     ) -> tuple[str, bool]:
         if not author:
             raise ValueError("Comment author must not be empty.")
+        existing = self.connection.execute(
+            """
+            SELECT c.comment_id, c.removed_at, cr.star_count, cr.content_hash
+            FROM comment AS c
+            LEFT JOIN comment_revision AS cr ON cr.comment_revision_id = c.current_revision_id
+            WHERE c.provider = ? AND c.resource_id = ? AND c.author = ?
+            """,
+            (provider, resource_id, author),
+        ).fetchone()
+        if star_count is None:
+            if existing is not None and existing["star_count"] is not None:
+                star_count = int(existing["star_count"])
         tags_json = stable_json(tags or [])
         metadata_json = stable_json(metadata or {})
         content_hash = sha256_bytes(
             stable_json({"body": body, "tags": tags_json, "star_count": star_count, "metadata": metadata_json}).encode("utf-8")
         )
+        if existing is not None and existing["removed_at"] is None and existing["content_hash"] == content_hash:
+            return str(existing["comment_id"]), False
         now = utc_now()
         with self.transaction() as connection:
             row = connection.execute(
