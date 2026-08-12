@@ -4,317 +4,528 @@
 ![Dependencies](https://img.shields.io/badge/dependencies-see%20requirements.txt-4C8CBF)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
 
-Bookmarks and feeds to Obsidian Markdown notes.
+Feedian collects bookmarks and feeds into a per-Obsidian-vault SQLite archive, renders the collected material as `raw/` Markdown, and optionally uses OpenAI to create summarized and tagged `source/` notes.
 
-Feedian reads items through source adapters, converts them to a canonical item, optionally asks the OpenAI Responses API for a Japanese summary and tags, and writes one `.md` file per item into a local Obsidian vault. Raindrop.io and Hatena Bookmark exports are currently supported.
+Supported providers are Raindrop.io, Hatena Bookmark, and RSS/Atom. Public Hatena comments can be attached to URLs collected from **any** provider.
 
-## Vault workflow (new)
+## How it works
 
-The current workflow treats the per-vault SQLite database as the canonical local archive. `raw/` and `source/` are generated Obsidian views. The database keeps the latest source metadata, extracted content, retained non-HTML source bytes such as PDFs, public Hatena comments, image URLs, and operational audit records. HTML is processed in memory and discarded after extraction; page image bytes are not downloaded. Rendered Markdown uses external Obsidian image embeds such as `![alt](<https://example/image.jpg>)`.
-
-Content tables retain only the latest state. Revision-shaped tables remain so history can be added later, but current updates overwrite their one live row. Sync logs, LLM/API usage, and snapshot verification records remain as operational history. Full-text search is rebuilt into `.feedian/cache/search.sqlite3`; this disposable cache is ignored by Git and excluded from snapshots.
-
-This is designed for a **private archive repository** separate from the Feedian application repository. Do not use `snapshot` with a public repository: Feedian checks that the GitHub repository is private and refuses otherwise.
-
-Initialize an existing vault once. This does not read or rewrite existing `raw/` files.
-
-```powershell
-feedian init --vault "D:\GitHub\@" --set-default
-feedian migrate --vault "D:\GitHub\@"
+```text
+Raindrop / Hatena / RSS
+          |
+          v
+  feedian sync          no LLM
+          |
+          v
+.feedian/feedian.sqlite3   canonical local archive
+       |             |
+       v             v
+feedian render    feedian ingest
+       |             |       OpenAI is used here only
+       v             v
+     raw/          source/
 ```
 
-When an existing schema needs conversion, `migrate` first creates a SQLite-consistent temporary backup, removes old content revisions, stored HTML, downloaded image BLOBs, the obsolete legacy Markdown copy, orphan payloads, and the old in-database FTS index. It also normalizes Hatena comment metadata and retains only the top 20 comments per resource. It then compacts the database and rebuilds the separate search cache. The temporary backup is deleted only after integrity checks succeed.
+- `.feedian/feedian.sqlite3` is the canonical local archive.
+- `raw/` and `source/` are generated Obsidian views.
+- `sync`, `render`, `run`, comment retrieval, star enrichment, search, and snapshots do not call an LLM.
+- `ingest` is the step that asks the LLM for a title, summary, key points, content type, and one to six tags.
+- Extracted HTML text is retained, but the original HTML is discarded. Non-HTML response bytes such as PDFs are retained for later re-extraction. Page image URLs are stored; image bytes are not downloaded.
 
-Then collect source data without using an LLM and inspect the generated staging view:
+## Quick start
 
-```powershell
-feedian sync --vault "D:\GitHub\@" --source hatena
-feedian render --vault "D:\GitHub\@"
-# inspect .feedian\staging\raw before ever using --apply
-```
-
-`render --apply` writes to `raw/`, but protects any file that is not an unchanged Feedian-generated document. This deliberately prevents an existing legacy or hand-edited note from being overwritten.
-
-Create LLM-derived `source/` notes only after raw collection is satisfactory:
+### 1. Install
 
 ```powershell
-$env:OPENAI_API_KEY = "your-openai-api-key"
-feedian ingest --vault "D:\GitHub\@" --model gpt-5.6-terra
+git clone https://github.com/tsunyan/feedian.git
+cd feedian
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m playwright install chromium --only-shell
 ```
 
-The non-LLM weekly pipeline is separate:
+Examples below use `feedian`. From PowerShell in the repository, use `.\feedian.bat` if the repository is not on `PATH`.
 
-```powershell
-feedian run --vault "D:\GitHub\@"
-feedian schedule install --vault "D:\GitHub\@"
-```
+### 2. Set credentials
 
-`run` performs due provider syncs → raw rendering → a due weekly snapshot; it does not call OpenAI. The default intervals are six hours for RSS and one week for Raindrop/Hatena and snapshots. `schedule install` creates a six-hourly task plus a logon catch-up task. Failed scheduled runs retry every 30 minutes, up to six attempts. Configure the schedule with `feedian schedule install --help`.
-
-Public Hatena comments are stored separately from article content. Before downloading comments, Feedian requests bookmark counts in batches with Hatena's [official count API](https://developer.hatena.ne.jp/ja/documents/bookmark/apis/getcount/). It fetches the full comments only for a new resource or when that count changes, retrieves their star totals, and retains the top 20 by star count with older comments winning ties. Every refresh replaces the previous selection, including deleting comments that fall outside the new top 20. Use `sync --force-comments` for an explicit full refresh. There is deliberately no age-based periodic comment refresh.
-
-Feedian derives each comment's public Hatena Star URI when needed rather than storing it, retrieves star totals in batches with Hatena's [official Star API](https://developer.hatena.ne.jp/ja/documents/star/apis/entry/), and sorts rendered comment notes by star count. Star checks have their own 30-day default interval and keep only the latest total. This enrichment is non-LLM and can also be run independently:
-
-```powershell
-feedian enrich-stars --vault "D:\GitHub\@"
-feedian enrich-stars --vault "D:\GitHub\@" --force
-```
-
-The local search cache can be inspected or rebuilt independently:
-
-```powershell
-feedian search status --vault "D:\GitHub\@"
-feedian search rebuild --vault "D:\GitHub\@"
-```
-
-Retained non-HTML response bytes can be processed again without downloading the source. For example, re-extract all stored PDFs after upgrading pypdf. HTML must be fetched again because only its extracted text is retained:
-
-```powershell
-feedian reextract --vault "D:\GitHub\@" --media-type application/pdf
-```
-
-For snapshots install [GitHub CLI](https://cli.github.com/) and [7-Zip](https://www.7-zip.org/), authenticate `gh`, and make sure the vault has a private GitHub `origin`. Feedian creates an SQLite-consistent backup, archives it, uploads it to a tag-linked Release, downloads it again, and verifies SHA-256, archive integrity, and SQLite integrity before removing its temporary local archive. `config.json` and `.feedian/snapshot.json` are intended for Git; `.feedian/feedian.sqlite3`, its WAL files, `.feedian/cache/`, logs, staging, and temporary archives are ignored.
-
-## Requirements
-
-- Python 3.11+
-- A Raindrop.io access token when using the Raindrop adapter
-- An OpenAI API key for AI summaries and tags (optional with `--no-llm`, `--dry-run`, or `--estimate`)
-- A local Obsidian vault folder
-
-Install the Python dependencies and the lightweight headless Chromium runtime:
-
-```powershell
-python -m pip install -r requirements.txt
-python -m playwright install chromium --only-shell
-```
-
-For personal use, Raindrop.io lets you copy a test token from your application settings in the App Management Console. Use that value as `RAINDROP_TOKEN`.
-
-## Setup
-
-Copy the example config and edit the vault path:
-
-```powershell
-Copy-Item config.example.json config.json
-notepad config.json
-```
-
-Set the Raindrop token in your shell:
-
-```powershell
-$env:RAINDROP_TOKEN = "your-raindrop-token"
-```
-
-For AI summaries and tags, also set an OpenAI API key:
-
-```powershell
-$env:OPENAI_API_KEY = "your-openai-api-key"
-```
-
-Or copy `.env.example` to `.env` and edit it. Omit `OPENAI_API_KEY` when using `--no-llm`, `--dry-run`, or `--estimate`. `.env` is ignored by Git.
-
-Run a dry run first:
-
-```powershell
-python -m feedian --config config.json --limit 3 --dry-run
-```
-
-Dry runs query Raindrop to list the target bookmarks, but do not fetch linked pages, call OpenAI, or write files. An OpenAI API key is not required for a dry run.
-
-Create notes:
-
-```powershell
-python -m feedian --config config.json --limit 10
-```
-
-## Hatena Bookmark
-
-Get your Hatena API key as follows:
-
-1. Sign in to Hatena and open the [posting email address settings](https://www.hatena.ne.jp/my/config/mail/upload).
-2. Find the API key shown on that page. If the posting address is displayed in a form such as `API_KEY.HATENA_ID@...`, use only the `API_KEY` part. Hatena's [official WSSE authentication documentation](https://developer.hatena.ne.jp/ja/documents/auth/apis/wsse/) also describes where to find it.
-3. Set your Hatena ID and API key in `.env`:
+Copy `.env.example` to `.env`, then fill in only the providers you enable:
 
 ```dotenv
+RAINDROP_TOKEN=your-raindrop-token
 HATENA_ID=your-hatena-id
 HATENA_API_KEY=your-hatena-api-key
+OPENAI_API_KEY=your-openai-api-key
+OPENAI_MODEL=gpt-5.6-luna
 ```
 
-The API key is not your Hatena account password. Do not paste it into issues or chat, and do not commit `.env`; this repository's `.gitignore` excludes it.
+`OPENAI_API_KEY` is needed only when `ingest` must make a new API call. `OPENAI_MODEL` is optional and selects its default model. RSS needs no credential. Do not commit `.env`.
 
-Then export all indexed bookmarks, including private bookmarks, and create notes:
+For Hatena, the API key is the key shown in the [posting email address settings](https://www.hatena.ne.jp/my/config/mail/upload), not the account password. If the address is shown as `API_KEY.HATENA_ID@...`, use the `API_KEY` part.
+
+### 3. Initialize a Vault
 
 ```powershell
-python -m feedian --config config.json --source hatena --dry-run
-python -m feedian --config config.json --source hatena --no-llm
-python -m feedian --config config.json --source hatena
+feedian init --vault "D:\GitHub\MyVault" --set-default
+feedian migrate
 ```
 
-Both normal mode and `--no-llm` fetch each bookmarked URL and store the full extracted page text under `Extracted Content (Original)`. `--no-llm` omits AI summaries, key points, and AI-generated tags; normal mode adds them to the same note. Use `--skip-page-fetch` only when you want Hatena metadata without the linked-page content. HTML downloads have a 10 MiB safety limit. `max_article_chars` limits only the text sent to OpenAI, not the text stored in Markdown. The same extraction pipeline is used by the Raindrop adapter.
+`--set-default` lets later commands omit `--vault`. Edit `D:\GitHub\MyVault\.feedian\config.json` to disable unused providers or add RSS feeds before the first sync.
 
-For a staged quality check, increase `--limit` without `--force`. Existing notes are skipped, so each run adds only the newly included bookmarks:
+### 4. Collect and inspect raw material
 
 ```powershell
-feedian --source hatena --no-llm --limit 100
-feedian --source hatena --no-llm --limit 500
-feedian --source hatena --no-llm --limit 1000
+# A small first pass; this writes only the SQLite archive.
+feedian sync --source all --limit 20
+
+# Render into .feedian/staging/raw for inspection.
+feedian render
+
+# After inspection, publish the generated raw view into raw/.
+feedian render --apply
 ```
 
-Feedian decodes HTML with HTTP and HTML charset declarations plus statistical detection, extracts the main article with Trafilatura, and uses headless Chromium when the first result is empty, corrupted, or appears to be a JavaScript shell. Notes record `fetch_method`, `extraction_method`, `content_encoding`, and `content_chars` in frontmatter for review.
+`render --apply` protects files that are not unchanged Feedian-generated documents. It reports a conflict rather than overwriting a legacy or hand-edited note.
 
-For every source item with a URL, Feedian also reads public bookmark comments from Hatena's official entry-information API. Page-level replies (currently separated explicitly for Hatena Anonymous Diary) and public Hatena comments are written to a sibling `*.comments.md` note linked from the main note. Comment and reply text is preserved but is not sent to the summary LLM. Set `hatena_fetch_public_comments` to `false` to disable the extra API request per item.
-
-Feedian uses Hatena's authenticated My Bookmark Full-text Search API. Because that API requires a search query, Feedian searches the `https` and `http` URL schemes separately, requests up to 100 results per page, and removes duplicate URLs. It then converts every result to a canonical item before writing it to `hatena_output_folder` (default: `Hatena`). Hatena notes preserve comments, tags encoded at the start of comments, snippets, timestamps, and private flags. The search index is asynchronous, so a newly added bookmark may not appear immediately. Use Hatena's manual export when you need an authoritative full backup rather than an indexed export.
-
-For a manual backup or migration, [Hatena also officially supports](https://b.hatena.ne.jp/help/entry/port) exporting bookmark HTML, Atom, and RSS 1.0. Pass a downloaded export with `--input`:
+### 5. Preview and run LLM ingest
 
 ```powershell
-python -m feedian --config config.json --source hatena --input "C:\Users\you\Downloads\hatena-bookmarks.atom" --dry-run
-python -m feedian --config config.json --source hatena --input "C:\Users\you\Downloads\hatena-bookmarks.atom"
+# No API calls and no writes.
+feedian ingest --auto --dry-run --limit 20
+
+# Create representative source notes.
+feedian ingest --auto --limit 20
 ```
 
-The `--input` adapter also accepts an HTTP(S) RSS/Atom URL. Private bookmarks are included only when the selected file or URL contains them.
+The dry run shows the selected resources, locally counted input tokens, a maximum estimate, and—after at least one matching completed run—an expected estimate based on actual output/input usage for that model.
 
-## Config
+During a real run, the progress display shows cumulative input tokens, output tokens, and estimated USD cost. Each successful item is recorded immediately, so stopping and rerunning continues by reusing completed results instead of making duplicate API calls. Do not use `--force` when resuming.
 
-See `config.example.json`.
+## Vault and configuration selection
 
-Important fields:
+Modern commands use the Vault-local `.feedian/config.json`. Feedian chooses the Vault in this order:
 
-- `vault_path`: Absolute path to your Obsidian vault.
-- `output_folder`: Folder inside the vault where notes are written.
-- `hatena_input`: Optional default path or URL for a Hatena Atom, RSS 1.0, or bookmark HTML export.
-- `hatena_output_folder`: Folder inside the vault for Hatena notes (default: `Hatena`).
-- `hatena_base_tags`: Tags added to every Hatena note.
-- `hatena_request_interval_seconds`: Minimum delay between authenticated Hatena export requests (default: `0.3`).
-- `hatena_fetch_public_comments`: Fetch public Hatena comments for URLs from every source and write a linked comments note (default: `true`).
-- `collection_id`: Raindrop collection ID. Use `0` for all bookmarks.
-- `nested`: Include nested collections when reading a collection.
-- `base_tags`: Tags added to every generated note.
-- `openai_model`: Model used when AI summaries are enabled. Override with `OPENAI_MODEL` if your account uses a different model.
-- `max_article_chars`: Maximum linked-page text sent to OpenAI (default: `10000`).
-- `max_output_tokens`: Hard upper bound for visible output and reasoning tokens per OpenAI request (default: `800`).
-- `openai_reasoning_effort`: Reasoning effort for supported OpenAI models (default: `none`). Use `low` only when testing shows it improves note quality.
-- `allow_private_urls`: Allow page fetches to private or local network addresses (default: `false`).
-- `max_retries`: Maximum retries after a transient Raindrop or OpenAI API failure (default: `3`).
-- `retry_base_seconds`: Initial retry delay; delays double on each retry (default: `1.0`).
-- `sync_request_interval_seconds`: Minimum interval between Raindrop HTTP requests during note or tag sync only (default: `0.5`).
+1. `--vault PATH`
+2. The current directory or its nearest parent containing `.feedian/config.json`
+3. The user default set by `init --set-default` or `config set-default-vault`
 
-## OpenAI API Cost Estimate
+There are two different config formats in this repository:
 
-`--no-llm` does not call the OpenAI API, so it does not incur OpenAI API charges.
+- `<vault>/.feedian/config.json`: current SQLite/Vault workflow; used by all modern commands documented below.
+- Repository-root `config.json`: legacy direct-export workflow only; it is **not** read by `feedian ingest`.
 
-The following rough estimate uses standard, uncached text pricing as of 2026-08-09 and assumes:
+For modern `ingest`, the model is selected in this order:
 
-- 449 bookmarks
-- About 2,000-10,000 input tokens per bookmark (up to 10,000 fetched page characters plus metadata)
-- At most 800 output tokens per bookmark, including reasoning tokens
-- One Responses API request per bookmark
-- No Batch API, prompt caching, or regional-processing surcharge
+1. `--model MODEL`
+2. `OPENAI_MODEL` from the environment or `.env`
+3. Built-in default `gpt-5.6-terra`
 
-| Model | Input / output per 1M tokens | Estimated total for 449 bookmarks |
-| --- | ---: | ---: |
-| [GPT-5.6 Sol](https://developers.openai.com/api/docs/models/gpt-5.6-sol) | $5.00 / $30.00 | $15.27-$33.23 |
-| [GPT-5.6 Terra](https://developers.openai.com/api/docs/models/gpt-5.6-terra) | $2.00 / $12.00 | $6.11-$13.29 |
-| [GPT-5.6 Luna](https://developers.openai.com/api/docs/models/gpt-5.6-luna) | $0.20 / $1.20 | $0.61-$1.33 |
-| [GPT-5.5](https://developers.openai.com/api/docs/models/gpt-5.5) | $5.00 / $30.00 | $15.27-$33.23 |
+The active model is shown in the ingest preview and execution header.
 
-Costs scale approximately linearly with the bookmark count. For `N` bookmarks, multiply the 449-bookmark estimate by `N / 449`.
+### Vault config fields
 
-The estimate is intentionally broad. `max_article_chars` limits fetched page text by characters, not API tokens. `max_output_tokens` is a hard ceiling for visible output and reasoning tokens, but actual input length still varies with page language and metadata. Check the linked official OpenAI documentation before a large run because model pricing can change.
+`feedian init` creates this structure:
 
-## Sampled Cost Estimate
-
-Use `--estimate` to calculate a project-specific estimate without calling an OpenAI model API or writing notes. It needs `RAINDROP_TOKEN`, fetches a representative sample of linked pages, builds the same prompts used for normal processing, and counts their input tokens locally with `tiktoken`. It also reads the public OpenAI model documentation to refresh prices; this does not require `OPENAI_API_KEY` or incur model API charges.
-
-```powershell
-python -m feedian --config config.json --estimate
+```json
+{
+  "format_version": 1,
+  "raw_folder": "raw",
+  "source_folder": "source",
+  "review_folder": "review",
+  "providers": {
+    "raindrop": {
+      "folder": "Raindrop",
+      "enabled": true,
+      "poll_hours": 168
+    },
+    "hatena": {
+      "folder": "Hatena",
+      "enabled": true,
+      "poll_hours": 168
+    },
+    "rss": {
+      "folder": "RSS",
+      "enabled": false,
+      "poll_hours": 6,
+      "layout": "feed/year/month",
+      "feeds": [
+        "https://example.com/feed.xml",
+        {
+          "url": "https://example.net/atom.xml",
+          "name": "Example Tech",
+          "folder": "Example Tech",
+          "tags": ["technology"],
+          "route": "reading"
+        }
+      ],
+      "category_routes": {
+        "AI": "technology/ai",
+        "Security": "technology/security"
+      }
+    }
+  },
+  "fetch": {
+    "html_max_bytes": 10485760,
+    "document_max_bytes": 104857600,
+    "refresh_days": 30,
+    "comment_workers": 8,
+    "star_refresh_days": 30,
+    "allow_private_hosts": []
+  }
+}
 ```
 
-The default sample size is `10%`, with a minimum of 20 pages when the target has at least 20 bookmarks. Samples are proportional to Raindrop collections and evenly spaced within each collection's API order.
+| Field | Meaning |
+| --- | --- |
+| `raw_folder`, `source_folder`, `review_folder` | Relative output folders inside the Vault. |
+| `providers.<name>.folder` | Provider subfolder under `raw_folder`. |
+| `providers.<name>.enabled` | Include the provider in `sync --source all` and scheduled runs. |
+| `providers.raindrop.collection_id` | Optional Raindrop collection ID; omitted means all bookmarks. |
+| `providers.<name>.poll_hours` | Minimum interval used by `run` to decide whether that provider is due. |
+| `providers.rss.feeds` | RSS/Atom subscriptions. Each entry may be a URL string or an object with `url`, `name`, `folder`, `tags`, `route`, and `enabled`. |
+| `providers.rss.layout` | RSS raw-note layout: `flat`, `feed`, `feed/year`, `feed/year/month` (default), or `route/feed/year/month`. |
+| `providers.rss.category_routes` | Explicit feed-category-to-folder mappings. Unlisted categories never create folders automatically. |
+| `fetch.html_max_bytes` | Maximum HTML download size. |
+| `fetch.document_max_bytes` | Maximum retained non-HTML response size. |
+| `fetch.refresh_days` | Age after which linked-page content may be fetched again. |
+| `fetch.comment_workers` | Parallel workers for Hatena comment retrieval. |
+| `fetch.star_refresh_days` | Default age for refreshing Hatena Star counts. |
+| `fetch.allow_private_hosts` | Explicit private/local hosts that page fetching may access. Empty by default. |
+
+Unknown config fields are rejected instead of silently ignored.
+
+## Command reference
+
+Run `feedian --help` for the command overview or `feedian COMMAND --help` for terminal help. The complete modern command set is summarized here.
+
+### `init`
+
+Initialize Feedian state in an existing Obsidian Vault.
 
 ```powershell
-# Use exactly 50 sampled pages.
-python -m feedian --config config.json --estimate --estimate-sample-size 50
-
-# Use 20% of the target bookmarks (at least 20 pages).
-python -m feedian --config config.json --estimate --estimate-sample-size 20%
-
-# Do not fetch pages; use the generic 2,000-10,000 input-token range instead.
-python -m feedian --config config.json --estimate --estimate-sample-size 0
-
-# Estimate metadata and excerpts only, without fetching linked pages.
-python -m feedian --config config.json --estimate --skip-page-fetch
+feedian init --vault PATH [--set-default]
 ```
 
-The command reports its current phase while it runs: official price refresh, bookmark collection, every 50 collected bookmarks, sample selection, each page fetch, and cost calculation. On each run it reads the [official OpenAI model catalog](https://developers.openai.com/api/docs/models) and prices for its recommended models, then also includes the configured `openai_model` (or `OPENAI_MODEL` override) and labels it `selected`. The `gpt-5.6` alias maps to Sol. If the catalog cannot be read or parsed, it prints `price_source=fallback` and uses the built-in price table instead. When pages are sampled, the table shows both a typical and a maximum estimate. The typical estimate uses the aggregate `output_tokens / input_tokens` ratio from matching usage records when available; otherwise it uses the initial `input-matched` assumption that output tokens equal the measured mean input tokens. The maximum estimate uses `max_output_tokens`. A failed page fetch still estimates the fallback prompt made from Raindrop metadata and the fetch error. Server-side request framing, reasoning tokens, or future price changes can still make the final bill differ.
+| Option | Meaning |
+| --- | --- |
+| `--vault PATH` | Required Vault root. |
+| `--set-default` | Save this Vault as the default for the current user. |
 
-## Behavior
+It creates `.feedian/config.json` and `.feedian/.gitignore`; it does not scan or rewrite existing notes.
 
-- Normal note generation is read-only against Raindrop.io. `--sync-raindrop-summary` and `--sync-raindrop-tags` are explicit opt-in operations that write Raindrop notes or tags.
-- Existing LLM-generated notes are skipped unless `--force` is passed. An LLM run automatically upgrades notes that were previously created with `--no-llm`; a later `--no-llm` run never downgrades an LLM-generated note.
-- New LLM-generated filenames use the Japanese note title and include the Raindrop item ID to avoid collisions. Use `--rename-existing` to rename existing LLM notes from their stored note titles and to rename `--no-llm` notes when they are upgraded.
-- Notes preserve the original Raindrop title and excerpt, and store the cleaned linked-page text as `Extracted Content (Original)`. Existing notes are not backfilled automatically.
-- If a web page cannot be fetched, the tool still uses Raindrop metadata such as title and excerpt.
-- HTML decoding uses w3lib and charset-normalizer. Main-content extraction uses Trafilatura in precision-oriented mode, with a Playwright headless-browser fallback for empty, corrupted, or JavaScript-shell static HTML. A short static article whose title and body were extracted is not replaced merely because the rendered page is longer; this avoids preferring ad-heavy browser output.
-- Page fetching accepts only `http` and `https` URLs and rejects local/private network addresses by default, including after redirects. Set `allow_private_urls` only for a trusted internal bookmark collection.
-- Linked-page text and bookmark metadata are treated as untrusted reference data when sent to the LLM; instructions in them are not followed.
-- Raindrop and OpenAI requests retry transient 408, 409, 425, 429, 5xx, and network failures with bounded exponential backoff.
-- Raindrop note and tag syncs pace each HTTP request independently at `sync_request_interval_seconds`. On a 429 response, the retry waits for the later of `Retry-After` and Raindrop's `X-RateLimit-Reset` time before retrying. Each sync prints its request interval at start and `elapsed=<seconds>s` when complete.
-- Long-running commands show their phase and progress automatically. `--progress auto` (the default) uses Rich progress bars in an interactive terminal and periodic plain-text updates elsewhere. Use `--progress rich`, `--progress plain`, or `--progress off` to override this choice; add `--verbose` to include individual bookmark names.
-- Before each OpenAI summary request, Feedian reads the usage log to confirm the vault is available. If the vault cannot be read or a Markdown or usage write fails, it stops before making further OpenAI requests.
-- After an LLM response, Feedian temporarily stores at most one pending note under `~/.feedian/pending` until both the Markdown note and usage record are stored in the vault. The next LLM run automatically completes this pending write without requesting another summary; the local pending file is then removed.
-- Successful LLM summaries append a JSON line with `operation: "summarize"` and a transaction ID to `<vault_path>/<output_folder>/.feedian-usage.jsonl`. Each line contains token usage, model and reasoning settings, a price snapshot, and the request's estimated USD cost; it does not contain page text or URLs.
-
-## Useful Commands
-
-List collections:
+### `config set-default-vault`
 
 ```powershell
-python -m feedian --config config.json --list-collections
+feedian config set-default-vault PATH
 ```
 
-Process one collection:
+Select an already initialized Vault as the user default.
+
+### `status`
 
 ```powershell
-python -m feedian --config config.json --collection 123456 --limit 20
+feedian status [--vault PATH]
 ```
 
-Upgrade `--no-llm` notes with LLM summaries and rename notes to their Japanese titles. Existing LLM notes are renamed from their saved frontmatter title without another OpenAI call:
+Show resolved paths, enabled providers, database integrity and schema version, record counts, and the latest sync status.
+
+### `migrate`
 
 ```powershell
-python -m feedian --config config.json --rename-existing
+feedian migrate [--vault PATH]
 ```
 
-Preview copying existing Japanese LLM summaries into Raindrop notes. This reads local Markdown only and does not call OpenAI or modify Raindrop:
+Create or upgrade the Vault database, run integrity checks, compact it, and rebuild the disposable search index. Before a schema upgrade, Feedian creates a SQLite-consistent temporary backup and removes it only after verification succeeds.
+
+### `sync`
 
 ```powershell
-python -m feedian --config config.json --sync-raindrop-summary --dry-run
+feedian sync [--vault PATH] [--source all|raindrop|hatena|rss] [--limit N]
+             [--skip-page-fetch] [--skip-comments]
+             [--force-fetch] [--force-comments]
+             [--progress auto|rich|plain|off] [--verbose]
 ```
 
-Apply the summary sync. Feedian appends or updates only its managed `Feedian Summary` block in each Raindrop note, preserving any manual note text:
+Collect provider metadata and linked-page content into SQLite without calling an LLM.
+
+| Option | Meaning |
+| --- | --- |
+| `--source` | Provider to collect; default `all` means every enabled provider. |
+| `--limit N` | Maximum items per selected provider. Useful for a staged first run. |
+| `--skip-page-fetch` | Store provider metadata without downloading linked-page content. |
+| `--skip-comments` | Do not check or retrieve public Hatena comments. |
+| `--force-fetch` | Fetch page content even when the stored copy is younger than `fetch.refresh_days`. |
+| `--force-comments` | Retrieve full Hatena comments even when the public bookmark count is unchanged. |
+| `--progress` | `auto` uses Rich in a terminal and plain output elsewhere; it can be overridden. |
+| `--verbose` | Print each processed source item title. |
+
+Hatena comment handling applies to every processed item with a URL, including Raindrop and RSS items—not only bookmarks collected from Hatena. Feedian checks bookmark counts in batches, retrieves full comments for new or changed entries, enriches star totals, and keeps at most 20 public comments per resource, ordered by stars and then age. `--limit` and `--source` also limit which items are considered during that sync.
+
+RSS 2.0, RSS 1.0/RDF, and Atom feeds are accepted. Feedian also understands common namespaced fields such as `content:encoded` and `dc:date`, resolves relative article URLs, and uses embedded feed content when no downloaded article revision exists. With multiple feeds, a failed feed is recorded while the remaining feeds continue; `--limit` selects the newest entries across the complete RSS provider rather than filling the limit from the first feed only. Stored `ETag` and `Last-Modified` values are reused for conditional requests, so unchanged feeds can return `304 Not Modified` without being parsed again.
+
+### `render`
 
 ```powershell
-python -m feedian --config config.json --sync-raindrop-summary
+feedian render [--vault PATH] [--apply] [--progress auto|rich|plain|off]
 ```
 
-Preview tags from existing LLM notes before adding them to the matching Raindrop items:
+Render SQLite records as Obsidian Markdown. Without `--apply`, output goes to `.feedian/staging/raw/`. With `--apply`, output goes to the configured `raw_folder` and protected-file conflicts are reported without overwriting those files.
+
+### `ingest`
 
 ```powershell
-python -m feedian --config config.json --sync-raindrop-tags --dry-run
+feedian ingest [--vault PATH] [--model MODEL] [--language LANGUAGE] [--limit N]
+               [--dry-run] [--auto] [--force]
+               [--progress auto|rich|plain|off]
 ```
 
-Apply the tag sync. Feedian excludes `base_tags`, reads the item's current Raindrop tags, and appends only missing tags. It never replaces or removes existing Raindrop tags:
+Create LLM-derived `source/` notes from resources already stored by `sync`.
+
+| Option | Meaning |
+| --- | --- |
+| `--model MODEL` | OpenAI model for this run. Overrides `OPENAI_MODEL`. |
+| `--language LANGUAGE` | Output language; default `Japanese`. |
+| `--limit N` | Maximum candidates to process. Without `--auto`, omitted means all stored resources. |
+| `--dry-run` | Show selection, token counts, and cost estimates without API calls or writes. |
+| `--auto` | Choose representative resources, prioritizing uncovered fields and then large fields. Source tags are used first, with title terms and domain as fallbacks. |
+| `--force` | Ignore reusable successful LLM results and call the API again. This can incur duplicate cost. |
+| `--progress` | Select Rich, plain, automatic, or disabled progress output. |
+
+`--auto` defaults to 20 candidates when `--limit` is omitted. A normal run reuses a matching successful result for the same content revision, model, prompt version, and request fingerprint. Each completed resource is marked in SQLite, allowing repeated stop-and-resume runs to advance without duplicating completed work.
+
+LLM tags are stored in the `source/` note frontmatter and `## Tags` section. Provider tags collected by `sync` remain separate in raw metadata and are also supplied to the LLM as context.
+
+The displayed cost is a local estimate from Feedian's price snapshot; account credits, complimentary tokens, taxes, and the provider's final billed amount are not known to Feedian.
+
+### `enrich-stars`
 
 ```powershell
-python -m feedian --config config.json --sync-raindrop-tags
+feedian enrich-stars [--vault PATH] [--limit N] [--refresh-days N] [--force]
+                     [--progress auto|rich|plain|off]
 ```
 
-Use a different vault without editing config:
+Refresh public Hatena Star totals for stored comments without an LLM. The default refresh age comes from `fetch.star_refresh_days` (30 days when omitted). `--force` refreshes every stored Hatena comment now.
+
+### `reextract`
 
 ```powershell
-python -m feedian --config config.json --vault "C:\Users\you\Documents\Obsidian\Vault"
+feedian reextract [--vault PATH] [--media-type PREFIX] [--limit N]
+```
+
+Re-run text extraction from retained non-HTML response bytes without downloading the source again. For example:
+
+```powershell
+feedian reextract --media-type application/pdf
+```
+
+HTML cannot be re-extracted this way because only its extracted text is retained; use `sync --force-fetch` to fetch HTML again.
+
+### `search`
+
+```powershell
+feedian search status [--vault PATH]
+feedian search rebuild [--vault PATH]
+```
+
+Inspect or rebuild `.feedian/cache/search.sqlite3`. This full-text index is disposable and is excluded from Git and snapshots.
+
+### `run`
+
+```powershell
+feedian run [--vault PATH] [--if-due] [--skip-snapshot]
+```
+
+Run the due non-LLM pipeline: sync due providers, refresh due Hatena stars, rebuild search, apply the raw render, and create a due weekly snapshot.
+
+| Option | Meaning |
+| --- | --- |
+| `--if-due` | Exit without work if no provider or snapshot is due. Used by the logon catch-up task. |
+| `--skip-snapshot` | Run sync, star enrichment, search, and render without creating a snapshot. |
+
+`run` never invokes `ingest` and therefore never calls OpenAI.
+
+### `schedule`
+
+```powershell
+feedian schedule install [--vault PATH] [--time HH:MM]
+feedian schedule status [--vault PATH]
+feedian schedule remove [--vault PATH]
+```
+
+Manage Windows Task Scheduler jobs. `install` creates a six-hourly task starting at local `03:00` by default and a logon catch-up task that runs with `--if-due`. Failed scheduled runs retry every 30 minutes, up to six attempts.
+
+### `snapshot`
+
+```powershell
+feedian snapshot [--vault PATH] [--dry-run] [--progress auto|rich|plain|off]
+```
+
+Publish a verified SQLite archive to a GitHub Release. `--dry-run` checks prerequisites without creating a commit, tag, archive, or Release.
+
+Snapshot prerequisites:
+
+- The Vault is a Git repository whose `origin` is GitHub.
+- The GitHub repository is private; Feedian refuses public repositories.
+- [GitHub CLI](https://cli.github.com/) is installed and authenticated.
+- [7-Zip](https://www.7-zip.org/) is installed, or `FEEDIAN_7Z` points to it.
+- The Git staging area has no unrelated staged files.
+
+A real snapshot creates a consistent database backup, archives it, commits managed Vault paths, pushes a tag, uploads a private Release asset, downloads it again, and verifies hashes, archive integrity, and SQLite integrity.
+
+### `restore`
+
+```powershell
+feedian restore --vault PATH (--archive FILE | --tag TAG)
+```
+
+Restore a verified snapshot from a local `.sqlite3.7z` archive or a GitHub Release tag. The destination Vault must not already contain `.feedian/feedian.sqlite3`.
+
+## Common recipes
+
+### Grow the raw archive in stages
+
+```powershell
+feedian sync --source hatena --limit 100
+feedian sync --source hatena --limit 500
+feedian sync --source hatena --limit 1000
+feedian render --apply
+```
+
+Existing records are updated or reused by stable source/resource identity instead of being duplicated.
+
+### Fetch metadata only
+
+```powershell
+feedian sync --source raindrop --skip-page-fetch --skip-comments
+```
+
+### Collect RSS into feed and month folders
+
+Enable RSS and add subscriptions under `providers.rss.feeds`, then run:
+
+```powershell
+feedian sync --source rss --limit 20 --skip-comments
+feedian render
+# Inspect .feedian/staging/raw/RSS/<feed>/<year>/<month>/
+feedian render --apply
+```
+
+The default layout is:
+
+```text
+raw/RSS/<feed folder>/<YYYY>/<MM>/<title> - <source id>.md
+```
+
+Entries without a usable publication date go under `_undated/`. A configured feed `folder` is stable. When it is omitted, Feedian remembers the first resolved folder already stored for that feed. Changing a layout or an explicit route safely moves unchanged Feedian-generated notes and their comment notes; edited files remain in place and are reported as conflicts.
+
+To add a controlled top-level route, set `providers.rss.layout` to `route/feed/year/month` and use either a feed's explicit `route` or `category_routes`. Ordinary feed and LLM tags stay in frontmatter and do not create arbitrary folders.
+
+### Refresh an article and its Hatena discussion
+
+```powershell
+feedian sync --source all --force-fetch --force-comments
+```
+
+### Compare full and automatic ingest previews
+
+```powershell
+# All stored resources, up to 100.
+feedian ingest --dry-run --limit 100
+
+# A diverse representative selection, up to 100.
+feedian ingest --auto --dry-run --limit 100
+```
+
+### Resume an interrupted ingest
+
+Run the same command again without `--force`:
+
+```powershell
+feedian ingest --auto --limit 100
+```
+
+Matching completed results are reused. New token and cost totals in the progress display include only API calls made during the current invocation.
+
+### Use a one-off model
+
+```powershell
+feedian ingest --auto --limit 20 --model gpt-5.6-terra
+```
+
+This overrides `.env` for that invocation without changing the configured environment.
+
+### Automate collection but keep LLM use manual
+
+```powershell
+feedian schedule install --time 03:00
+feedian schedule status
+
+# Run this manually whenever the preview looks appropriate.
+feedian ingest --auto --dry-run --limit 20
+feedian ingest --auto --limit 20
+```
+
+## Files and backup policy
+
+| Path | Purpose | Git/snapshot policy |
+| --- | --- | --- |
+| `.feedian/config.json` | Current Vault configuration | Intended for Git and snapshots |
+| `.feedian/feedian.sqlite3` | Canonical local archive | Ignored by Git; included in release archives |
+| `.feedian/cache/search.sqlite3` | Rebuildable full-text index | Ignored; excluded from snapshots |
+| `.feedian/logs/`, `staging/`, `tmp/` | Operational files | Ignored |
+| `.feedian/snapshot.json` | Latest verified snapshot manifest | Intended for Git |
+| `raw/` | Generated source-material view | Managed snapshot path |
+| `source/` | Generated LLM-derived notes | Managed snapshot path |
+
+Use a private archive repository separate from the Feedian application repository. Source material, comments, generated notes, and snapshot metadata may contain private information.
+
+## Legacy direct-export mode
+
+Feedian still accepts the original option-only interface when the first argument is not one of the modern commands. It writes notes directly using the repository-root `config.json`; new Vaults should use the SQLite workflow above.
+
+```powershell
+python -m feedian --config config.json --source raindrop --limit 10
+python -m feedian --config config.json --source hatena --input bookmarks.atom --no-llm
+```
+
+| Legacy option | Meaning |
+| --- | --- |
+| `--source raindrop|hatena` | Select the old direct-export adapter. |
+| `--input FILE_OR_URL` | Hatena Atom, RSS 1.0, bookmark HTML, or HTTP(S) feed input. |
+| `--config FILE` | Legacy config path; default `config.json`. |
+| `--vault PATH` / `--folder NAME` | Override legacy output location. |
+| `--collection ID` | Override the Raindrop collection. |
+| `--limit N` | Limit bookmarks. |
+| `--dry-run` | Preview items without page fetches, OpenAI calls, or writes. |
+| `--force` | Overwrite existing notes. |
+| `--rename-existing` | Rename existing LLM notes from saved note titles. |
+| `--list-collections` | List Raindrop collections. |
+| `--skip-page-fetch` | Use metadata, comments, and excerpts only. |
+| `--no-llm` | Create notes without OpenAI summaries or generated tags. |
+| `--estimate` | Estimate model cost without calling a model or writing notes. |
+| `--estimate-sample-size N|PERCENT|0` | Control estimate sampling; default `10%`. |
+| `--sync-raindrop-summary` | Copy managed summaries from local notes to Raindrop notes. |
+| `--sync-raindrop-tags` | Append generated tags from local notes to Raindrop items. |
+| `--progress auto|rich|plain|off` | Select progress output. |
+| `--verbose` | Show per-bookmark details. |
+
+See [`config.example.json`](config.example.json) for legacy config fields. The legacy `openai_model` setting does not configure modern `feedian ingest`; use `OPENAI_MODEL` or `ingest --model` for that.
+
+## Security and operational behavior
+
+- Linked pages, bookmark metadata, and comments are treated as untrusted reference data. Instructions embedded in them are not followed by the summarization prompt.
+- Page fetching accepts only HTTP(S), blocks private/local addresses by default, and rechecks redirects. Add only trusted hosts to `fetch.allow_private_hosts`.
+- Raindrop and OpenAI requests retry bounded transient failures with exponential backoff.
+- A Vault write lock prevents overlapping mutating operations.
+- Before every OpenAI request, Feedian checks that the Vault remains readable. LLM usage and the generated note are recorded per resource in SQLite.
+- Public Hatena comment and star retrieval uses Hatena's official APIs and does not require an LLM.
+- Full-text search is a rebuildable local cache; the SQLite Vault database remains authoritative.
+
+## Development
+
+Run the test suite from the repository root:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest
 ```
 
 ## License
