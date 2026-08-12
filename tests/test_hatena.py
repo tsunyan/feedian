@@ -6,12 +6,25 @@ from unittest.mock import patch
 from feedian.hatena import (
     clean_hatena_excerpt,
     fetch_hatena_bookmarks,
+    fetch_hatena_bookmark_counts,
     fetch_hatena_entry_discussion,
     load_hatena_export,
 )
 
 
 class HatenaExportTests(unittest.TestCase):
+    def test_bookmark_count_api_batches_urls_and_keeps_zeroes(self) -> None:
+        urls = ["https://example.com/a", "https://example.com/b"]
+        with patch(
+            "feedian.hatena._read_entry_json",
+            return_value={urls[0]: 12, urls[1]: 0},
+        ) as read_json:
+            counts = fetch_hatena_bookmark_counts(urls, workers=1)
+
+        request = read_json.call_args.args[0]
+        self.assertIn("count/entries?", request.full_url)
+        self.assertEqual(counts, {urls[0]: 12, urls[1]: 0})
+
     def test_niconico_excerpt_removes_job_box_advertisement(self) -> None:
         excerpt = (
             "記事の導入 sponsored by 求人ボックス もっと見る > "

@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .markdown import comments_note_filename, escape_markdown_heading, sanitize_filename, yaml_frontmatter
 from .store import VaultStore
@@ -31,12 +31,23 @@ def render_raw_views(
     config: VaultConfig,
     *,
     apply: bool = False,
-    replace_legacy: bool = False,
+    progress: Callable[[int, int], None] | None = None,
 ) -> RenderReport:
-    if replace_legacy and not apply:
-        raise ValueError("replace_legacy requires apply=True.")
     paths = vault_paths(vault_root)
     output_root = paths.root / config.raw_folder if apply else paths.state_dir / "staging" / config.raw_folder
+    total = int(
+        store.connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM source_item AS s
+            JOIN source_item_revision AS sr ON sr.source_revision_id = s.current_revision_id
+            """
+        ).fetchone()[0]
+    )
+    if progress is not None:
+        progress(0, total)
+    if not apply and output_root.exists():
+        shutil.rmtree(output_root)
     rows = store.connection.execute(
         """
         SELECT s.source_item_id, s.provider, s.account, s.native_id, s.resource_id, s.removed_at,
@@ -55,27 +66,27 @@ def render_raw_views(
         """
     ).fetchall()
     written = skipped = conflicts = comments_written = 0
-    for row in rows:
+    for processed, row in enumerate(rows, start=1):
         metadata = json.loads(str(row["metadata_json"]))
         provider = str(row["provider"])
         settings = config.providers.get(provider)
         if settings is None:
+            if progress is not None:
+                progress(processed, total)
             continue
         destination = output_root / settings.folder
         filename = _note_filename(metadata, str(row["native_id"]))
         main_path = destination / filename
+        if apply:
+            _reconcile_legacy_generated_paths(destination, str(row["native_id"]), main_path)
         comments_path = destination / comments_note_filename(filename)
         comments = _comments_for_resource(store, row["resource_id"])
-        assets = _materialize_assets(
-            store, row["resource_id"], row["resource_revision_id"], output_root / "assets", main_path.parent
-        )
-        main_document = _render_main_document(row, metadata, comments_path.stem if comments else None, assets)
+        images = _external_images(store, row["resource_id"])
+        main_document = _render_main_document(row, metadata, comments_path.stem if comments else None, images)
         write_result = _write_generated(
             main_path,
             main_document,
             apply=apply,
-            replace_legacy=replace_legacy,
-            legacy_matches=_legacy_matches(store, paths.root, config.raw_folder, main_path),
         )
         if write_result == "written":
             written += 1
@@ -89,13 +100,13 @@ def render_raw_views(
                 comments_path,
                 comments_document,
                 apply=apply,
-                replace_legacy=replace_legacy,
-                legacy_matches=_legacy_matches(store, paths.root, config.raw_folder, comments_path),
             )
             if comments_result == "written":
                 comments_written += 1
             elif comments_result == "conflict":
                 conflicts += 1
+        if progress is not None:
+            progress(processed, total)
     return RenderReport(written, skipped, conflicts, comments_written, output_root)
 
 
@@ -105,7 +116,7 @@ def _note_filename(metadata: dict[str, Any], native_id: str) -> str:
 
 
 def _render_main_document(
-    row: Any, metadata: dict[str, Any], comments_note: str | None, assets: list[tuple[str, str]]
+    row: Any, metadata: dict[str, Any], comments_note: str | None, images: list[tuple[str, str]]
 ) -> str:
     title = str(metadata.get("title") or row["resource_title"] or metadata.get("link") or "Untitled")
     tags = [str(value) for value in metadata.get("tags") or [] if str(value).strip()]
@@ -147,10 +158,12 @@ def _render_main_document(
     discussion = str(row["discussion_text"] or "").strip()
     if discussion:
         lines.extend(["## Reply (Original)", "", discussion, ""])
-    if assets:
+    if images:
         lines.extend(["## Images (Original)", ""])
-        for relative_path, alt_text in assets:
-            lines.extend([f"![{alt_text}]({relative_path})", ""])
+        for source_url, alt_text in images:
+            safe_alt = alt_text.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+            safe_url = source_url.replace("<", "%3C").replace(">", "%3E").replace(" ", "%20")
+            lines.extend([f"![{safe_alt}](<{safe_url}>)", ""])
     if comments_note:
         lines.extend(["## Hatena Comments", "", f"- [[{comments_note}]]", ""])
     warning = str(row["fetch_warning"] or "").strip()
@@ -182,8 +195,7 @@ def _render_comments_document(row: Any, metadata: dict[str, Any], comments: list
         lines.extend([f"## {escape_markdown_heading(heading)}", "", str(comment["body"]), ""])
         if tags:
             lines.extend([" ".join(f"#{tag}" for tag in tags), ""])
-        metadata_json = json.loads(str(comment["metadata_json"]))
-        timestamp = metadata_json.get("timestamp")
+        timestamp = str(comment["posted_at"])
         if timestamp:
             lines.extend([f"- Posted: {timestamp}", ""])
     return _with_render_hash("\n".join(lines).rstrip() + "\n")
@@ -194,60 +206,31 @@ def _comments_for_resource(store: VaultStore, resource_id: str | None) -> list[A
         return []
     return store.connection.execute(
         """
-        SELECT c.author, cr.body, cr.tags_json, cr.star_count, cr.metadata_json
+        SELECT c.author, cr.body, cr.tags_json, cr.star_count, cr.posted_at
         FROM comment AS c
         JOIN comment_revision AS cr ON cr.comment_revision_id = c.current_revision_id
         WHERE c.resource_id = ? AND c.removed_at IS NULL
-        ORDER BY cr.star_count DESC, cr.created_at ASC, c.author ASC
+        ORDER BY COALESCE(cr.star_count, 0) DESC,
+                 CASE WHEN cr.posted_at = '' THEN 1 ELSE 0 END,
+                 cr.posted_at ASC, c.comment_id ASC
         """,
         (resource_id,),
     ).fetchall()
 
 
-def _materialize_assets(
-    store: VaultStore,
-    resource_id: str | None,
-    resource_revision_id: str | None,
-    assets_dir: Path,
-    note_directory: Path,
-) -> list[tuple[str, str]]:
-    if not resource_id or not resource_revision_id:
+def _external_images(store: VaultStore, resource_id: str | None) -> list[tuple[str, str]]:
+    if not resource_id:
         return []
     rows = store.connection.execute(
         """
-        SELECT p.content, p.sha256, p.media_type, a.alt_text
-        FROM asset AS a
-        JOIN payload AS p ON p.payload_id = a.payload_id
-        WHERE a.resource_id = ? AND a.resource_revision_id = ?
-        ORDER BY a.created_at, a.asset_id
+        SELECT source_url, alt_text
+        FROM resource_image
+        WHERE resource_id = ?
+        ORDER BY position, resource_image_id
         """,
-        (resource_id, resource_revision_id),
+        (resource_id,),
     ).fetchall()
-    references: list[tuple[str, str]] = []
-    for row in rows:
-        extension = _displayable_image_extension(str(row["media_type"]))
-        if extension is None:
-            continue
-        path = assets_dir / f"{row['sha256']}{extension}"
-        if not path.exists() or path.read_bytes() != row["content"]:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = path.with_suffix(path.suffix + ".tmp")
-            temporary.write_bytes(row["content"])
-            temporary.replace(path)
-        relative_path = os.path.relpath(path, start=note_directory).replace("\\", "/")
-        references.append((relative_path, str(row["alt_text"])))
-    return references
-
-
-def _displayable_image_extension(media_type: str) -> str | None:
-    normalized = media_type.split(";", 1)[0].strip().lower()
-    return {
-        "image/jpeg": ".jpg",
-        "image/png": ".png",
-        "image/gif": ".gif",
-        "image/webp": ".webp",
-        "image/avif": ".avif",
-    }.get(normalized)
+    return [(str(row["source_url"]), str(row["alt_text"])) for row in rows]
 
 
 def _with_render_hash(document_without_hash: str) -> str:
@@ -260,8 +243,6 @@ def _write_generated(
     document: str,
     *,
     apply: bool,
-    replace_legacy: bool = False,
-    legacy_matches: bool = False,
 ) -> str:
     if path.exists() and apply:
         existing_bytes = path.read_bytes()
@@ -269,7 +250,7 @@ def _write_generated(
             existing = existing_bytes.decode("utf-8")
         except UnicodeDecodeError:
             existing = ""
-        if not _is_unchanged_generated_document(existing) and not (replace_legacy and legacy_matches):
+        if not _is_unchanged_generated_document(existing) and not _is_legacy_generated_document(existing):
             return "conflict"
         if existing_bytes == document.encode("utf-8"):
             return "skipped"
@@ -282,17 +263,6 @@ def _write_generated(
     return "written"
 
 
-def _legacy_matches(store: VaultStore, vault_root: Path, raw_folder: str, path: Path) -> bool:
-    if not path.exists():
-        return False
-    raw_root = vault_root / raw_folder
-    try:
-        relative_path = path.relative_to(raw_root).as_posix()
-    except ValueError:
-        return False
-    return store.matches_legacy_artifact(relative_path, path.read_bytes())
-
-
 def _is_unchanged_generated_document(document: str) -> bool:
     match = RENDER_HASH_PATTERN.search(document)
     if match is None:
@@ -301,3 +271,48 @@ def _is_unchanged_generated_document(document: str) -> bool:
     # The hash line is immediately after feedian_managed and therefore leaves one empty line when removed.
     without_hash = without_hash.replace("feedian_managed: true\n\n", "feedian_managed: true\n", 1)
     return hashlib.sha256(without_hash.encode("utf-8")).hexdigest() == match.group(1)
+
+
+def _is_legacy_generated_document(document: str) -> bool:
+    """Recognize pre-canonical Feedian raw views without treating ordinary Markdown as generated."""
+    document = document.replace("\r\n", "\n").replace("\r", "\n")
+    if not document.startswith("---\n"):
+        return False
+    frontmatter_end = document.find("\n---\n", 4)
+    if frontmatter_end < 0:
+        return False
+    frontmatter = document[4:frontmatter_end]
+    canonical_required = (
+        re.search(r"(?m)^source_type: \"?(?:hatena|raindrop)\"?\s*$", frontmatter),
+        re.search(r"(?m)^source_id: \"?(?:hatena|raindrop)-[^\s\"]+\"?\s*$", frontmatter),
+        re.search(r"(?m)^content_key: \"?url:[0-9a-f]{64}\"?\s*$", frontmatter),
+    )
+    raindrop_required = (
+        re.search(r"(?m)^source: \"?https?://.+\"?\s*$", frontmatter),
+        re.search(r"(?m)^raindrop_id: \"?[0-9]+\"?\s*$", frontmatter),
+        re.search(r"(?m)^raindrop_collection_id: \"?-?[0-9]+\"?\s*$", frontmatter),
+        re.search(r"(?m)^summary_generated_at: \"?[^\n\"]+\"?\s*$", frontmatter),
+        re.search(r"(?m)^summary_model: \"?[^\n\"]+\"?\s*$", frontmatter),
+    )
+    return all(canonical_required) or all(raindrop_required)
+
+
+def _reconcile_legacy_generated_paths(destination: Path, native_id: str, expected_path: Path) -> None:
+    """Move or remove an old title-based Feedian path for the same stable source ID."""
+    if not destination.exists():
+        return
+    candidates = sorted(destination.glob(f"* - {native_id}.md"))
+    for candidate in candidates:
+        if candidate == expected_path or candidate.name.endswith(".comments.md"):
+            continue
+        try:
+            document = candidate.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        if not _is_legacy_generated_document(document):
+            continue
+        expected_path.parent.mkdir(parents=True, exist_ok=True)
+        if not expected_path.exists():
+            candidate.replace(expected_path)
+        else:
+            candidate.unlink()

@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import argparse
 import os
-import sys
+import sqlite3
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from .locking import vault_write_lock
+from .cli_ui import RichArgumentParser, print_cli_error
 from .env import load_env_file
 from .ingest import ingest_source_notes, render_source_notes
 from .notifications import notify_windows
@@ -19,10 +20,12 @@ from .sync import sync_vault
 from .renderer import render_raw_views
 from .scheduler import install_schedule, remove_schedule, schedule_status
 from .snapshots import create_snapshot
+from .search import rebuild_search_index, search_index_generation
+from .store import SCHEMA_VERSION
 from .vault import find_vault_root, initialize_vault, load_vault_config, save_default_vault, vault_paths
 
 
-COMMANDS = frozenset({"init", "config", "status", "migrate", "sync", "reextract", "enrich-stars", "render", "run", "snapshot", "restore", "schedule", "auth", "ingest"})
+COMMANDS = frozenset({"init", "config", "status", "migrate", "sync", "reextract", "enrich-stars", "render", "run", "snapshot", "restore", "schedule", "auth", "ingest", "search"})
 
 
 def is_modern_command(argv: list[str]) -> bool:
@@ -30,7 +33,7 @@ def is_modern_command(argv: list[str]) -> bool:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = RichArgumentParser(
         prog="feedian",
         description="Collect external sources into a per-vault SQLite archive and Obsidian views.",
     )
@@ -47,28 +50,26 @@ def build_parser() -> argparse.ArgumentParser:
 
     for command, help_text in (
         ("status", "Show Vault database and sync status."),
-        ("migrate", "Create or migrate the Vault database, preserving existing raw Markdown."),
+        ("migrate", "Create or migrate the Vault database."),
     ):
         subparser = subparsers.add_parser(command, help=help_text)
         subparser.add_argument("--vault", help="Vault root. Defaults to the current or configured Vault.")
-        if command == "migrate":
-            subparser.add_argument(
-                "--skip-legacy-import",
-                action="store_true",
-                help="Do not import existing raw/**/*.md into the immutable legacy archive.",
-            )
 
     sync = subparsers.add_parser("sync", help="Collect providers into SQLite without calling an LLM.")
     sync.add_argument("--vault", help="Vault root. Defaults to the current or configured Vault.")
-    sync.add_argument("--source", choices=("all", "raindrop", "hatena", "rss"), default="all")
+    sync.add_argument(
+        "--source", choices=("all", "raindrop", "hatena", "rss"), default="all",
+        help="Provider to sync (default: all).",
+    )
     sync.add_argument("--limit", type=int, help="Maximum items per provider.")
     sync.add_argument("--skip-page-fetch", action="store_true", help="Store provider data only.")
     sync.add_argument("--skip-comments", action="store_true", help="Do not request public Hatena comments.")
     sync.add_argument("--force-fetch", action="store_true", help="Refetch page content even when it is younger than refresh_days.")
-    sync.add_argument("--progress", choices=PROGRESS_MODES, default="auto")
+    sync.add_argument("--force-comments", action="store_true", help="Refetch Hatena comments even when bookmark counts are unchanged.")
+    sync.add_argument("--progress", choices=PROGRESS_MODES, default="auto", help="Progress display mode.")
     sync.add_argument("--verbose", action="store_true", help="Show each processed source item title.")
 
-    reextract = subparsers.add_parser("reextract", help="Re-run extraction from response bytes already stored in SQLite.")
+    reextract = subparsers.add_parser("reextract", help="Re-run extraction from retained non-HTML response bytes such as PDFs.")
     reextract.add_argument("--vault", help="Vault root. Defaults to the current or configured Vault.")
     reextract.add_argument("--media-type", help="Optional MIME prefix such as application/pdf.")
     reextract.add_argument("--limit", type=int)
@@ -76,16 +77,14 @@ def build_parser() -> argparse.ArgumentParser:
     stars = subparsers.add_parser("enrich-stars", help="Fetch public Hatena star counts for stored comments without using an LLM.")
     stars.add_argument("--vault", help="Vault root. Defaults to the current or configured Vault.")
     stars.add_argument("--limit", type=int, help="Maximum comments to enrich.")
-    stars.add_argument("--progress", choices=PROGRESS_MODES, default="auto")
+    stars.add_argument("--refresh-days", type=int, help="Refresh stars older than this many days (default: config or 30).")
+    stars.add_argument("--force", action="store_true", help="Refresh every stored Hatena comment now.")
+    stars.add_argument("--progress", choices=PROGRESS_MODES, default="auto", help="Progress display mode.")
 
     render = subparsers.add_parser("render", help="Render SQLite records as Obsidian Markdown.")
     render.add_argument("--vault", help="Vault root. Defaults to the current or configured Vault.")
     render.add_argument("--apply", action="store_true", help="Write to raw/. The default writes to .feedian/staging/raw/.")
-    render.add_argument(
-        "--replace-legacy",
-        action="store_true",
-        help="With --apply, replace only files that still exactly match their immutable legacy archive copy.",
-    )
+    render.add_argument("--progress", choices=PROGRESS_MODES, default="auto", help="Progress display mode.")
 
     run = subparsers.add_parser("run", help="Run due non-LLM source syncs, render raw, and snapshot weekly.")
     run.add_argument("--vault", help="Vault root. Defaults to the current or configured Vault.")
@@ -117,6 +116,10 @@ def build_parser() -> argparse.ArgumentParser:
     ingest.add_argument("--language", default="Japanese")
     ingest.add_argument("--limit", type=int)
     ingest.add_argument("--force", action="store_true", help="Ignore matching successful LLM results and run again.")
+
+    search = subparsers.add_parser("search", help="Inspect or rebuild the disposable local full-text index.")
+    search.add_argument("action", choices=("status", "rebuild"))
+    search.add_argument("--vault", help="Vault root. Defaults to the current or configured Vault.")
     return parser
 
 
@@ -143,7 +146,7 @@ def main(argv: list[str]) -> int:
         if args.command == "status":
             return _status(args.vault)
         if args.command == "migrate":
-            return _migrate(args.vault, skip_legacy_import=args.skip_legacy_import)
+            return _migrate(args.vault)
         if args.command == "sync":
             return _sync(args)
         if args.command == "reextract":
@@ -162,9 +165,11 @@ def main(argv: list[str]) -> int:
             return _schedule(args)
         if args.command == "ingest":
             return _ingest(args)
+        if args.command == "search":
+            return _search(args)
         raise ValueError(f"Command not implemented yet: {args.command}")
     except Exception as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        print_cli_error(exc)
         return 1
 
 
@@ -183,6 +188,11 @@ def _status(explicit_vault: str | None) -> int:
     try:
         print(f"schema_version: {store.schema_version()}")
         print(f"integrity: {store.quick_check()}")
+        index_generation = search_index_generation(paths.search_database_path)
+        print(
+            f"search_index: {'current' if index_generation == store.search_generation() else 'stale-or-missing'} "
+            f"generation={index_generation if index_generation is not None else '-'}"
+        )
         for name, count in store.status_counts().items():
             print(f"{name}: {count}")
         latest = store.latest_sync_run()
@@ -193,23 +203,33 @@ def _status(explicit_vault: str | None) -> int:
     return 0
 
 
-def _migrate(explicit_vault: str | None, *, skip_legacy_import: bool = False) -> int:
+def _migrate(explicit_vault: str | None) -> int:
     root = find_vault_root(explicit=explicit_vault)
     paths = vault_paths(root)
-    store = VaultStore.open(paths.database_path)
-    try:
-        with vault_write_lock(paths.state_dir):
-            imported = skipped = 0
-            if not skip_legacy_import:
-                imported, skipped = store.import_legacy_artifacts(paths.raw_dir)
+    paths.state_dir.mkdir(parents=True, exist_ok=True)
+    backup_path: Path | None = None
+    with vault_write_lock(paths.state_dir):
+        if paths.database_path.exists() and _database_schema_version(paths.database_path) < SCHEMA_VERSION:
+            backup_path = paths.state_dir / "tmp" / f"migration-v{_database_schema_version(paths.database_path)}.sqlite3"
+            print(f"migration: creating temporary safety backup: {backup_path}")
+            _backup_database(paths.database_path, backup_path)
+        store = VaultStore.open(paths.database_path, allow_migration=True)
+        try:
             if store.integrity_check() != "ok":
                 raise RuntimeError("Database integrity check failed after migration.")
+            print("migration: compacting database")
+            store.compact()
+            if store.integrity_check() != "ok":
+                raise RuntimeError("Database integrity check failed after compaction.")
+            search = rebuild_search_index(store, paths.search_database_path, force=True)
             print(
                 f"migrated: schema_version={store.schema_version()} database={paths.database_path} "
-                f"legacy_imported={imported} legacy_skipped={skipped}"
+                f"search_sources={search.sources} search_resources={search.resources} search_comments={search.comments}"
             )
-    finally:
-        store.close()
+        finally:
+            store.close()
+        if backup_path is not None:
+            backup_path.unlink(missing_ok=True)
     return 0
 
 
@@ -219,15 +239,82 @@ def _sync(args: argparse.Namespace) -> int:
     paths = vault_paths(root)
     store = VaultStore.open(paths.database_path)
     try:
+        if args.source == "all":
+            previous_source_total = int(
+                store.connection.execute(
+                    "SELECT COUNT(*) FROM source_item WHERE removed_at IS NULL"
+                ).fetchone()[0]
+            )
+        else:
+            previous_source_total = int(
+                store.connection.execute(
+                    "SELECT COUNT(*) FROM source_item WHERE provider = ? AND removed_at IS NULL",
+                    (args.source,),
+                ).fetchone()[0]
+            )
         reporter = ProgressReporter(args.progress, verbose=args.verbose)
         with reporter:
             reporter.start_task(
                 f"process: syncing {args.source}", total=args.limit if args.limit is not None else None
             )
+            collection_reported = 0
+            processing_started = False
+            processing_total: int | None = None
+            processing_reported = 0
+            comments_reported = 0
+            comments_started = False
+
+            def update_collection(provider: str, collected: int, total: int) -> None:
+                nonlocal collection_reported, processing_started
+                if collected == 0:
+                    collection_reported = 0
+                    processing_started = False
+                    reporter.start_task(f"process: collecting {provider} bookmarks")
+                    return
+                if total > 0:
+                    # The API total is a snapshot and can grow while Feedian is
+                    # paging through bookmarks added during the same run.
+                    reporter.set_total(max(total, collected))
+                reporter.advance(max(0, collected - collection_reported))
+                collection_reported = collected
 
             def update_progress(_processed: int, item) -> None:
-                reporter.advance()
+                nonlocal processing_started, processing_total, processing_reported
+                if not processing_started:
+                    if collection_reported:
+                        reporter.finish_task(collection_reported)
+                    processing_total = (
+                        args.limit
+                        if args.limit is not None
+                        else (collection_reported or previous_source_total or None)
+                    )
+                    reporter.start_task(
+                        f"process: syncing {args.source} items",
+                        total=processing_total,
+                        estimated_total=args.limit is None and processing_total is not None,
+                        preserve_previous=bool(collection_reported),
+                    )
+                    processing_started = True
+                elif args.limit is None and processing_total is not None and _processed > processing_total:
+                    processing_total = _processed
+                    reporter.set_total(processing_total, estimated_total=True)
+                reporter.advance(max(0, _processed - processing_reported))
+                processing_reported = _processed
                 reporter.verbose_log(f"  {item.title or item.url or item.source_id}")
+
+            def update_comments(processed: int, total: int) -> None:
+                nonlocal comments_reported, comments_started
+                if not comments_started:
+                    comments_started = True
+                    comments_reported = 0
+                    reporter.finish_task(processing_reported)
+                    reporter.start_task(
+                        "process: checking and updating Hatena comments",
+                        total=total,
+                        preserve_previous=True,
+                    )
+                reporter.advance(max(0, processed - comments_reported))
+                comments_reported = processed
 
             with vault_write_lock(paths.state_dir):
                 report = sync_vault(
@@ -238,8 +325,14 @@ def _sync(args: argparse.Namespace) -> int:
                     fetch_pages=not args.skip_page_fetch,
                     fetch_comments=not args.skip_comments,
                     force_fetch=args.force_fetch,
+                    force_comments=args.force_comments,
                     progress=update_progress,
+                    collection_progress=update_collection,
+                    comment_progress=update_comments,
                 )
+                if not comments_started:
+                    reporter.finish_task(report.processed)
+                rebuild_search_index(store, paths.search_database_path)
         print(
             f"sync: run={report.run_id} processed={report.processed} changed={report.changed} "
             f"fetched={report.fetched} failed={report.failed}"
@@ -257,10 +350,30 @@ def _render(args: argparse.Namespace) -> int:
         raise FileNotFoundError(f"Database not found: {paths.database_path}; run feedian sync first.")
     store = VaultStore.open(paths.database_path)
     try:
-        with vault_write_lock(paths.state_dir):
-            report = render_raw_views(
-                store, root, config, apply=args.apply, replace_legacy=args.replace_legacy
-            )
+        reporter = ProgressReporter(args.progress)
+        reported = 0
+
+        def update_progress(processed: int, total: int) -> None:
+            nonlocal reported
+            if processed == 0:
+                reporter.start_task(
+                    "process: applying Obsidian notes" if args.apply else "process: staging Obsidian notes",
+                    total=total,
+                )
+                reported = 0
+                return
+            reporter.advance(max(0, processed - reported))
+            reported = processed
+
+        with reporter:
+            with vault_write_lock(paths.state_dir):
+                report = render_raw_views(
+                    store,
+                    root,
+                    config,
+                    apply=args.apply,
+                    progress=update_progress,
+                )
         print(
             f"render: output={report.output_root} written={report.written} comments={report.comments_written} "
             f"skipped={report.skipped} conflicts={report.conflicts}"
@@ -287,18 +400,23 @@ def _reextract(args: argparse.Namespace) -> int:
 
 def _enrich_stars(args: argparse.Namespace) -> int:
     root = find_vault_root(explicit=args.vault)
+    config = load_vault_config(root)
     paths = vault_paths(root)
     if not paths.database_path.exists():
         raise FileNotFoundError(f"Database not found: {paths.database_path}; run feedian sync first.")
     store = VaultStore.open(paths.database_path)
     try:
+        refresh_days = args.refresh_days or int(config.fetch.get("star_refresh_days", 30))
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=max(1, refresh_days))).isoformat()
         pending = int(
             store.connection.execute(
                 """
                 SELECT COUNT(1) FROM comment AS c
                 JOIN comment_revision AS cr ON cr.comment_revision_id = c.current_revision_id
-                WHERE c.provider = 'hatena' AND c.removed_at IS NULL AND cr.star_count IS NULL
-                """
+                WHERE c.provider = 'hatena' AND c.removed_at IS NULL
+                  AND (? OR cr.star_checked_at IS NULL OR cr.star_checked_at < ?)
+                """,
+                (int(args.force), cutoff),
             ).fetchone()[0]
         )
         total = min(pending, args.limit) if args.limit is not None else pending
@@ -306,7 +424,13 @@ def _enrich_stars(args: argparse.Namespace) -> int:
         with reporter:
             reporter.start_task("process: enriching Hatena stars", total=total)
             with vault_write_lock(paths.state_dir):
-                report = enrich_hatena_stars(store, limit=args.limit, progress=lambda _count: reporter.advance())
+                report = enrich_hatena_stars(
+                    store,
+                    limit=args.limit,
+                    refresh_days=refresh_days,
+                    force=args.force,
+                    progress=lambda _count: reporter.advance(),
+                )
         print(
             f"enrich-stars: processed={report.processed} updated={report.updated} unavailable={report.unavailable}"
         )
@@ -361,7 +485,10 @@ def _run_pipeline(args: argparse.Namespace) -> int:
                     sync_report = sync_vault(store, config, source=provider)
                     processed += sync_report.processed
                     failed += sync_report.failed
-                star_report = enrich_hatena_stars(store)
+                star_report = enrich_hatena_stars(
+                    store, refresh_days=int(config.fetch.get("star_refresh_days", 30))
+                )
+                rebuild_search_index(store, paths.search_database_path)
                 render_report = render_raw_views(store, root, config, apply=True)
                 if render_report.conflicts:
                     raise RuntimeError(f"Raw render has {render_report.conflicts} protected file conflict(s).")
@@ -441,3 +568,57 @@ def _ingest(args: argparse.Namespace) -> int:
         return 1 if report.failed else 0
     finally:
         store.close()
+
+
+def _search(args: argparse.Namespace) -> int:
+    root = find_vault_root(explicit=args.vault)
+    paths = vault_paths(root)
+    if not paths.database_path.exists():
+        raise FileNotFoundError(f"Database not found: {paths.database_path}; run feedian sync first.")
+    store = VaultStore.open(paths.database_path)
+    try:
+        if args.action == "status":
+            cached = search_index_generation(paths.search_database_path)
+            current = store.search_generation()
+            print(
+                f"search: path={paths.search_database_path} status="
+                f"{'current' if cached == current else 'stale-or-missing'} source_generation={current} "
+                f"index_generation={cached if cached is not None else '-'}"
+            )
+            return 0
+        with vault_write_lock(paths.state_dir):
+            report = rebuild_search_index(store, paths.search_database_path, force=True)
+        print(
+            f"search: rebuilt={report.rebuilt} sources={report.sources} resources={report.resources} "
+            f"comments={report.comments} path={report.path}"
+        )
+        return 0
+    finally:
+        store.close()
+
+
+def _database_schema_version(path: Path) -> int:
+    connection = sqlite3.connect(path)
+    try:
+        row = connection.execute(
+            "SELECT value FROM schema_meta WHERE key = 'schema_version'"
+        ).fetchone()
+        return int(row[0]) if row is not None else 0
+    except sqlite3.OperationalError:
+        return 0
+    finally:
+        connection.close()
+
+
+def _backup_database(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.unlink(missing_ok=True)
+    source_connection = sqlite3.connect(source)
+    destination_connection = sqlite3.connect(destination)
+    try:
+        source_connection.backup(destination_connection)
+        if str(destination_connection.execute("PRAGMA integrity_check").fetchone()[0]) != "ok":
+            raise RuntimeError("Temporary migration backup integrity check failed.")
+    finally:
+        destination_connection.close()
+        source_connection.close()

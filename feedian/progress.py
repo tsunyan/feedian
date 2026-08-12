@@ -90,13 +90,17 @@ class ProgressReporter:
         *,
         total: int | None = None,
         estimated_total: bool = False,
+        preserve_previous: bool = False,
     ) -> None:
         if self.mode == "off":
             return
         if self.mode == "rich":
             assert self._progress is not None
             if self._rich_task_id is not None:
-                self._progress.remove_task(self._rich_task_id)
+                if preserve_previous:
+                    self._progress.stop_task(self._rich_task_id)
+                else:
+                    self._progress.remove_task(self._rich_task_id)
             self._rich_task_id = self._progress.add_task(
                 description,
                 total=total,
@@ -104,6 +108,8 @@ class ProgressReporter:
             )
             return
         now = time.monotonic()
+        if preserve_previous and self._plain_task is not None:
+            self._write(self._plain_text(self._plain_task))
         self._plain_task = _PlainTask(
             description=description,
             total=total,
@@ -147,6 +153,33 @@ class ProgressReporter:
         if self._plain_task is not None:
             self._plain_task.total = total
             self._plain_task.estimated_total = estimated_total
+
+    def finish_task(self, total: int) -> None:
+        """Finalize the current phase with its actual count before preserving it."""
+        if self.mode == "off":
+            return
+        final_total = max(0, int(total))
+        if self.mode == "rich":
+            if self._progress is not None and self._rich_task_id is not None:
+                self._progress.update(
+                    self._rich_task_id,
+                    completed=final_total,
+                    total=final_total,
+                    estimated_total=False,
+                )
+                self._progress.stop_task(self._rich_task_id)
+            return
+        if self._plain_task is not None:
+            already_complete = (
+                self._plain_task.completed == final_total
+                and self._plain_task.total == final_total
+                and not self._plain_task.estimated_total
+            )
+            self._plain_task.completed = final_total
+            self._plain_task.total = final_total
+            self._plain_task.estimated_total = False
+            if not already_complete:
+                self._write(self._plain_text(self._plain_task))
 
     def log(self, message: str) -> None:
         if self.mode == "off":

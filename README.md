@@ -10,16 +10,20 @@ Feedian reads items through source adapters, converts them to a canonical item, 
 
 ## Vault workflow (new)
 
-The current workflow treats the per-vault SQLite database as the canonical local archive. `raw/` and `source/` are generated Obsidian views; the database keeps source metadata, fetched response bytes, extracted content, public Hatena comments, image bytes, and LLM audit records. The database is local-only during normal use, while a verified `.sqlite3.7z` archive is uploaded as a GitHub Release snapshot.
+The current workflow treats the per-vault SQLite database as the canonical local archive. `raw/` and `source/` are generated Obsidian views. The database keeps the latest source metadata, extracted content, retained non-HTML source bytes such as PDFs, public Hatena comments, image URLs, and operational audit records. HTML is processed in memory and discarded after extraction; page image bytes are not downloaded. Rendered Markdown uses external Obsidian image embeds such as `![alt](<https://example/image.jpg>)`.
+
+Content tables retain only the latest state. Revision-shaped tables remain so history can be added later, but current updates overwrite their one live row. Sync logs, LLM/API usage, and snapshot verification records remain as operational history. Full-text search is rebuilt into `.feedian/cache/search.sqlite3`; this disposable cache is ignored by Git and excluded from snapshots.
 
 This is designed for a **private archive repository** separate from the Feedian application repository. Do not use `snapshot` with a public repository: Feedian checks that the GitHub repository is private and refuses otherwise.
 
-Initialize an existing vault once. This does not rewrite `raw/`: it first stores every existing `raw/**/*.md` file byte-for-byte in `legacy_artifact` inside SQLite.
+Initialize an existing vault once. This does not read or rewrite existing `raw/` files.
 
 ```powershell
 feedian init --vault "D:\GitHub\@" --set-default
 feedian migrate --vault "D:\GitHub\@"
 ```
+
+When an existing schema needs conversion, `migrate` first creates a SQLite-consistent temporary backup, removes old content revisions, stored HTML, downloaded image BLOBs, the obsolete legacy Markdown copy, orphan payloads, and the old in-database FTS index. It also normalizes Hatena comment metadata and retains only the top 20 comments per resource. It then compacts the database and rebuilds the separate search cache. The temporary backup is deleted only after integrity checks succeed.
 
 Then collect source data without using an LLM and inspect the generated staging view:
 
@@ -47,19 +51,29 @@ feedian schedule install --vault "D:\GitHub\@"
 
 `run` performs due provider syncs → raw rendering → a due weekly snapshot; it does not call OpenAI. The default intervals are six hours for RSS and one week for Raindrop/Hatena and snapshots. `schedule install` creates a six-hourly task plus a logon catch-up task. Failed scheduled runs retry every 30 minutes, up to six attempts. Configure the schedule with `feedian schedule install --help`.
 
-Public Hatena comments are stored separately from article content. Feedian derives each comment's public Hatena Star URI, retrieves star totals in batches with Hatena's [official Star API](https://developer.hatena.ne.jp/ja/documents/star/apis/entry/), and sorts rendered comment notes by star count. This enrichment is non-LLM and can also be run independently:
+Public Hatena comments are stored separately from article content. Before downloading comments, Feedian requests bookmark counts in batches with Hatena's [official count API](https://developer.hatena.ne.jp/ja/documents/bookmark/apis/getcount/). It fetches the full comments only for a new resource or when that count changes, retrieves their star totals, and retains the top 20 by star count with older comments winning ties. Every refresh replaces the previous selection, including deleting comments that fall outside the new top 20. Use `sync --force-comments` for an explicit full refresh. There is deliberately no age-based periodic comment refresh.
+
+Feedian derives each comment's public Hatena Star URI when needed rather than storing it, retrieves star totals in batches with Hatena's [official Star API](https://developer.hatena.ne.jp/ja/documents/star/apis/entry/), and sorts rendered comment notes by star count. Star checks have their own 30-day default interval and keep only the latest total. This enrichment is non-LLM and can also be run independently:
 
 ```powershell
 feedian enrich-stars --vault "D:\GitHub\@"
+feedian enrich-stars --vault "D:\GitHub\@" --force
 ```
 
-When extraction logic improves, preserved HTTP bytes can be processed again without downloading the source. For example, re-extract all stored PDFs after upgrading pypdf:
+The local search cache can be inspected or rebuilt independently:
+
+```powershell
+feedian search status --vault "D:\GitHub\@"
+feedian search rebuild --vault "D:\GitHub\@"
+```
+
+Retained non-HTML response bytes can be processed again without downloading the source. For example, re-extract all stored PDFs after upgrading pypdf. HTML must be fetched again because only its extracted text is retained:
 
 ```powershell
 feedian reextract --vault "D:\GitHub\@" --media-type application/pdf
 ```
 
-For snapshots install [GitHub CLI](https://cli.github.com/) and [7-Zip](https://www.7-zip.org/), authenticate `gh`, and make sure the vault has a private GitHub `origin`. Feedian creates an SQLite-consistent backup, archives it, uploads it to a tag-linked Release, downloads it again, and verifies SHA-256, archive integrity, and SQLite integrity before removing its temporary local archive. `config.json` and `.feedian/snapshot.json` are intended for Git; `.feedian/feedian.sqlite3`, its WAL files, assets, logs, and temporary archives are ignored.
+For snapshots install [GitHub CLI](https://cli.github.com/) and [7-Zip](https://www.7-zip.org/), authenticate `gh`, and make sure the vault has a private GitHub `origin`. Feedian creates an SQLite-consistent backup, archives it, uploads it to a tag-linked Release, downloads it again, and verifies SHA-256, archive integrity, and SQLite integrity before removing its temporary local archive. `config.json` and `.feedian/snapshot.json` are intended for Git; `.feedian/feedian.sqlite3`, its WAL files, `.feedian/cache/`, logs, staging, and temporary archives are ignored.
 
 ## Requirements
 

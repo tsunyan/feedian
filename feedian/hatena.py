@@ -25,6 +25,7 @@ from .retry import run_with_retries
 
 SEARCH_API_URL = "https://b.hatena.ne.jp/my/search/json"
 ENTRY_INFO_API_URL = "https://b.hatena.ne.jp/entry/jsonlite/"
+ENTRY_COUNT_API_URL = "https://bookmark.hatenaapis.com/count/entries"
 STAR_ENTRY_API_URL = "https://s.hatena.ne.jp/entry.json"
 # The search API requires a non-empty full-text query. Searching both URL
 # schemes covers the HTTP(S) bookmark URLs Feedian can turn into web notes.
@@ -37,7 +38,7 @@ class HatenaPublicComment:
     comment: str
     tags: list[str] = field(default_factory=list)
     timestamp: str = ""
-    star_url: str = ""
+    star_count: int | None = None
 
 
 @dataclass(frozen=True)
@@ -91,11 +92,6 @@ def fetch_hatena_entry_discussion(
                     comment=comment,
                     tags=tags,
                     timestamp=str(raw.get("timestamp") or "").strip(),
-                    star_url=_hatena_comment_star_url(
-                        str(raw.get("user") or "").strip(),
-                        str(raw.get("timestamp") or "").strip(),
-                        entry_id,
-                    ),
                 )
             )
     count = data.get("count")
@@ -105,6 +101,50 @@ def fetch_hatena_entry_discussion(
         entry_id=entry_id,
         comments=comments,
     )
+
+
+def fetch_hatena_bookmark_counts(
+    urls: list[str],
+    *,
+    timeout_seconds: int = 30,
+    batch_size: int = 50,
+    workers: int = 4,
+    max_retries: int = 3,
+    retry_base_seconds: float = 1.0,
+) -> dict[str, int]:
+    """Fetch only public bookmark counts, at most 50 URLs per official API request."""
+    unique_urls = list(dict.fromkeys(url for url in urls if url))
+    counts = {url: 0 for url in unique_urls}
+    size = max(1, min(50, batch_size))
+    batches = [unique_urls[offset : offset + size] for offset in range(0, len(unique_urls), size)]
+
+    def fetch_batch(batch: list[str]) -> dict[str, Any]:
+        request = Request(
+            f"{ENTRY_COUNT_API_URL}?{urlencode([('url', url) for url in batch])}",
+            headers={
+                "Accept": "application/json",
+                "User-Agent": "feedian/0.1 (+https://github.com/tsunyan/feedian)",
+            },
+            method="GET",
+        )
+        return run_with_retries(
+            lambda: _read_entry_json(request, timeout_seconds),
+            max_retries=max_retries,
+            retry_base_seconds=retry_base_seconds,
+        )
+
+    worker_count = max(1, min(len(batches) or 1, workers))
+    try:
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="feedian-comment-counts") as executor:
+            for data in executor.map(fetch_batch, batches):
+                for url, value in data.items():
+                    if url in counts and isinstance(value, int) and value >= 0:
+                        counts[url] = value
+    except HTTPError as exc:
+        raise RuntimeError(f"Hatena bookmark count API HTTP {exc.code}") from exc
+    except URLError as exc:
+        raise RuntimeError(f"Hatena bookmark count API network error: {exc.reason}") from exc
+    return counts
 
 
 def fetch_hatena_star_counts(
@@ -147,7 +187,7 @@ def fetch_hatena_star_counts(
     return counts
 
 
-def _hatena_comment_star_url(user: str, timestamp: str, entry_id: str) -> str:
+def hatena_comment_star_url(user: str, timestamp: str, entry_id: str) -> str:
     date = "".join(character for character in timestamp[:10] if character.isdigit())
     if not user or len(date) != 8 or not entry_id:
         return ""

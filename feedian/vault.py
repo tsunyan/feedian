@@ -38,8 +38,8 @@ class VaultConfig:
             "html_max_bytes": 10 * 1024 * 1024,
             "document_max_bytes": 100 * 1024 * 1024,
             "refresh_days": 30,
-            "asset_workers": 6,
             "comment_workers": 8,
+            "star_refresh_days": 30,
             "allow_private_hosts": [],
         }
     )
@@ -57,10 +57,10 @@ class VaultPaths:
     config_path: Path
     state_dir: Path
     database_path: Path
+    search_database_path: Path
     raw_dir: Path
     source_dir: Path
     review_dir: Path
-    assets_dir: Path
     logs_dir: Path
 
 
@@ -72,10 +72,10 @@ def vault_paths(root: str | Path) -> VaultPaths:
         config_path=resolved_root / VAULT_CONFIG_RELATIVE_PATH,
         state_dir=state_dir,
         database_path=state_dir / VAULT_DATABASE_NAME,
+        search_database_path=state_dir / "cache" / "search.sqlite3",
         raw_dir=resolved_root / "raw",
         source_dir=resolved_root / "source",
         review_dir=resolved_root / "review",
-        assets_dir=resolved_root / "raw" / "assets",
         logs_dir=state_dir / "logs",
     )
 
@@ -148,6 +148,7 @@ def initialize_vault(root: str | Path) -> VaultPaths:
         "feedian.sqlite3-shm\n"
         "feedian.sqlite3-wal\n"
         "feedian.lock\n"
+        "cache/\n"
         "logs/\n"
         "staging/\n"
         "tmp/\n"

@@ -47,6 +47,48 @@ class ProgressReporterTests(unittest.TestCase):
 
         self.assertIn("50/~3163", stream.getvalue())
 
+    def test_rich_mode_can_preserve_a_completed_phase(self) -> None:
+        stream = io.StringIO()
+        reporter = ProgressReporter("rich", stream=stream)
+
+        with reporter:
+            reporter.start_task("process: collecting bookmarks", total=100)
+            reporter.advance(100)
+            reporter.start_task("process: syncing items", total=100, preserve_previous=True)
+            reporter.advance(100)
+
+        output = stream.getvalue()
+        self.assertIn("process: collecting bookmarks", output)
+        self.assertIn("process: syncing items", output)
+        self.assertIn("100/100", output)
+
+    def test_plain_mode_prints_the_previous_phase_at_transition(self) -> None:
+        stream = io.StringIO()
+        reporter = ProgressReporter("plain", stream=stream, plain_interval_seconds=60)
+
+        with reporter:
+            reporter.start_task("process: collecting bookmarks", total=100)
+            reporter.advance(50)
+            reporter.start_task("process: syncing items", total=100, preserve_previous=True)
+
+        output = stream.getvalue()
+        self.assertIn("process: collecting bookmarks 50/100", output)
+        self.assertIn("process: syncing items 0/100", output)
+
+    def test_finish_task_replaces_an_estimate_with_the_actual_total(self) -> None:
+        stream = io.StringIO()
+        reporter = ProgressReporter("rich", stream=stream)
+
+        with reporter:
+            reporter.start_task("process: syncing items", total=110, estimated_total=True)
+            reporter.advance(100)
+            reporter.finish_task(100)
+
+        output = stream.getvalue()
+        self.assertIn("100%", output)
+        self.assertIn("100/100", output)
+        self.assertNotIn("100/~110", output.splitlines()[-1])
+
 
 if __name__ == "__main__":
     unittest.main()

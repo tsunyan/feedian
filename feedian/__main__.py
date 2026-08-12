@@ -14,6 +14,7 @@ from typing import Any, Callable, Iterable, Iterator, TypeVar
 
 from .canonical import canonical_item_from_metadata
 from .cli import is_modern_command, main as modern_main
+from .cli_ui import print_cli_error
 from .config import Config, load_config
 from .estimate import (
     ModelPrice,
@@ -1521,7 +1522,7 @@ def main(argv: list[str] | None = None) -> int:
                 return sync_raindrop_tags(config, args, client, reporter)
             return process_bookmarks(config, args, reporter)
     except Exception as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        print_cli_error(exc)
         return 1
 
 

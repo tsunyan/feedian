@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-import json
-from collections import defaultdict
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Callable
 
-from .hatena import fetch_hatena_star_counts
+from .hatena import fetch_hatena_star_counts, hatena_comment_star_url
 from .store import VaultStore
 
 
@@ -17,16 +16,26 @@ class StarEnrichmentReport:
 
 
 def enrich_hatena_stars(
-    store: VaultStore, *, limit: int | None = None, progress: Callable[[int], None] | None = None
+    store: VaultStore,
+    *,
+    limit: int | None = None,
+    refresh_days: int = 30,
+    force: bool = False,
+    progress: Callable[[int], None] | None = None,
 ) -> StarEnrichmentReport:
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=max(1, refresh_days))).isoformat()
     rows = store.connection.execute(
         """
-        SELECT c.provider, c.resource_id, c.author, cr.body, cr.tags_json, cr.metadata_json
+        SELECT c.comment_id, c.author, cr.posted_at, rcs.entry_id
         FROM comment AS c
         JOIN comment_revision AS cr ON cr.comment_revision_id = c.current_revision_id
-        WHERE c.provider = 'hatena' AND c.removed_at IS NULL AND cr.star_count IS NULL
+        JOIN resource_comment_state AS rcs
+          ON rcs.provider = c.provider AND rcs.resource_id = c.resource_id
+        WHERE c.provider = 'hatena' AND c.removed_at IS NULL
+          AND (? OR cr.star_checked_at IS NULL OR cr.star_checked_at < ?)
         ORDER BY c.created_at, c.comment_id
-        """
+        """,
+        (int(force), cutoff),
     ).fetchall()
     if limit is not None:
         rows = rows[:limit]
@@ -34,34 +43,23 @@ def enrich_hatena_stars(
     processed = 0
     for offset in range(0, len(rows), 500):
         batch = rows[offset : offset + 500]
-        star_urls = [str(json.loads(str(row["metadata_json"])).get("star_url") or "") for row in batch]
+        star_urls = [
+            hatena_comment_star_url(
+                str(row["author"]), str(row["posted_at"]), str(row["entry_id"])
+            )
+            for row in batch
+        ]
         counts = fetch_hatena_star_counts(star_urls)
-        updates: dict[tuple[str, str], list[dict[str, object]]] = defaultdict(list)
+        updates: dict[str, int | None] = {}
         for row, star_url in zip(batch, star_urls):
-            metadata = json.loads(str(row["metadata_json"]))
             if not star_url or star_url not in counts:
                 unavailable += 1
+                updates[str(row["comment_id"])] = None
             else:
-                key = (str(row["provider"]), str(row["resource_id"]))
-                updates[key].append(
-                    {
-                        "author": str(row["author"]),
-                        "body": str(row["body"]),
-                        "tags": [str(tag) for tag in json.loads(str(row["tags_json"]))],
-                        "star_count": counts[star_url],
-                        "metadata": metadata,
-                    }
-                )
+                updates[str(row["comment_id"])] = counts[star_url]
                 updated += 1
             processed += 1
             if progress is not None:
                 progress(processed)
-        for (provider, resource_id), comments in updates.items():
-            # Star enrichment changes ranking metadata, not searchable text.
-            store.upsert_comments(
-                provider=provider,
-                resource_id=resource_id,
-                comments=comments,
-                refresh_fts=False,
-            )
+        store.update_comment_star_counts(updates)
     return StarEnrichmentReport(len(rows), updated, unavailable)

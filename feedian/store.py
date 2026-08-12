@@ -13,7 +13,7 @@ from .canonical import CanonicalItem, canonicalize_url
 from .ids import uuid7
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 4
 
 
 def utc_now() -> str:
@@ -26,6 +26,22 @@ def sha256_bytes(value: bytes) -> str:
 
 def stable_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _comment_content_hash(
+    *, body: str, tags_json: str, star_count: int | None, posted_at: str, metadata_json: str
+) -> str:
+    return sha256_bytes(
+        stable_json(
+            {
+                "body": body,
+                "tags": tags_json,
+                "star_count": star_count,
+                "posted_at": posted_at,
+                "metadata": metadata_json,
+            }
+        ).encode("utf-8")
+    )
 
 
 @dataclass(frozen=True)
@@ -44,7 +60,7 @@ class VaultStore:
         self.path = path
 
     @classmethod
-    def open(cls, path: str | Path) -> "VaultStore":
+    def open(cls, path: str | Path, *, allow_migration: bool = False) -> "VaultStore":
         database_path = Path(path)
         database_path.parent.mkdir(parents=True, exist_ok=True)
         connection = sqlite3.connect(database_path)
@@ -54,7 +70,11 @@ class VaultStore:
         connection.execute("PRAGMA foreign_keys=ON")
         connection.execute("PRAGMA busy_timeout=5000")
         store = cls(connection, database_path)
-        store.migrate()
+        try:
+            store.migrate(allow_migration=allow_migration)
+        except BaseException:
+            connection.close()
+            raise
         return store
 
     def close(self) -> None:
@@ -71,7 +91,7 @@ class VaultStore:
         else:
             self.connection.commit()
 
-    def migrate(self) -> None:
+    def migrate(self, *, allow_migration: bool = False) -> None:
         self.connection.execute("CREATE TABLE IF NOT EXISTS schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
         row = self.connection.execute("SELECT value FROM schema_meta WHERE key = 'schema_version'").fetchone()
         current = int(row["value"]) if row is not None else 0
@@ -88,8 +108,46 @@ class VaultStore:
                 )
                 connection.execute("INSERT INTO schema_meta(key, value) VALUES ('vault_id', ?)", (uuid7(),))
                 connection.execute("INSERT INTO schema_meta(key, value) VALUES ('created_at', ?)", (utc_now(),))
+                connection.execute("INSERT INTO schema_meta(key, value) VALUES ('search_generation', '0')")
         elif current < SCHEMA_VERSION:
-            raise RuntimeError("Database migration is required; run `feedian migrate --vault ...`.")
+            if not allow_migration:
+                raise RuntimeError("Database migration is required; run `feedian migrate --vault ...`.")
+            self._migrate_schema(current)
+
+    def _migrate_schema(self, current: int) -> None:
+        while current < SCHEMA_VERSION:
+            if current == 1:
+                _migrate_v1_to_v2(self.connection)
+                current = 2
+                continue
+            if current == 2:
+                _migrate_v2_to_v3(self.connection)
+                current = 3
+                continue
+            if current == 3:
+                _migrate_v3_to_v4(self.connection)
+                current = 4
+                continue
+            raise RuntimeError(f"No migration path from database schema {current}.")
+
+    def compact(self) -> None:
+        self.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        self.connection.execute("VACUUM")
+
+    def search_generation(self) -> int:
+        row = self.connection.execute(
+            "SELECT value FROM schema_meta WHERE key = 'search_generation'"
+        ).fetchone()
+        return int(row["value"]) if row is not None else 0
+
+    @staticmethod
+    def _mark_search_dirty(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            INSERT INTO schema_meta(key, value) VALUES ('search_generation', '1')
+            ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)
+            """
+        )
 
     def schema_version(self) -> int:
         row = self.connection.execute("SELECT value FROM schema_meta WHERE key = 'schema_version'").fetchone()
@@ -114,29 +172,48 @@ class VaultStore:
         source_url: str = "",
         headers: dict[str, str] | None = None,
     ) -> str:
+        with self.transaction() as connection:
+            return self._put_payload(
+                connection,
+                content,
+                media_type=media_type,
+                charset=charset,
+                source_url=source_url,
+                headers=headers,
+            )
+
+    def _put_payload(
+        self,
+        connection: sqlite3.Connection,
+        content: bytes,
+        *,
+        media_type: str,
+        charset: str = "",
+        source_url: str = "",
+        headers: dict[str, str] | None = None,
+    ) -> str:
         digest = sha256_bytes(content)
-        row = self.connection.execute("SELECT payload_id FROM payload WHERE sha256 = ?", (digest,)).fetchone()
+        row = connection.execute("SELECT payload_id FROM payload WHERE sha256 = ?", (digest,)).fetchone()
         if row is not None:
             return str(row["payload_id"])
         payload_id = uuid7()
-        with self.transaction() as connection:
-            connection.execute(
-                """
-                INSERT INTO payload(payload_id, sha256, content, media_type, charset, source_url, headers_json, byte_length, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    payload_id,
-                    digest,
-                    content,
-                    media_type,
-                    charset,
-                    source_url,
-                    stable_json(headers or {}),
-                    len(content),
-                    utc_now(),
-                ),
-            )
+        connection.execute(
+            """
+            INSERT INTO payload(payload_id, sha256, content, media_type, charset, source_url, headers_json, byte_length, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                payload_id,
+                digest,
+                content,
+                media_type,
+                charset,
+                source_url,
+                stable_json(headers or {}),
+                len(content),
+                utc_now(),
+            ),
+        )
         return payload_id
 
     def upsert_canonical_item(
@@ -148,11 +225,6 @@ class VaultStore:
         source_media_type: str = "application/json",
     ) -> StoredItem:
         metadata = item.as_bookmark_metadata()
-        payload_id = (
-            self.put_payload(source_payload, media_type=source_media_type)
-            if source_payload is not None
-            else None
-        )
         metadata_json = stable_json(metadata)
         metadata_hash = sha256_bytes(metadata_json.encode("utf-8"))
         now = utc_now()
@@ -178,32 +250,63 @@ class VaultStore:
             else:
                 source_item_id = str(source_row["source_item_id"])
                 previous_hash_row = connection.execute(
-                    "SELECT metadata_hash FROM source_item_revision WHERE source_revision_id = ?",
+                    """
+                    SELECT sr.metadata_hash, p.sha256 AS payload_sha256
+                    FROM source_item_revision AS sr
+                    LEFT JOIN payload AS p ON p.payload_id = sr.payload_id
+                    WHERE sr.source_revision_id = ?
+                    """,
                     (source_row["current_revision_id"],),
                 ).fetchone()
                 previous_hash = str(previous_hash_row["metadata_hash"]) if previous_hash_row else None
+                previous_payload_hash = (
+                    str(previous_hash_row["payload_sha256"])
+                    if previous_hash_row is not None and previous_hash_row["payload_sha256"]
+                    else None
+                )
                 connection.execute(
                     "UPDATE source_item SET resource_id = ?, updated_at = ?, removed_at = NULL WHERE source_item_id = ?",
                     (resource_id, now, source_item_id),
                 )
-            changed = metadata_hash != previous_hash
+            if source_row is None:
+                previous_payload_hash = None
+            payload_hash = sha256_bytes(source_payload) if source_payload is not None else previous_payload_hash
+            changed = metadata_hash != previous_hash or payload_hash != previous_payload_hash
             if changed:
-                source_revision_id = uuid7()
-                connection.execute(
-                    """
-                    INSERT INTO source_item_revision(
-                        source_revision_id, source_item_id, metadata_json, metadata_hash, payload_id, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (source_revision_id, source_item_id, metadata_json, metadata_hash, payload_id, now),
+                payload_id = (
+                    self._put_payload(connection, source_payload, media_type=source_media_type)
+                    if source_payload is not None
+                    else None
                 )
-                connection.execute(
-                    "UPDATE source_item SET current_revision_id = ? WHERE source_item_id = ?",
-                    (source_revision_id, source_item_id),
-                )
+                if source_row is None or not source_row["current_revision_id"]:
+                    source_revision_id = uuid7()
+                    connection.execute(
+                        """
+                        INSERT INTO source_item_revision(
+                            source_revision_id, source_item_id, metadata_json, metadata_hash, payload_id, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (source_revision_id, source_item_id, metadata_json, metadata_hash, payload_id, now),
+                    )
+                    connection.execute(
+                        "UPDATE source_item SET current_revision_id = ? WHERE source_item_id = ?",
+                        (source_revision_id, source_item_id),
+                    )
+                else:
+                    source_revision_id = str(source_row["current_revision_id"])
+                    connection.execute(
+                        """
+                        UPDATE source_item_revision
+                        SET metadata_json = ?, metadata_hash = ?, payload_id = ?, created_at = ?
+                        WHERE source_revision_id = ?
+                        """,
+                        (metadata_json, metadata_hash, payload_id, now, source_revision_id),
+                    )
+                self._mark_search_dirty(connection)
             else:
                 source_revision_id = str(source_row["current_revision_id"])
-        self._refresh_source_fts(source_item_id, item)
+        if changed:
+            self.delete_orphan_payloads()
         return StoredItem(source_item_id, resource_id, source_revision_id, changed)
 
     def record_resource_revision(
@@ -221,7 +324,9 @@ class VaultStore:
         warning: str | None = None,
     ) -> tuple[str, bool]:
         content_hash = sha256_bytes(
-            stable_json({"content_markdown": content_markdown, "discussion_text": discussion_text}).encode("utf-8")
+            stable_json(
+                {"title": title, "content_markdown": content_markdown, "discussion_text": discussion_text}
+            ).encode("utf-8")
         )
         now = utc_now()
         with self.transaction() as connection:
@@ -236,41 +341,63 @@ class VaultStore:
                 if current_id
                 else None
             )
-            if current_hash_row is not None and current_hash_row["content_hash"] == content_hash:
+            changed = current_hash_row is None or current_hash_row["content_hash"] != content_hash
+            if current_id:
                 revision_id = str(current_id)
+                if changed:
+                    connection.execute(
+                        """
+                        UPDATE resource_revision
+                        SET title = ?, content_markdown = ?, discussion_text = ?, content_hash = ?, created_at = ?
+                        WHERE resource_revision_id = ?
+                        """,
+                        (title, content_markdown, discussion_text, content_hash, now, revision_id),
+                    )
+            else:
+                revision_id = uuid7()
                 connection.execute(
                     """
-                    INSERT INTO fetch_capture(fetch_capture_id, resource_id, resource_revision_id, http_payload_id, rendered_payload_id,
-                                              final_url, extracted_by, content_truncated, warning, fetched_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO resource_revision(resource_revision_id, resource_id, title, content_markdown,
+                                                  discussion_text, content_hash, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (uuid7(), resource_id, revision_id, http_payload_id, rendered_payload_id, final_url, extracted_by,
-                     int(content_truncated), warning, now),
+                    (revision_id, resource_id, title, content_markdown, discussion_text, content_hash, now),
                 )
-                return revision_id, False
-            revision_id = uuid7()
-            connection.execute(
-                """
-                INSERT INTO resource_revision(resource_revision_id, resource_id, title, content_markdown, discussion_text, content_hash, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (revision_id, resource_id, title, content_markdown, discussion_text, content_hash, now),
-            )
+                changed = True
             connection.execute(
                 "UPDATE resource SET current_revision_id = ?, updated_at = ? WHERE resource_id = ?",
                 (revision_id, now, resource_id),
             )
-            connection.execute(
-                """
-                INSERT INTO fetch_capture(fetch_capture_id, resource_id, resource_revision_id, http_payload_id, rendered_payload_id,
-                                          final_url, extracted_by, content_truncated, warning, fetched_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (uuid7(), resource_id, revision_id, http_payload_id, rendered_payload_id, final_url, extracted_by,
-                 int(content_truncated), warning, now),
-            )
-        self._refresh_resource_fts(resource_id, title, content_markdown)
-        return revision_id, True
+            capture = connection.execute(
+                "SELECT fetch_capture_id FROM fetch_capture WHERE resource_id = ? ORDER BY fetched_at DESC LIMIT 1",
+                (resource_id,),
+            ).fetchone()
+            if capture is None:
+                connection.execute(
+                    """
+                    INSERT INTO fetch_capture(fetch_capture_id, resource_id, resource_revision_id, http_payload_id,
+                                              rendered_payload_id, final_url, extracted_by, content_truncated,
+                                              warning, fetched_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (uuid7(), resource_id, revision_id, http_payload_id, rendered_payload_id, final_url,
+                     extracted_by, int(content_truncated), warning, now),
+                )
+            else:
+                connection.execute(
+                    """
+                    UPDATE fetch_capture
+                    SET resource_revision_id = ?, http_payload_id = ?, rendered_payload_id = ?, final_url = ?,
+                        extracted_by = ?, content_truncated = ?, warning = ?, fetched_at = ?
+                    WHERE fetch_capture_id = ?
+                    """,
+                    (revision_id, http_payload_id, rendered_payload_id, final_url, extracted_by,
+                     int(content_truncated), warning, now, capture["fetch_capture_id"]),
+                )
+            if changed:
+                self._mark_search_dirty(connection)
+        self.delete_orphan_payloads()
+        return revision_id, changed
 
     def upsert_comment(
         self,
@@ -281,68 +408,24 @@ class VaultStore:
         body: str,
         tags: list[str] | None = None,
         star_count: int | None = None,
+        posted_at: str = "",
         metadata: dict[str, Any] | None = None,
     ) -> tuple[str, bool]:
-        if not author:
-            raise ValueError("Comment author must not be empty.")
-        existing = self.connection.execute(
-            """
-            SELECT c.comment_id, c.removed_at, cr.star_count, cr.content_hash
-            FROM comment AS c
-            LEFT JOIN comment_revision AS cr ON cr.comment_revision_id = c.current_revision_id
-            WHERE c.provider = ? AND c.resource_id = ? AND c.author = ?
-            """,
-            (provider, resource_id, author),
-        ).fetchone()
-        if star_count is None:
-            if existing is not None and existing["star_count"] is not None:
-                star_count = int(existing["star_count"])
-        tags_json = stable_json(tags or [])
-        metadata_json = stable_json(metadata or {})
-        content_hash = sha256_bytes(
-            stable_json({"body": body, "tags": tags_json, "star_count": star_count, "metadata": metadata_json}).encode("utf-8")
+        results = self.upsert_comments(
+            provider=provider,
+            resource_id=resource_id,
+            comments=[
+                {
+                    "author": author,
+                    "body": body,
+                    "tags": tags or [],
+                    "star_count": star_count,
+                    "posted_at": posted_at,
+                    "metadata": metadata or {},
+                }
+            ],
         )
-        if existing is not None and existing["removed_at"] is None and existing["content_hash"] == content_hash:
-            return str(existing["comment_id"]), False
-        now = utc_now()
-        with self.transaction() as connection:
-            row = connection.execute(
-                "SELECT comment_id, current_revision_id FROM comment WHERE provider = ? AND resource_id = ? AND author = ?",
-                (provider, resource_id, author),
-            ).fetchone()
-            if row is None:
-                comment_id = uuid7()
-                connection.execute(
-                    """
-                    INSERT INTO comment(comment_id, provider, resource_id, author, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (comment_id, provider, resource_id, author, now, now),
-                )
-                current_hash = None
-            else:
-                comment_id = str(row["comment_id"])
-                current_hash_row = connection.execute(
-                    "SELECT content_hash FROM comment_revision WHERE comment_revision_id = ?",
-                    (row["current_revision_id"],),
-                ).fetchone()
-                current_hash = str(current_hash_row["content_hash"]) if current_hash_row else None
-                connection.execute(
-                    "UPDATE comment SET updated_at = ?, removed_at = NULL WHERE comment_id = ?", (now, comment_id)
-                )
-            changed = current_hash != content_hash
-            if changed:
-                revision_id = uuid7()
-                connection.execute(
-                    """
-                    INSERT INTO comment_revision(comment_revision_id, comment_id, body, tags_json, star_count, metadata_json, content_hash, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (revision_id, comment_id, body, tags_json, star_count, metadata_json, content_hash, now),
-                )
-                connection.execute("UPDATE comment SET current_revision_id = ? WHERE comment_id = ?", (revision_id, comment_id))
-        self._refresh_comment_fts(comment_id, body, " ".join(tags or []))
-        return comment_id, changed
+        return results[0]
 
     def upsert_comments(
         self,
@@ -350,11 +433,9 @@ class VaultStore:
         provider: str,
         resource_id: str,
         comments: list[dict[str, Any]],
-        refresh_fts: bool = True,
+        replace: bool = False,
     ) -> list[tuple[str, bool]]:
         """Upsert one resource's comments in a single durable transaction."""
-        if not comments:
-            return []
         if any(not str(comment.get("author") or "") for comment in comments):
             raise ValueError("Comment author must not be empty.")
 
@@ -369,12 +450,13 @@ class VaultStore:
         ).fetchall()
         existing_by_author = {str(row["author"]): row for row in existing_rows}
         results: list[tuple[str, bool] | None] = [None] * len(comments)
-        pending: list[tuple[int, str, str, str, int | None, str, str, sqlite3.Row | None]] = []
+        pending: list[tuple[int, str, str, str, int | None, str, str, str, sqlite3.Row | None]] = []
 
         for index, comment in enumerate(comments):
             author = str(comment.get("author") or "")
             body = str(comment.get("body") or "")
             tags = [str(tag) for tag in (comment.get("tags") or [])]
+            posted_at = str(comment.get("posted_at") or "")
             metadata = dict(comment.get("metadata") or {})
             existing = existing_by_author.get(author)
             star_count = comment.get("star_count")
@@ -384,15 +466,12 @@ class VaultStore:
                 star_count = int(star_count)
             tags_json = stable_json(tags)
             metadata_json = stable_json(metadata)
-            content_hash = sha256_bytes(
-                stable_json(
-                    {
-                        "body": body,
-                        "tags": tags_json,
-                        "star_count": star_count,
-                        "metadata": metadata_json,
-                    }
-                ).encode("utf-8")
+            content_hash = _comment_content_hash(
+                body=body,
+                tags_json=tags_json,
+                star_count=star_count,
+                posted_at=posted_at,
+                metadata_json=metadata_json,
             )
             if (
                 existing is not None
@@ -402,15 +481,16 @@ class VaultStore:
                 results[index] = (str(existing["comment_id"]), False)
                 continue
             pending.append(
-                (index, author, body, tags_json, star_count, metadata_json, content_hash, existing)
+                (index, author, body, tags_json, star_count, posted_at, metadata_json, content_hash, existing)
             )
 
-        if not pending:
+        if not pending and not replace:
             return [result for result in results if result is not None]
 
         now = utc_now()
+        any_changed = False
         with self.transaction() as connection:
-            for index, author, body, tags_json, star_count, metadata_json, content_hash, existing in pending:
+            for index, author, body, tags_json, star_count, posted_at, metadata_json, content_hash, existing in pending:
                 if existing is None:
                     comment_id = uuid7()
                     current_hash = None
@@ -430,29 +510,58 @@ class VaultStore:
                     )
                 changed = current_hash != content_hash
                 if changed:
-                    revision_id = uuid7()
-                    connection.execute(
-                        """
-                        INSERT INTO comment_revision(comment_revision_id, comment_id, body, tags_json, star_count,
-                                                     metadata_json, content_hash, created_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (revision_id, comment_id, body, tags_json, star_count, metadata_json, content_hash, now),
-                    )
-                    connection.execute(
-                        "UPDATE comment SET current_revision_id = ? WHERE comment_id = ?",
-                        (revision_id, comment_id),
-                    )
-                if refresh_fts:
-                    try:
-                        connection.execute("DELETE FROM comment_fts WHERE comment_id = ?", (comment_id,))
+                    if existing is not None and existing["comment_id"]:
+                        revision_row = connection.execute(
+                            "SELECT current_revision_id FROM comment WHERE comment_id = ?", (comment_id,)
+                        ).fetchone()
+                    else:
+                        revision_row = None
+                    current_revision_id = revision_row["current_revision_id"] if revision_row else None
+                    if current_revision_id:
                         connection.execute(
-                            "INSERT INTO comment_fts(comment_id, body, tags) VALUES (?, ?, ?)",
-                            (comment_id, body, " ".join(json.loads(tags_json))),
+                            """
+                            UPDATE comment_revision
+                            SET body = ?, tags_json = ?, star_count = ?, posted_at = ?, metadata_json = ?,
+                                content_hash = ?, created_at = ?
+                            WHERE comment_revision_id = ?
+                            """,
+                            (body, tags_json, star_count, posted_at, metadata_json, content_hash, now, current_revision_id),
                         )
-                    except sqlite3.OperationalError:
-                        pass
+                    else:
+                        revision_id = uuid7()
+                        connection.execute(
+                            """
+                            INSERT INTO comment_revision(comment_revision_id, comment_id, body, tags_json, star_count,
+                                                         posted_at, metadata_json, content_hash, created_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (revision_id, comment_id, body, tags_json, star_count, posted_at, metadata_json, content_hash, now),
+                        )
+                        connection.execute(
+                            "UPDATE comment SET current_revision_id = ? WHERE comment_id = ?",
+                            (revision_id, comment_id),
+                        )
+                    any_changed = True
                 results[index] = (comment_id, changed)
+            if replace:
+                keep_authors = {str(comment.get("author") or "") for comment in comments}
+                stale_ids = [
+                    str(row["comment_id"])
+                    for row in existing_rows
+                    if str(row["author"]) not in keep_authors
+                ]
+                if stale_ids:
+                    connection.executemany(
+                        "DELETE FROM comment_revision WHERE comment_id = ?",
+                        [(comment_id,) for comment_id in stale_ids],
+                    )
+                    connection.executemany(
+                        "DELETE FROM comment WHERE comment_id = ?",
+                        [(comment_id,) for comment_id in stale_ids],
+                    )
+                    any_changed = True
+            if any_changed:
+                self._mark_search_dirty(connection)
         return [result for result in results if result is not None]
 
     def create_sync_run(self, providers: list[str], settings_fingerprint: str) -> str:
@@ -504,8 +613,9 @@ class VaultStore:
 
     def status_counts(self) -> dict[str, int]:
         tables = (
-            "resource", "resource_revision", "source_item", "source_item_revision", "comment", "asset", "payload",
-            "legacy_artifact", "llm_run", "source_note", "snapshot",
+            "resource", "resource_revision", "source_item", "source_item_revision", "comment",
+            "resource_image", "payload",
+            "llm_run", "source_note", "snapshot",
         )
         return {table: int(self.connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]) for table in tables}
 
@@ -527,15 +637,23 @@ class VaultStore:
             return True
         latest = self.connection.execute(
             """
-            SELECT fetched_at, warning, http_payload_id, rendered_payload_id
-            FROM fetch_capture WHERE resource_id = ? ORDER BY fetched_at DESC LIMIT 1
+            SELECT fc.fetched_at, fc.warning, fc.http_payload_id, fc.rendered_payload_id,
+                   length(trim(coalesce(rr.content_markdown, ''))) AS content_length
+            FROM fetch_capture AS fc
+            LEFT JOIN resource_revision AS rr ON rr.resource_revision_id = fc.resource_revision_id
+            WHERE fc.resource_id = ? ORDER BY fc.fetched_at DESC LIMIT 1
             """,
             (resource_id,),
         ).fetchone()
         if latest is None:
             return True
         fetched_at = datetime.fromisoformat(str(latest["fetched_at"]).replace("Z", "+00:00"))
-        if latest["warning"] and not latest["http_payload_id"] and not latest["rendered_payload_id"]:
+        if (
+            latest["warning"]
+            and not latest["http_payload_id"]
+            and not latest["rendered_payload_id"]
+            and int(latest["content_length"] or 0) == 0
+        ):
             return datetime.now(timezone.utc) - fetched_at >= timedelta(minutes=30)
         return datetime.now(timezone.utc) - fetched_at >= timedelta(days=max(1, refresh_days))
 
@@ -633,87 +751,159 @@ class VaultStore:
         ).fetchone()
         if current is not None and current["markdown_hash"] == markdown_hash:
             return str(current["source_note_id"])
-        note_id = uuid7()
         now = utc_now()
         with self.transaction() as connection:
             if current is not None:
-                connection.execute("UPDATE source_note SET superseded_at = ? WHERE source_note_id = ?", (now, current["source_note_id"]))
-            connection.execute(
-                """
-                INSERT INTO source_note(source_note_id, resource_id, llm_run_id, markdown, markdown_hash, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (note_id, resource_id, llm_run_id, markdown, markdown_hash, now),
-            )
+                note_id = str(current["source_note_id"])
+                connection.execute(
+                    """
+                    UPDATE source_note
+                    SET llm_run_id = ?, markdown = ?, markdown_hash = ?, created_at = ?, superseded_at = NULL
+                    WHERE source_note_id = ?
+                    """,
+                    (llm_run_id, markdown, markdown_hash, now, note_id),
+                )
+            else:
+                note_id = uuid7()
+                connection.execute(
+                    """
+                    INSERT INTO source_note(source_note_id, resource_id, llm_run_id, markdown, markdown_hash, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (note_id, resource_id, llm_run_id, markdown, markdown_hash, now),
+                )
         return note_id
 
-    def put_asset(
+    def replace_resource_images(
         self,
         *,
         resource_id: str,
         resource_revision_id: str,
-        content: bytes,
-        media_type: str,
-        source_url: str,
-        alt_text: str = "",
-        headers: dict[str, str] | None = None,
-    ) -> str:
-        payload_id = self.put_payload(
-            content, media_type=media_type, source_url=source_url, headers=headers,
-        )
+        images: list[tuple[str, str]],
+    ) -> int:
+        unique_images: list[tuple[str, str]] = []
+        seen_urls: set[str] = set()
+        for url, alt in images:
+            normalized_url = url.strip()
+            if not normalized_url or normalized_url in seen_urls:
+                continue
+            seen_urls.add(normalized_url)
+            unique_images.append((normalized_url, alt.strip()))
+        with self.transaction() as connection:
+            connection.execute("DELETE FROM resource_image WHERE resource_id = ?", (resource_id,))
+            now = utc_now()
+            connection.executemany(
+                """
+                INSERT INTO resource_image(resource_image_id, resource_id, resource_revision_id, source_url,
+                                           alt_text, position, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (uuid7(), resource_id, resource_revision_id, url, alt, position, now)
+                    for position, (url, alt) in enumerate(unique_images)
+                ],
+            )
+        return len(unique_images)
+
+    def comment_bookmark_count(self, resource_id: str, *, provider: str = "hatena") -> int | None:
         row = self.connection.execute(
-            "SELECT asset_id FROM asset WHERE payload_id = ? AND resource_id = ? AND source_url = ?",
-            (payload_id, resource_id, source_url),
+            "SELECT bookmark_count FROM resource_comment_state WHERE provider = ? AND resource_id = ?",
+            (provider, resource_id),
         ).fetchone()
-        if row is not None:
-            return str(row["asset_id"])
-        asset_id = uuid7()
+        return int(row["bookmark_count"]) if row is not None else None
+
+    def update_comment_state(
+        self,
+        resource_id: str,
+        bookmark_count: int,
+        *,
+        provider: str = "hatena",
+        entry_url: str = "",
+        entry_id: str = "",
+    ) -> None:
+        now = utc_now()
         with self.transaction() as connection:
             connection.execute(
                 """
-                INSERT INTO asset(asset_id, payload_id, resource_id, resource_revision_id, alt_text, source_url, created_at)
+                INSERT INTO resource_comment_state(
+                    provider, resource_id, bookmark_count, entry_url, entry_id, checked_at, updated_at
+                )
                 VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(provider, resource_id) DO UPDATE SET
+                    bookmark_count = excluded.bookmark_count,
+                    entry_url = excluded.entry_url,
+                    entry_id = excluded.entry_id,
+                    checked_at = excluded.checked_at,
+                    updated_at = excluded.updated_at
                 """,
-                (asset_id, payload_id, resource_id, resource_revision_id, alt_text, source_url, utc_now()),
+                (provider, resource_id, max(0, int(bookmark_count)), entry_url, entry_id, now, now),
             )
-        return asset_id
 
-    def import_legacy_artifacts(self, raw_root: str | Path) -> tuple[int, int]:
-        """Preserve pre-Feedian raw Markdown exactly once before first rendering.
-
-        Legacy files are deliberately not parsed or rewritten here. They are an
-        immutable recovery record; normalisation happens only after a later
-        provider re-collection has produced separately staged views.
-        """
-        root = Path(raw_root)
-        if not root.exists():
-            return 0, 0
-        imported = skipped = 0
-        for path in sorted(candidate for candidate in root.rglob("*.md") if candidate.is_file()):
-            relative_path = path.relative_to(root).as_posix()
-            row = self.connection.execute(
-                "SELECT sha256 FROM legacy_artifact WHERE relative_path = ?", (relative_path,)
-            ).fetchone()
-            if row is not None:
-                skipped += 1
-                continue
-            content = path.read_bytes()
-            with self.transaction() as connection:
+    def update_comment_star_counts(
+        self, updates: dict[str, int | None], *, checked_at: str | None = None
+    ) -> int:
+        if not updates:
+            return 0
+        checked = checked_at or utc_now()
+        changed = 0
+        with self.transaction() as connection:
+            for comment_id, star_count in updates.items():
+                row = connection.execute(
+                    """
+                    SELECT cr.comment_revision_id, cr.body, cr.tags_json, cr.star_count,
+                           cr.posted_at, cr.metadata_json
+                    FROM comment AS c
+                    JOIN comment_revision AS cr ON cr.comment_revision_id = c.current_revision_id
+                    WHERE c.comment_id = ?
+                    """,
+                    (comment_id,),
+                ).fetchone()
+                if row is None:
+                    continue
+                if star_count is None:
+                    connection.execute(
+                        "UPDATE comment_revision SET star_checked_at = ? WHERE comment_revision_id = ?",
+                        (checked, row["comment_revision_id"]),
+                    )
+                    continue
+                normalized_count = max(0, int(star_count))
+                content_hash = _comment_content_hash(
+                    body=str(row["body"]),
+                    tags_json=str(row["tags_json"]),
+                    star_count=normalized_count,
+                    posted_at=str(row["posted_at"]),
+                    metadata_json=str(row["metadata_json"]),
+                )
+                count_changed = row["star_count"] is None or int(row["star_count"]) != normalized_count
                 connection.execute(
                     """
-                    INSERT INTO legacy_artifact(legacy_artifact_id, relative_path, content, sha256, mtime_ns, imported_at)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    UPDATE comment_revision
+                    SET star_count = ?, star_checked_at = ?, content_hash = ?,
+                        created_at = CASE WHEN ? THEN ? ELSE created_at END
+                    WHERE comment_revision_id = ?
                     """,
-                    (uuid7(), relative_path, content, sha256_bytes(content), path.stat().st_mtime_ns, utc_now()),
+                    (normalized_count, checked, content_hash, int(count_changed), checked, row["comment_revision_id"]),
                 )
-            imported += 1
-        return imported, skipped
+                changed += int(count_changed)
+        return changed
 
-    def matches_legacy_artifact(self, relative_path: str, content: bytes) -> bool:
-        row = self.connection.execute(
-            "SELECT sha256, content FROM legacy_artifact WHERE relative_path = ?", (relative_path.replace("\\", "/"),)
-        ).fetchone()
-        return bool(row is not None and row["content"] == content and row["sha256"] == sha256_bytes(content))
+    def delete_orphan_payloads(self) -> int:
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                """
+                DELETE FROM payload
+                WHERE payload_id NOT IN (
+                    SELECT payload_id FROM source_item_revision WHERE payload_id IS NOT NULL
+                    UNION
+                    SELECT http_payload_id FROM fetch_capture WHERE http_payload_id IS NOT NULL
+                    UNION
+                    SELECT rendered_payload_id FROM fetch_capture WHERE rendered_payload_id IS NOT NULL
+                    UNION
+                    SELECT payload_id FROM asset WHERE payload_id IS NOT NULL
+                )
+                """
+            )
+        return int(cursor.rowcount)
 
     def _resolve_resource(self, connection: sqlite3.Connection, item: CanonicalItem, now: str) -> str | None:
         if not item.url:
@@ -743,39 +933,6 @@ class VaultStore:
             (uuid7(), resource_id, normalized_url, now),
         )
         return resource_id
-
-    def _refresh_resource_fts(self, resource_id: str, title: str, content: str) -> None:
-        try:
-            with self.transaction() as connection:
-                connection.execute("DELETE FROM resource_fts WHERE resource_id = ?", (resource_id,))
-                connection.execute(
-                    "INSERT INTO resource_fts(resource_id, title, content) VALUES (?, ?, ?)",
-                    (resource_id, title, content),
-                )
-        except sqlite3.OperationalError:
-            pass
-
-    def _refresh_source_fts(self, source_item_id: str, item: CanonicalItem) -> None:
-        try:
-            with self.transaction() as connection:
-                connection.execute("DELETE FROM source_fts WHERE source_item_id = ?", (source_item_id,))
-                connection.execute(
-                    "INSERT INTO source_fts(source_item_id, title, comment, tags) VALUES (?, ?, ?, ?)",
-                    (source_item_id, item.title, item.comment, " ".join(item.tags)),
-                )
-        except sqlite3.OperationalError:
-            pass
-
-    def _refresh_comment_fts(self, comment_id: str, body: str, tags: str) -> None:
-        try:
-            with self.transaction() as connection:
-                connection.execute("DELETE FROM comment_fts WHERE comment_id = ?", (comment_id,))
-                connection.execute(
-                    "INSERT INTO comment_fts(comment_id, body, tags) VALUES (?, ?, ?)", (comment_id, body, tags)
-                )
-        except sqlite3.OperationalError:
-            pass
-
 
 def _create_schema(connection: sqlite3.Connection) -> None:
     connection.executescript(
@@ -866,6 +1023,8 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             body TEXT NOT NULL,
             tags_json TEXT NOT NULL DEFAULT '[]',
             star_count INTEGER,
+            star_checked_at TEXT,
+            posted_at TEXT NOT NULL DEFAULT '',
             metadata_json TEXT NOT NULL DEFAULT '{}',
             content_hash TEXT NOT NULL,
             created_at TEXT NOT NULL
@@ -879,6 +1038,26 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             source_url TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL,
             UNIQUE(payload_id, resource_id, source_url)
+        );
+        CREATE TABLE IF NOT EXISTS resource_image (
+            resource_image_id TEXT PRIMARY KEY,
+            resource_id TEXT NOT NULL REFERENCES resource(resource_id),
+            resource_revision_id TEXT REFERENCES resource_revision(resource_revision_id),
+            source_url TEXT NOT NULL,
+            alt_text TEXT NOT NULL DEFAULT '',
+            position INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL,
+            UNIQUE(resource_id, source_url)
+        );
+        CREATE TABLE IF NOT EXISTS resource_comment_state (
+            provider TEXT NOT NULL,
+            resource_id TEXT NOT NULL REFERENCES resource(resource_id),
+            bookmark_count INTEGER NOT NULL,
+            entry_url TEXT NOT NULL DEFAULT '',
+            entry_id TEXT NOT NULL DEFAULT '',
+            checked_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(provider, resource_id)
         );
         CREATE TABLE IF NOT EXISTS resource_relation (
             relation_id TEXT PRIMARY KEY,
@@ -946,14 +1125,6 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             created_at TEXT NOT NULL,
             superseded_at TEXT
         );
-        CREATE TABLE IF NOT EXISTS legacy_artifact (
-            legacy_artifact_id TEXT PRIMARY KEY,
-            relative_path TEXT NOT NULL UNIQUE,
-            content BLOB NOT NULL,
-            sha256 TEXT NOT NULL,
-            mtime_ns INTEGER,
-            imported_at TEXT NOT NULL
-        );
         CREATE TABLE IF NOT EXISTS snapshot (
             snapshot_id TEXT PRIMARY KEY,
             manifest_json TEXT NOT NULL,
@@ -965,19 +1136,314 @@ def _create_schema(connection: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS resource_revision_resource_idx ON resource_revision(resource_id, created_at);
         CREATE INDEX IF NOT EXISTS fetch_capture_resource_idx ON fetch_capture(resource_id, fetched_at);
         CREATE INDEX IF NOT EXISTS comment_resource_idx ON comment(resource_id);
+        CREATE INDEX IF NOT EXISTS comment_revision_comment_idx ON comment_revision(comment_id);
+        CREATE INDEX IF NOT EXISTS resource_image_resource_idx ON resource_image(resource_id, position);
         CREATE INDEX IF NOT EXISTS sync_run_status_idx ON sync_run(status, started_at);
         """
     )
+
+
+def _migrate_v1_to_v2(connection: sqlite3.Connection) -> None:
+    """Convert the canonical database to latest-state storage.
+
+    Revision-shaped tables remain, but only the row referenced by each parent is
+    retained. Search data and downloaded image bytes are deliberately removed.
+    """
     try:
+        connection.execute("BEGIN IMMEDIATE")
+        if not _column_exists(connection, "comment_revision", "star_checked_at"):
+            connection.execute("ALTER TABLE comment_revision ADD COLUMN star_checked_at TEXT")
         connection.execute(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS resource_fts USING fts5(resource_id UNINDEXED, title, content, tokenize='trigram')"
+            """
+            CREATE TABLE IF NOT EXISTS resource_image (
+                resource_image_id TEXT PRIMARY KEY,
+                resource_id TEXT NOT NULL REFERENCES resource(resource_id),
+                resource_revision_id TEXT REFERENCES resource_revision(resource_revision_id),
+                source_url TEXT NOT NULL,
+                alt_text TEXT NOT NULL DEFAULT '',
+                position INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL,
+                UNIQUE(resource_id, source_url)
+            )
+            """
         )
         connection.execute(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS source_fts USING fts5(source_item_id UNINDEXED, title, comment, tags, tokenize='trigram')"
+            """
+            CREATE TABLE IF NOT EXISTS resource_comment_state (
+                provider TEXT NOT NULL,
+                resource_id TEXT NOT NULL REFERENCES resource(resource_id),
+                bookmark_count INTEGER NOT NULL,
+                checked_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(provider, resource_id)
+            )
+            """
         )
         connection.execute(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS comment_fts USING fts5(comment_id UNINDEXED, body, tags, tokenize='trigram')"
+            """
+            INSERT OR IGNORE INTO resource_image(
+                resource_image_id, resource_id, resource_revision_id, source_url, alt_text, position, updated_at
+            )
+            SELECT a.asset_id, a.resource_id, a.resource_revision_id, a.source_url, a.alt_text,
+                   ROW_NUMBER() OVER (PARTITION BY a.resource_id ORDER BY a.created_at, a.asset_id) - 1,
+                   a.created_at
+            FROM asset AS a
+            JOIN resource AS r ON r.resource_id = a.resource_id
+            WHERE a.source_url <> '' AND a.resource_revision_id = r.current_revision_id
+            """
         )
-    except sqlite3.OperationalError:
-        # Python builds without FTS5 retain the canonical tables. Search can fall back to SQL LIKE.
-        pass
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO resource_comment_state(provider, resource_id, bookmark_count, checked_at, updated_at)
+            SELECT c.provider, c.resource_id,
+                   MAX(CAST(json_extract(cr.metadata_json, '$.bookmark_count') AS INTEGER)),
+                   MAX(c.updated_at), MAX(c.updated_at)
+            FROM comment AS c
+            JOIN comment_revision AS cr ON cr.comment_revision_id = c.current_revision_id
+            WHERE json_type(cr.metadata_json, '$.bookmark_count') IN ('integer', 'real')
+            GROUP BY c.provider, c.resource_id
+            """
+        )
+
+        for table in ("resource_fts", "source_fts", "comment_fts"):
+            connection.execute(f"DROP TABLE IF EXISTS {table}")
+
+        connection.execute("DELETE FROM source_note WHERE superseded_at IS NOT NULL")
+        connection.execute(
+            "DELETE FROM source_item_revision WHERE source_revision_id NOT IN "
+            "(SELECT current_revision_id FROM source_item WHERE current_revision_id IS NOT NULL)"
+        )
+        connection.execute(
+            "DELETE FROM comment_revision WHERE comment_revision_id NOT IN "
+            "(SELECT current_revision_id FROM comment WHERE current_revision_id IS NOT NULL)"
+        )
+        connection.execute(
+            """
+            UPDATE comment_revision
+            SET star_checked_at = created_at
+            WHERE star_count IS NOT NULL AND star_checked_at IS NULL
+            """
+        )
+        connection.execute(
+            """
+            DELETE FROM fetch_capture
+            WHERE fetch_capture_id NOT IN (
+                SELECT fetch_capture_id FROM (
+                    SELECT fetch_capture_id,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY resource_id
+                               ORDER BY (http_payload_id IS NOT NULL OR rendered_payload_id IS NOT NULL) DESC,
+                                        fetched_at DESC, fetch_capture_id DESC
+                           ) AS row_number
+                    FROM fetch_capture
+                ) WHERE row_number = 1
+            )
+            """
+        )
+        connection.execute(
+            """
+            UPDATE fetch_capture
+            SET resource_revision_id = (
+                SELECT current_revision_id FROM resource WHERE resource.resource_id = fetch_capture.resource_id
+            )
+            """
+        )
+        connection.execute("DELETE FROM asset")
+        connection.execute(
+            """
+            UPDATE llm_run SET resource_revision_id = NULL
+            WHERE resource_revision_id IS NOT NULL
+              AND resource_revision_id NOT IN (
+                  SELECT current_revision_id FROM resource WHERE current_revision_id IS NOT NULL
+              )
+            """
+        )
+        connection.execute(
+            "DELETE FROM resource_revision WHERE resource_revision_id NOT IN "
+            "(SELECT current_revision_id FROM resource WHERE current_revision_id IS NOT NULL)"
+        )
+        connection.execute(
+            """
+            DELETE FROM payload
+            WHERE payload_id NOT IN (
+                SELECT payload_id FROM source_item_revision WHERE payload_id IS NOT NULL
+                UNION
+                SELECT http_payload_id FROM fetch_capture WHERE http_payload_id IS NOT NULL
+                UNION
+                SELECT rendered_payload_id FROM fetch_capture WHERE rendered_payload_id IS NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS resource_image_resource_idx ON resource_image(resource_id, position)"
+        )
+        connection.execute(
+            """
+            INSERT INTO schema_meta(key, value) VALUES ('search_generation', '1')
+            ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)
+            """
+        )
+        connection.execute(
+            "UPDATE schema_meta SET value = '2' WHERE key = 'schema_version'"
+        )
+    except BaseException:
+        connection.rollback()
+        raise
+    else:
+        connection.commit()
+
+
+def _column_exists(connection: sqlite3.Connection, table: str, column: str) -> bool:
+    return any(str(row[1]) == column for row in connection.execute(f"PRAGMA table_info({table})"))
+
+
+def _migrate_v2_to_v3(connection: sqlite3.Connection) -> None:
+    """Discard reproducible HTML and the one-time legacy Markdown safety copy."""
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute(
+            """
+            UPDATE fetch_capture
+            SET http_payload_id = NULL
+            WHERE http_payload_id IN (
+                SELECT payload_id FROM payload WHERE lower(media_type) LIKE '%html%'
+            )
+            """
+        )
+        connection.execute("UPDATE fetch_capture SET rendered_payload_id = NULL")
+        connection.execute(
+            """
+            DELETE FROM payload
+            WHERE payload_id NOT IN (
+                SELECT payload_id FROM source_item_revision WHERE payload_id IS NOT NULL
+                UNION
+                SELECT http_payload_id FROM fetch_capture WHERE http_payload_id IS NOT NULL
+                UNION
+                SELECT rendered_payload_id FROM fetch_capture WHERE rendered_payload_id IS NOT NULL
+                UNION
+                SELECT payload_id FROM asset WHERE payload_id IS NOT NULL
+            )
+            """
+        )
+        connection.execute("DROP TABLE IF EXISTS legacy_artifact")
+        connection.execute("UPDATE schema_meta SET value = '3' WHERE key = 'schema_version'")
+    except BaseException:
+        connection.rollback()
+        raise
+    else:
+        connection.commit()
+
+
+def _migrate_v3_to_v4(connection: sqlite3.Connection) -> None:
+    """Normalize Hatena comment metadata and retain the top twenty comments per resource."""
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        if not _column_exists(connection, "comment_revision", "posted_at"):
+            connection.execute("ALTER TABLE comment_revision ADD COLUMN posted_at TEXT NOT NULL DEFAULT ''")
+        if not _column_exists(connection, "resource_comment_state", "entry_url"):
+            connection.execute("ALTER TABLE resource_comment_state ADD COLUMN entry_url TEXT NOT NULL DEFAULT ''")
+        if not _column_exists(connection, "resource_comment_state", "entry_id"):
+            connection.execute("ALTER TABLE resource_comment_state ADD COLUMN entry_id TEXT NOT NULL DEFAULT ''")
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS comment_revision_comment_idx ON comment_revision(comment_id)"
+        )
+        connection.execute(
+            """
+            UPDATE resource_comment_state
+            SET entry_url = COALESCE((
+                    SELECT json_extract(cr.metadata_json, '$.entry_url')
+                    FROM comment AS c
+                    JOIN comment_revision AS cr ON cr.comment_revision_id = c.current_revision_id
+                    WHERE c.provider = resource_comment_state.provider
+                      AND c.resource_id = resource_comment_state.resource_id
+                      AND json_extract(cr.metadata_json, '$.entry_url') IS NOT NULL
+                    LIMIT 1
+                ), ''),
+                entry_id = COALESCE((
+                    SELECT json_extract(cr.metadata_json, '$.entry_id')
+                    FROM comment AS c
+                    JOIN comment_revision AS cr ON cr.comment_revision_id = c.current_revision_id
+                    WHERE c.provider = resource_comment_state.provider
+                      AND c.resource_id = resource_comment_state.resource_id
+                      AND json_extract(cr.metadata_json, '$.entry_id') IS NOT NULL
+                    LIMIT 1
+                ), '')
+            WHERE provider = 'hatena'
+            """
+        )
+        connection.execute(
+            """
+            UPDATE comment_revision
+            SET posted_at = COALESCE(json_extract(metadata_json, '$.timestamp'), ''),
+                metadata_json = json_remove(
+                    metadata_json,
+                    '$.timestamp', '$.entry_url', '$.entry_id', '$.star_url', '$.bookmark_count'
+                )
+            WHERE comment_id IN (SELECT comment_id FROM comment WHERE provider = 'hatena')
+            """
+        )
+        connection.execute("DROP TABLE IF EXISTS temp.comment_prune")
+        connection.execute("CREATE TEMP TABLE comment_prune(comment_id TEXT PRIMARY KEY)")
+        connection.execute(
+            """
+            INSERT INTO comment_prune(comment_id)
+            SELECT comment_id
+            FROM (
+                SELECT c.comment_id,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY c.provider, c.resource_id
+                           ORDER BY COALESCE(cr.star_count, 0) DESC,
+                                    CASE WHEN cr.posted_at = '' THEN 1 ELSE 0 END,
+                                    cr.posted_at ASC,
+                                    c.comment_id ASC
+                       ) AS rank
+                FROM comment AS c
+                JOIN comment_revision AS cr ON cr.comment_revision_id = c.current_revision_id
+                WHERE c.provider = 'hatena' AND c.removed_at IS NULL
+            )
+            WHERE rank > 20
+            """
+        )
+        connection.execute(
+            "DELETE FROM comment_revision WHERE comment_id IN (SELECT comment_id FROM comment_prune)"
+        )
+        connection.execute("DELETE FROM comment WHERE comment_id IN (SELECT comment_id FROM comment_prune)")
+        connection.execute("DROP TABLE comment_prune")
+
+        rows = connection.execute(
+            """
+            SELECT cr.comment_revision_id, cr.body, cr.tags_json, cr.star_count,
+                   cr.posted_at, cr.metadata_json
+            FROM comment AS c
+            JOIN comment_revision AS cr ON cr.comment_revision_id = c.current_revision_id
+            WHERE c.provider = 'hatena'
+            """
+        ).fetchall()
+        connection.executemany(
+            "UPDATE comment_revision SET content_hash = ? WHERE comment_revision_id = ?",
+            [
+                (
+                    _comment_content_hash(
+                        body=str(row["body"]),
+                        tags_json=str(row["tags_json"]),
+                        star_count=int(row["star_count"]) if row["star_count"] is not None else None,
+                        posted_at=str(row["posted_at"]),
+                        metadata_json=str(row["metadata_json"]),
+                    ),
+                    str(row["comment_revision_id"]),
+                )
+                for row in rows
+            ],
+        )
+        connection.execute(
+            """
+            INSERT INTO schema_meta(key, value) VALUES ('search_generation', '1')
+            ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)
+            """
+        )
+        connection.execute("UPDATE schema_meta SET value = '4' WHERE key = 'schema_version'")
+    except BaseException:
+        connection.rollback()
+        raise
+    else:
+        connection.commit()

@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import json
-
 from feedian.canonical import CanonicalItem
 from feedian.hatena import fetch_hatena_star_counts
 from feedian.stars import enrich_hatena_stars
@@ -17,13 +15,18 @@ def test_star_enrichment_updates_comment_revision(monkeypatch, tmp_path) -> None
         star_url = "https://b.hatena.ne.jp/alice/20260812#bookmark-123"
         store.upsert_comment(
             provider="hatena", resource_id=item.resource_id or "", author="alice", body="comment",
-            metadata={"star_url": star_url},
+            posted_at="2026/08/12 12:00",
         )
+        store.update_comment_state(item.resource_id or "", 1, entry_id="123")
         monkeypatch.setattr("feedian.stars.fetch_hatena_star_counts", lambda _uris: {star_url: 7})
 
         report = enrich_hatena_stars(store)
+        second = enrich_hatena_stars(store)
+        forced = enrich_hatena_stars(store, force=True)
 
         assert report.updated == 1
+        assert second.processed == 0
+        assert forced.processed == 1
         row = store.connection.execute("SELECT star_count FROM comment_revision ORDER BY created_at DESC LIMIT 1").fetchone()
         assert row[0] == 7
     finally:
@@ -40,22 +43,24 @@ def test_star_enrichment_batches_updates_without_rebuilding_search_text(monkeypa
         for index, star_url in enumerate(urls):
             store.upsert_comment(
                 provider="hatena", resource_id=item.resource_id or "", author=f"user-{index}", body="comment",
-                metadata={"star_url": star_url},
+                posted_at="2026/08/12 12:00",
             )
+        store.update_comment_state(item.resource_id or "", 2, entry_id="123")
         monkeypatch.setattr("feedian.stars.fetch_hatena_star_counts", lambda _uris: dict.fromkeys(urls, 3))
-        calls: list[bool] = []
-        original = store.upsert_comments
+        calls: list[dict[str, int | None]] = []
+        original = store.update_comment_star_counts
 
-        def observe(**kwargs):
-            calls.append(bool(kwargs.get("refresh_fts")))
-            return original(**kwargs)
+        def observe(updates, **kwargs):
+            calls.append(updates)
+            return original(updates, **kwargs)
 
-        monkeypatch.setattr(store, "upsert_comments", observe)
+        monkeypatch.setattr(store, "update_comment_star_counts", observe)
 
         report = enrich_hatena_stars(store)
 
         assert report.updated == 2
-        assert calls == [False]
+        assert list(calls[0].values()) == [3, 3]
+        assert store.connection.execute("SELECT COUNT(*) FROM comment_revision").fetchone()[0] == 2
     finally:
         store.close()
 
