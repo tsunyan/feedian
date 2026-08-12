@@ -12,12 +12,24 @@ VAULT_DATABASE_NAME = "feedian.sqlite3"
 
 
 @dataclass
+class RssFeedSettings:
+    url: str
+    name: str = ""
+    folder: str = ""
+    tags: list[str] = field(default_factory=list)
+    route: str = ""
+    enabled: bool = True
+
+
+@dataclass
 class ProviderSettings:
     folder: str
     enabled: bool = True
     collection_id: int | None = None
     poll_hours: int | None = None
-    feeds: list[str] = field(default_factory=list)
+    feeds: list[RssFeedSettings] = field(default_factory=list)
+    layout: str = "flat"
+    category_routes: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -30,7 +42,7 @@ class VaultConfig:
         default_factory=lambda: {
             "raindrop": ProviderSettings(folder="Raindrop", poll_hours=168),
             "hatena": ProviderSettings(folder="Hatena", poll_hours=168),
-            "rss": ProviderSettings(folder="RSS", enabled=False, poll_hours=6),
+            "rss": ProviderSettings(folder="RSS", enabled=False, poll_hours=6, layout="feed/year/month"),
         }
     )
     fetch: dict[str, Any] = field(
@@ -192,7 +204,9 @@ def render_vault_config(config: VaultConfig) -> str:
             "enabled": settings.enabled,
             **({"collection_id": settings.collection_id} if settings.collection_id is not None else {}),
             **({"poll_hours": settings.poll_hours} if settings.poll_hours is not None else {}),
-            **({"feeds": settings.feeds} if settings.feeds else {}),
+            **({"feeds": [_render_rss_feed(feed) for feed in settings.feeds]} if settings.feeds else {}),
+            **({"layout": settings.layout} if settings.layout != "flat" else {}),
+            **({"category_routes": settings.category_routes} if settings.category_routes else {}),
         }
         for name, settings in config.providers.items()
     }
@@ -216,7 +230,7 @@ def _parse_providers(raw: object) -> dict[str, ProviderSettings]:
     for name, value in raw.items():
         if not isinstance(name, str) or not isinstance(value, dict):
             raise ValueError("Each provider must have an object configuration.")
-        allowed = {"folder", "enabled", "collection_id", "poll_hours", "feeds"}
+        allowed = {"folder", "enabled", "collection_id", "poll_hours", "feeds", "layout", "category_routes"}
         unknown = sorted(set(value) - allowed)
         if unknown:
             raise ValueError(f"Unknown provider field(s) for {name}: {', '.join(unknown)}")
@@ -224,14 +238,33 @@ def _parse_providers(raw: object) -> dict[str, ProviderSettings]:
         collection_id = value.get("collection_id")
         poll_hours = value.get("poll_hours")
         raw_feeds = value.get("feeds", [])
-        if not isinstance(raw_feeds, list) or not all(isinstance(feed, str) and feed.strip() for feed in raw_feeds):
-            raise ValueError(f"providers.{name}.feeds must be an array of non-empty URLs.")
+        if not isinstance(raw_feeds, list):
+            raise ValueError(f"providers.{name}.feeds must be an array.")
+        feeds = [_parse_rss_feed(feed, index=index) for index, feed in enumerate(raw_feeds)]
+        default_layout = "feed/year/month" if name == "rss" else "flat"
+        layout = str(value.get("layout", default_layout)).strip()
+        allowed_layouts = {"flat", "feed", "feed/year", "feed/year/month", "route/feed/year/month"}
+        if layout not in allowed_layouts:
+            raise ValueError(
+                f"providers.{name}.layout must be one of: {', '.join(sorted(allowed_layouts))}."
+            )
+        raw_routes = value.get("category_routes", {})
+        if not isinstance(raw_routes, dict) or not all(
+            isinstance(tag, str) and tag.strip() and isinstance(route, str) and route.strip()
+            for tag, route in raw_routes.items()
+        ):
+            raise ValueError(f"providers.{name}.category_routes must map non-empty tags to folders.")
         providers[name] = ProviderSettings(
             folder=folder,
             enabled=bool(value.get("enabled", True)),
             collection_id=int(collection_id) if collection_id is not None else None,
             poll_hours=max(1, int(poll_hours)) if poll_hours is not None else None,
-            feeds=[feed.strip() for feed in raw_feeds],
+            feeds=feeds,
+            layout=layout,
+            category_routes={
+                str(tag).strip(): _relative_folder(route, f"providers.{name}.category_routes.{tag}")
+                for tag, route in raw_routes.items()
+            },
         )
     return providers
 
@@ -242,3 +275,57 @@ def _relative_folder(value: object, field_name: str) -> str:
     if not text or path.is_absolute() or ".." in path.parts:
         raise ValueError(f"{field_name} must be a non-empty relative path.")
     return path.as_posix()
+
+
+def _parse_rss_feed(value: object, *, index: int) -> RssFeedSettings:
+    field_name = f"providers.rss.feeds[{index}]"
+    if isinstance(value, str):
+        url = value.strip()
+        if not url:
+            raise ValueError(f"{field_name} must not be empty.")
+        return RssFeedSettings(url=url)
+    if not isinstance(value, dict):
+        raise ValueError(f"{field_name} must be a URL string or an object.")
+    allowed = {"url", "name", "folder", "tags", "route", "enabled"}
+    unknown = sorted(set(value) - allowed)
+    if unknown:
+        raise ValueError(f"Unknown RSS feed field(s) in {field_name}: {', '.join(unknown)}")
+    url = str(value.get("url") or "").strip()
+    if not url:
+        raise ValueError(f"{field_name}.url must not be empty.")
+    raw_tags = value.get("tags", [])
+    if not isinstance(raw_tags, list) or not all(isinstance(tag, str) and tag.strip() for tag in raw_tags):
+        raise ValueError(f"{field_name}.tags must be an array of non-empty strings.")
+    folder_value = str(value.get("folder") or "").strip()
+    route_value = str(value.get("route") or "").strip()
+    return RssFeedSettings(
+        url=url,
+        name=str(value.get("name") or "").strip(),
+        folder=_relative_folder(folder_value, f"{field_name}.folder") if folder_value else "",
+        tags=[tag.strip() for tag in raw_tags],
+        route=_relative_folder(route_value, f"{field_name}.route") if route_value else "",
+        enabled=bool(value.get("enabled", True)),
+    )
+
+
+def _render_rss_feed(feed: RssFeedSettings | str) -> object:
+    if isinstance(feed, str):
+        return feed
+    if not any((feed.name, feed.folder, feed.tags, feed.route)) and feed.enabled:
+        return feed.url
+    return {
+        "url": feed.url,
+        **({"name": feed.name} if feed.name else {}),
+        **({"folder": feed.folder} if feed.folder else {}),
+        **({"tags": feed.tags} if feed.tags else {}),
+        **({"route": feed.route} if feed.route else {}),
+        **({"enabled": False} if not feed.enabled else {}),
+    }
+
+
+def normalized_rss_feeds(settings: ProviderSettings) -> list[RssFeedSettings]:
+    """Normalize programmatically-created legacy string feed settings."""
+    return [
+        feed if isinstance(feed, RssFeedSettings) else _parse_rss_feed(feed, index=index)
+        for index, feed in enumerate(settings.feeds)
+    ]

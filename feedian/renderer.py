@@ -5,12 +5,14 @@ import json
 import re
 import shutil
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Callable
 
 from .markdown import comments_note_filename, escape_markdown_heading, sanitize_filename, yaml_frontmatter
 from .store import VaultStore
-from .vault import VaultConfig, vault_paths
+from .vault import ProviderSettings, VaultConfig, vault_paths
 
 
 RENDER_HASH_PATTERN = re.compile(r"(?m)^render_hash: ([0-9a-f]{64})\r?$")
@@ -48,6 +50,7 @@ def render_raw_views(
         progress(0, total)
     if not apply and output_root.exists():
         shutil.rmtree(output_root)
+    managed_paths = _index_managed_paths(output_root) if apply else {}
     rows = store.connection.execute(
         """
         SELECT s.source_item_id, s.provider, s.account, s.native_id, s.resource_id, s.removed_at,
@@ -74,12 +77,29 @@ def render_raw_views(
             if progress is not None:
                 progress(processed, total)
             continue
-        destination = output_root / settings.folder
+        provider_root = output_root / settings.folder
+        destination = _provider_destination(provider_root, provider, metadata, settings)
         filename = _note_filename(metadata, str(row["native_id"]))
         main_path = destination / filename
-        if apply:
-            _reconcile_legacy_generated_paths(destination, str(row["native_id"]), main_path)
         comments_path = destination / comments_note_filename(filename)
+        if apply:
+            previous_main = managed_paths.get((str(row["source_item_id"]), "raw"))
+            path_conflict = _reconcile_generated_path(previous_main, main_path)
+            previous_comments = managed_paths.get((str(row["source_item_id"]), "comments"))
+            if previous_comments is None and previous_main is not None:
+                legacy_comments = previous_main.with_name(comments_note_filename(previous_main.name))
+                previous_comments = legacy_comments if legacy_comments.exists() else None
+            comments_path_conflict = _reconcile_generated_path(previous_comments, comments_path)
+            if path_conflict:
+                conflicts += 1
+                if comments_path_conflict:
+                    conflicts += 1
+                if progress is not None:
+                    progress(processed, total)
+                continue
+            _reconcile_legacy_generated_paths(destination, str(row["native_id"]), main_path)
+            if comments_path_conflict:
+                conflicts += 1
         comments = _comments_for_resource(store, row["resource_id"])
         images = _external_images(store, row["resource_id"])
         main_document = _render_main_document(row, metadata, comments_path.stem if comments else None, images)
@@ -94,7 +114,7 @@ def render_raw_views(
             skipped += 1
         else:
             conflicts += 1
-        if comments:
+        if comments and not (apply and comments_path_conflict):
             comments_document = _render_comments_document(row, metadata, comments, filename)
             comments_result = _write_generated(
                 comments_path,
@@ -107,12 +127,63 @@ def render_raw_views(
                 conflicts += 1
         if progress is not None:
             progress(processed, total)
+    if apply:
+        _remove_empty_directories(output_root)
     return RenderReport(written, skipped, conflicts, comments_written, output_root)
 
 
 def _note_filename(metadata: dict[str, Any], native_id: str) -> str:
     title = sanitize_filename(str(metadata.get("title") or metadata.get("link") or "Untitled"))
     return f"{(title or 'Untitled')[:60].rstrip(' .') or 'Untitled'} - {native_id}.md"
+
+
+def _provider_destination(
+    provider_root: Path,
+    provider: str,
+    metadata: dict[str, Any],
+    settings: ProviderSettings,
+) -> Path:
+    if provider != "rss" or settings.layout == "flat":
+        return provider_root
+    provider_metadata = metadata.get("_feedian_provider_metadata")
+    if not isinstance(provider_metadata, dict):
+        provider_metadata = {}
+    destination = provider_root
+    route = _safe_metadata_path(str(provider_metadata.get("feed_route") or ""))
+    if settings.layout == "route/feed/year/month" and route is not None:
+        destination /= route
+    feed_folder = _safe_metadata_path(str(provider_metadata.get("feed_folder") or "RSS Feed"))
+    destination /= feed_folder or Path("RSS Feed")
+    if settings.layout in {"feed/year", "feed/year/month", "route/feed/year/month"}:
+        date_parts = _rss_date_parts(str(metadata.get("created") or ""))
+        if date_parts is None:
+            destination /= "_undated"
+        else:
+            destination /= date_parts[0]
+            if settings.layout in {"feed/year/month", "route/feed/year/month"}:
+                destination /= date_parts[1]
+    return destination
+
+
+def _safe_metadata_path(value: str) -> Path | None:
+    parts = [sanitize_filename(part).strip(" .") for part in value.replace("\\", "/").split("/")]
+    safe = [part for part in parts if part and part not in {".", ".."}]
+    return Path(*safe) if safe else None
+
+
+def _rss_date_parts(value: str) -> tuple[str, str] | None:
+    if not value.strip():
+        return None
+    try:
+        parsed = parsedate_to_datetime(value)
+    except (TypeError, ValueError, OverflowError):
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return f"{parsed.year:04d}", f"{parsed.month:02d}"
 
 
 def _render_main_document(
@@ -132,6 +203,16 @@ def _render_main_document(
         "title": title,
         "tags": tags,
     }
+    provider_metadata = metadata.get("_feedian_provider_metadata")
+    if row["provider"] == "rss" and isinstance(provider_metadata, dict):
+        frontmatter.update(
+            {
+                "feed_url": provider_metadata.get("feed_url") or "",
+                "feed_title": provider_metadata.get("feed_title") or "",
+                "feed_site": provider_metadata.get("feed_site") or "",
+                "published_at": provider_metadata.get("published_at") or metadata.get("created") or "",
+            }
+        )
     lines = ["---", yaml_frontmatter(frontmatter), "---", "", f"# {escape_markdown_heading(title)}", ""]
     lines.extend(
         [
@@ -142,6 +223,15 @@ def _render_main_document(
             "",
         ]
     )
+    if row["provider"] == "rss" and isinstance(provider_metadata, dict):
+        lines.extend(
+            [
+                f"- Feed: {provider_metadata.get('feed_title') or provider_metadata.get('feed_url') or ''}",
+                f"- Feed URL: {provider_metadata.get('feed_url') or ''}",
+                f"- Published: {provider_metadata.get('published_at') or metadata.get('created') or ''}",
+                "",
+            ]
+        )
     if tags:
         lines.extend(["## Tags", "", " ".join(f"#{tag}" for tag in tags), ""])
     comment = str(metadata.get("note") or "").strip()
@@ -180,6 +270,7 @@ def _render_comments_document(row: Any, metadata: dict[str, Any], comments: list
     frontmatter = {
         "feedian_managed": True,
         "feedian_kind": "comments",
+        "source_item_id": row["source_item_id"],
         "resource_id": row["resource_id"],
         "source": metadata.get("link") or "",
         "comment_count": len(comments),
@@ -295,6 +386,59 @@ def _is_legacy_generated_document(document: str) -> bool:
         re.search(r"(?m)^summary_model: \"?[^\n\"]+\"?\s*$", frontmatter),
     )
     return all(canonical_required) or all(raindrop_required)
+
+
+def _index_managed_paths(root: Path) -> dict[tuple[str, str], Path]:
+    if not root.exists():
+        return {}
+    result: dict[tuple[str, str], Path] = {}
+    source_pattern = re.compile(r'(?m)^source_item_id: "?([^\n"]+)"?\s*$')
+    kind_pattern = re.compile(r'(?m)^feedian_kind: "?([^\n"]+)"?\s*$')
+    for path in root.rglob("*.md"):
+        try:
+            document = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        source_match = source_pattern.search(document)
+        kind_match = kind_pattern.search(document)
+        if source_match is not None and kind_match is not None:
+            result.setdefault((source_match.group(1).strip(), kind_match.group(1).strip()), path)
+    return result
+
+
+def _reconcile_generated_path(previous: Path | None, expected: Path) -> bool:
+    """Move an unchanged managed file, returning True when a human edit blocks the move."""
+    if previous is None or previous == expected or not previous.exists():
+        return False
+    try:
+        document = previous.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return True
+    if not _is_unchanged_generated_document(document):
+        return True
+    if expected.exists():
+        try:
+            expected_document = expected.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            return True
+        if not _is_unchanged_generated_document(expected_document):
+            return True
+        previous.unlink()
+        return False
+    expected.parent.mkdir(parents=True, exist_ok=True)
+    previous.replace(expected)
+    return False
+
+
+def _remove_empty_directories(root: Path) -> None:
+    if not root.exists():
+        return
+    directories = sorted((path for path in root.rglob("*") if path.is_dir()), key=lambda path: len(path.parts), reverse=True)
+    for directory in directories:
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
 
 
 def _reconcile_legacy_generated_paths(destination: Path, native_id: str, expected_path: Path) -> None:

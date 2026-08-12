@@ -18,9 +18,9 @@ from .hatena import (
     hatena_comment_star_url,
 )
 from .raindrop import RaindropClient
-from .rss import fetch_rss_items
+from .rss import RssItem, fetch_rss_items, published_timestamp
 from .store import VaultStore, sha256_bytes, stable_json
-from .vault import VaultConfig
+from .vault import VaultConfig, normalized_rss_feeds
 
 
 HATENA_COMMENT_LIMIT = 20
@@ -67,25 +67,68 @@ def sync_vault(
     run_id = store.create_sync_run(providers, fingerprint)
     processed = changed = failed = fetched = 0
     comment_targets: dict[str, tuple[str, str, str]] = {}
+    provider_errors: list[str] = []
+
+    def record_provider_error(provider: str, source_name: str, error: Exception) -> None:
+        nonlocal failed
+        failed += 1
+        provider_errors.append(f"{provider} {source_name}: {error}")
+
     try:
         for provider in providers:
             for item, raw_payload in _provider_items(
-                config, provider, limit, collection_progress=collection_progress
+                config,
+                provider,
+                limit,
+                collection_progress=collection_progress,
+                store=store,
+                provider_error=record_provider_error,
             ):
                 processed += 1
                 stored = store.upsert_canonical_item(item, source_payload=raw_payload)
                 try:
-                    if stored.resource_id and fetch_pages and item.url and store.should_fetch_resource(
-                        stored.resource_id, refresh_days=int(config.fetch.get("refresh_days", 30)), force=force_fetch
-                    ):
-                        page = fetch_page_text(
-                            item.url,
-                            timeout_seconds=30,
-                            max_chars=10_000,
-                            allow_private_urls=False,
+                    should_fetch_page = bool(
+                        stored.resource_id
+                        and fetch_pages
+                        and item.url
+                        and store.should_fetch_resource(
+                            stored.resource_id,
+                            refresh_days=int(config.fetch.get("refresh_days", 30)),
+                            force=force_fetch,
                         )
+                    )
+                    if should_fetch_page and stored.resource_id:
+                        try:
+                            page = fetch_page_text(
+                                item.url,
+                                timeout_seconds=30,
+                                max_chars=10_000,
+                                allow_private_urls=False,
+                            )
+                        except Exception:
+                            if item.embedded_content and not _resource_has_revision(store, stored.resource_id):
+                                store.record_resource_revision(
+                                    stored.resource_id,
+                                    content_markdown=item.embedded_content,
+                                    title=item.title,
+                                    final_url=item.url,
+                                    extracted_by="rss-feed-fallback",
+                                )
+                            raise
+                        if not page.text.strip() and item.embedded_content:
+                            page.text = item.embedded_content
+                            page.title = page.title or item.title
+                            page.extraction_method = "rss-feed-fallback"
                         _store_page(store, stored.resource_id, page)
                         fetched += 1
+                    elif stored.resource_id and item.embedded_content and not _resource_has_revision(store, stored.resource_id):
+                        store.record_resource_revision(
+                            stored.resource_id,
+                            content_markdown=item.embedded_content,
+                            title=item.title,
+                            final_url=item.url,
+                            extracted_by="rss-feed",
+                        )
                     if stored.resource_id and fetch_comments and item.url:
                         comment_targets.setdefault(
                             stored.resource_id, (stored.source_item_id, stored.resource_id, item.url)
@@ -106,7 +149,11 @@ def sync_vault(
             force=force_comments,
             progress=comment_progress,
         )
-        store.finish_sync_run(run_id, status="partial" if failed else "completed")
+        store.finish_sync_run(
+            run_id,
+            status="partial" if failed else "completed",
+            error="; ".join(provider_errors) if provider_errors else None,
+        )
     except Exception as exc:
         store.finish_sync_run(run_id, status="failed", error=str(exc))
         raise
@@ -127,6 +174,8 @@ def _provider_items(
     limit: int | None,
     *,
     collection_progress: Callable[[str, int, int], None] | None = None,
+    store: VaultStore | None = None,
+    provider_error: Callable[[str, str, Exception], None] | None = None,
 ) -> Iterable[tuple[CanonicalItem, bytes]]:
     if provider == "raindrop":
         token = _required_env("RAINDROP_TOKEN")
@@ -153,16 +202,48 @@ def _provider_items(
             yield item, stable_json(item.as_bookmark_metadata()).encode("utf-8")
         return
     if provider == "rss":
-        feeds = config.providers[provider].feeds
+        settings = config.providers[provider]
+        feeds = [feed for feed in normalized_rss_feeds(settings) if feed.enabled]
         if not feeds:
             raise ValueError("RSS is enabled but providers.rss.feeds is empty.")
-        count = 0
-        for feed_url in feeds:
-            for entry in fetch_rss_items(feed_url):
-                if limit is not None and count >= limit:
-                    return
-                count += 1
-                yield entry.item, entry.payload
+        collected: list[tuple[int, RssItem]] = []
+        seen_source_ids: set[str] = set()
+        sequence = 0
+        for feed in feeds:
+            persisted = _existing_rss_feed_metadata(store, feed.url) if store is not None else {}
+            try:
+                entries = fetch_rss_items(
+                    feed.url,
+                    name=feed.name,
+                    folder=feed.folder or str(persisted.get("feed_folder") or ""),
+                    tags=feed.tags,
+                    route=feed.route,
+                    category_routes=settings.category_routes,
+                    etag=str(persisted.get("feed_etag") or ""),
+                    last_modified=str(persisted.get("feed_last_modified") or ""),
+                )
+            except Exception as exc:
+                if provider_error is None:
+                    raise
+                provider_error(provider, feed.name or feed.url, exc)
+                continue
+            for entry in entries:
+                if entry.item.source_id in seen_source_ids:
+                    continue
+                seen_source_ids.add(entry.item.source_id)
+                collected.append((sequence, entry))
+                sequence += 1
+        collected.sort(
+            key=lambda value: (
+                published_timestamp(value[1]) is not None,
+                published_timestamp(value[1]) or 0,
+                -value[0],
+            ),
+            reverse=True,
+        )
+        selected = collected if limit is None else collected[: max(0, limit)]
+        for _, entry in selected:
+            yield entry.item, entry.payload
         return
     raise ValueError(f"Unsupported provider: {provider}")
 
@@ -200,6 +281,35 @@ def _store_page(store: VaultStore, resource_id: str, page: PageFetchResult) -> N
         resource_revision_id=resource_revision_id,
         images=[(image.url, image.alt_text) for image in images],
     )
+
+
+def _resource_has_revision(store: VaultStore, resource_id: str) -> bool:
+    row = store.connection.execute(
+        "SELECT current_revision_id FROM resource WHERE resource_id = ?", (resource_id,)
+    ).fetchone()
+    return bool(row is not None and row["current_revision_id"])
+
+
+def _existing_rss_feed_metadata(store: VaultStore, feed_url: str) -> dict[str, object]:
+    rows = store.connection.execute(
+        """
+        SELECT sr.metadata_json
+        FROM source_item AS s
+        JOIN source_item_revision AS sr ON sr.source_revision_id = s.current_revision_id
+        WHERE s.provider = 'rss' AND sr.metadata_json LIKE ?
+        ORDER BY s.updated_at DESC
+        """,
+        (f'%"feed_url":"{feed_url.replace(chr(34), "")}"%',),
+    ).fetchall()
+    for row in rows:
+        try:
+            metadata = json.loads(str(row["metadata_json"]))
+        except json.JSONDecodeError:
+            continue
+        provider_metadata = metadata.get("_feedian_provider_metadata") or {}
+        if provider_metadata.get("feed_url") == feed_url:
+            return dict(provider_metadata)
+    return {}
 
 
 def _store_hatena_discussion(store: VaultStore, resource_id: str, discussion: HatenaEntryDiscussion) -> None:

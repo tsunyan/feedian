@@ -58,4 +58,41 @@ def test_load_vault_config_accepts_rss_feeds(tmp_path) -> None:
         encoding="utf-8",
     )
     config = load_vault_config(root)
-    assert config.providers["rss"].feeds == ["https://example.test/feed.xml"]
+    assert config.providers["rss"].feeds[0].url == "https://example.test/feed.xml"
+    assert config.providers["rss"].layout == "feed/year/month"
+
+
+def test_load_vault_config_accepts_rss_feed_routing(tmp_path) -> None:
+    root = tmp_path / "vault"
+    root.mkdir()
+    initialize_vault(root)
+    config_path = root / ".feedian" / "config.json"
+    config_path.write_text(
+        """{
+          "providers": {
+            "rss": {
+              "folder": "RSS",
+              "enabled": true,
+              "layout": "route/feed/year/month",
+              "category_routes": {"AI": "technology/ai"},
+              "feeds": [{
+                "url": "https://example.test/feed.xml",
+                "name": "Example",
+                "folder": "Example Feed",
+                "tags": ["news"],
+                "route": "reading"
+              }]
+            }
+          }
+        }""",
+        encoding="utf-8",
+    )
+
+    config = load_vault_config(root)
+    settings = config.providers["rss"]
+
+    assert settings.layout == "route/feed/year/month"
+    assert settings.category_routes == {"AI": "technology/ai"}
+    assert settings.feeds[0].folder == "Example Feed"
+    assert settings.feeds[0].tags == ["news"]
+    assert settings.feeds[0].route == "reading"

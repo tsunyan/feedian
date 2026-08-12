@@ -20,10 +20,12 @@ class CanonicalItem:
     updated_at: str = ""
     private: bool | None = None
     item_type: str = "link"
+    provider_metadata: dict[str, Any] = field(default_factory=dict)
+    embedded_content: str = ""
 
     def as_bookmark_metadata(self) -> dict[str, object]:
         hostname = urlsplit(self.url).hostname or ""
-        return {
+        metadata = {
             "_id": self.source_id,
             "_feedian_source": self.source,
             "_feedian_source_id": self.source_id,
@@ -39,6 +41,9 @@ class CanonicalItem:
             "lastUpdate": self.updated_at,
             "private": self.private,
         }
+        if self.provider_metadata:
+            metadata["_feedian_provider_metadata"] = dict(self.provider_metadata)
+        return metadata
 
 
 def canonicalize_url(url: str) -> str:
@@ -83,4 +88,5 @@ def canonical_item_from_metadata(
         updated_at=str(item.get("lastUpdate") or ""),
         private=item.get("private") if isinstance(item.get("private"), bool) else None,
         item_type=str(item.get("type") or "link"),
+        provider_metadata=dict(item.get("_feedian_provider_metadata") or {}),
     )
