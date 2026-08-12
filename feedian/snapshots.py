@@ -10,7 +10,7 @@ import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .ids import uuid7
 from .store import VaultStore, stable_json
@@ -32,25 +32,32 @@ class SnapshotReport:
     dry_run: bool = False
 
 
+SnapshotProgress = Callable[[str, int, int, bool], None]
+
+
 def create_snapshot(
     store: VaultStore,
     vault_root: str | Path,
     config: VaultConfig,
     *,
     dry_run: bool = False,
+    progress: SnapshotProgress | None = None,
 ) -> SnapshotReport:
     """Archive a consistent DB backup and verify it after private Release upload.
 
     This never stages arbitrary vault files: only configured generated folders
     and the two explicitly versioned .feedian JSON files are included.
     """
+    total_phases = 1 if dry_run else 9
     paths = vault_paths(vault_root)
+    _phase(progress, "checking prerequisites", 1, total_phases)
     repository = _github_repository(paths.root)
     _assert_private_repository(repository)
     seven_zip = _find_7zip()
     _require_clean_staging_area(paths.root, config)
     if store.integrity_check() != "ok":
         raise RuntimeError("Live database integrity check failed; refusing to snapshot.")
+    _phase(progress, "checking prerequisites", 1, total_phases, completed=True)
 
     created_at = datetime.now(timezone.utc).replace(microsecond=0)
     snapshot_id = uuid7()
@@ -58,6 +65,7 @@ def create_snapshot(
     if dry_run:
         return SnapshotReport(snapshot_id, tag, None, None, dry_run=True)
 
+    _phase(progress, "preparing snapshot metadata", 2, total_phases)
     previous = store.latest_snapshot()
     manifest = _base_manifest(store, snapshot_id, tag, created_at, previous)
     store.record_snapshot(snapshot_id, manifest)
@@ -66,8 +74,13 @@ def create_snapshot(
     database_backup = work_dir / "feedian.sqlite3"
     archive_manifest = work_dir / "manifest.json"
     archive_path = work_dir / f"{tag}.sqlite3.7z"
+    _phase(progress, "preparing snapshot metadata", 2, total_phases, completed=True)
     try:
+        _phase(progress, "backing up SQLite", 3, total_phases)
         store.backup_to(database_backup)
+        _phase(progress, "backing up SQLite", 3, total_phases, completed=True)
+
+        _phase(progress, "compressing database archive", 4, total_phases)
         database_sha256 = _sha256_file(database_backup)
         manifest["database"] = {"sha256": database_sha256, "byte_length": database_backup.stat().st_size}
         archive_manifest.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -78,12 +91,20 @@ def create_snapshot(
         (paths.state_dir / "snapshot.json").write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
         )
+        _phase(progress, "compressing database archive", 4, total_phases, completed=True)
 
+        _phase(progress, "committing Vault snapshot", 5, total_phases)
         _stage_snapshot_paths(paths.root, config)
         _commit_if_needed(paths.root, f"snapshot: {created_at:%Y-%m-%d %H:%M UTC}")
         _run_git(paths.root, ["tag", "-a", tag, "-m", f"Feedian snapshot {snapshot_id}"])
+        _phase(progress, "committing Vault snapshot", 5, total_phases, completed=True)
+
+        _phase(progress, "pushing commit and tag", 6, total_phases)
         _run_git(paths.root, ["push", "origin", "HEAD"])
         _run_git(paths.root, ["push", "origin", tag])
+        _phase(progress, "pushing commit and tag", 6, total_phases, completed=True)
+
+        _phase(progress, "publishing private GitHub Release", 7, total_phases)
         _run(
             [
                 "gh", "release", "create", tag, str(archive_path), "--repo", repository,
@@ -91,12 +112,31 @@ def create_snapshot(
                 "--notes", f"SQLite archive for snapshot `{snapshot_id}`.", "--verify-tag",
             ]
         )
+        _phase(progress, "publishing private GitHub Release", 7, total_phases, completed=True)
+
+        _phase(progress, "downloading and verifying Release", 8, total_phases)
         _verify_remote_archive(repository, tag, archive_path, archive_sha256, seven_zip, work_dir)
+        _phase(progress, "downloading and verifying Release", 8, total_phases, completed=True)
+
+        _phase(progress, "finalizing verified snapshot", 9, total_phases)
         store.mark_snapshot_verified(snapshot_id)
+        shutil.rmtree(work_dir)
+        _phase(progress, "finalizing verified snapshot", 9, total_phases, completed=True)
     except Exception as exc:
         raise RuntimeError(f"Snapshot failed; temporary archive retained at {work_dir}: {exc}") from exc
-    shutil.rmtree(work_dir)
     return SnapshotReport(snapshot_id, tag, None, archive_sha256)
+
+
+def _phase(
+    progress: SnapshotProgress | None,
+    description: str,
+    phase: int,
+    total_phases: int,
+    *,
+    completed: bool = False,
+) -> None:
+    if progress is not None:
+        progress(description, phase, total_phases, completed)
 
 
 def _base_manifest(

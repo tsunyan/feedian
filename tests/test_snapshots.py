@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from feedian.snapshots import _github_repository, _managed_git_paths, _path_is_within
+from feedian.snapshots import _github_repository, _managed_git_paths, _path_is_within, _phase
 from feedian.vault import VaultConfig
 
 
@@ -28,3 +28,15 @@ def test_github_repository_uses_origin(monkeypatch, tmp_path: Path, remote: str,
     monkeypatch.setattr("feedian.snapshots._git_output", lambda *_args, **_kwargs: remote)
 
     assert _github_repository(tmp_path) == expected
+
+
+def test_snapshot_phase_reports_start_and_completion() -> None:
+    events: list[tuple[str, int, int, bool]] = []
+
+    _phase(lambda *event: events.append(event), "compressing database archive", 4, 9)
+    _phase(lambda *event: events.append(event), "compressing database archive", 4, 9, completed=True)
+
+    assert events == [
+        ("compressing database archive", 4, 9, False),
+        ("compressing database archive", 4, 9, True),
+    ]

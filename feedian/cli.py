@@ -94,6 +94,7 @@ def build_parser() -> argparse.ArgumentParser:
     snapshot = subparsers.add_parser("snapshot", help="Publish a verified SQLite archive to a private GitHub Release.")
     snapshot.add_argument("--vault", help="Vault root. Defaults to the current or configured Vault.")
     snapshot.add_argument("--dry-run", action="store_true", help="Check prerequisites without creating a commit, tag, or Release.")
+    snapshot.add_argument("--progress", choices=PROGRESS_MODES, default="auto", help="Progress display mode.")
 
     restore = subparsers.add_parser("restore", help="Restore a verified SQLite snapshot only into a Vault without a database.")
     restore.add_argument("--vault", required=True, help="Vault root that has no .feedian/feedian.sqlite3 yet.")
@@ -447,8 +448,30 @@ def _snapshot(args: argparse.Namespace) -> int:
         raise FileNotFoundError(f"Database not found: {paths.database_path}; run feedian migrate or sync first.")
     store = VaultStore.open(paths.database_path)
     try:
-        with vault_write_lock(paths.state_dir):
-            report = create_snapshot(store, root, config, dry_run=args.dry_run)
+        reporter = ProgressReporter(args.progress)
+        active_phase = 0
+
+        def snapshot_progress(description: str, phase: int, total_phases: int, completed: bool) -> None:
+            nonlocal active_phase
+            if completed:
+                reporter.finish_task(1)
+                return
+            reporter.start_task(
+                f"snapshot: [{phase}/{total_phases}] {description}",
+                total=1,
+                preserve_previous=active_phase > 0,
+            )
+            active_phase = phase
+
+        with reporter:
+            with vault_write_lock(paths.state_dir):
+                report = create_snapshot(
+                    store,
+                    root,
+                    config,
+                    dry_run=args.dry_run,
+                    progress=snapshot_progress,
+                )
         if report.dry_run:
             print(f"snapshot dry-run: id={report.snapshot_id} tag={report.tag}")
         else:
