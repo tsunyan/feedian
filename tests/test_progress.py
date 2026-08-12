@@ -89,6 +89,19 @@ class ProgressReporterTests(unittest.TestCase):
         self.assertIn("100/100", output)
         self.assertNotIn("100/~110", output.splitlines()[-1])
 
+    def test_rich_mode_updates_usage_in_the_active_description(self) -> None:
+        stream = io.StringIO()
+        reporter = ProgressReporter("rich", stream=stream)
+
+        with reporter:
+            reporter.start_task("ingest: creating source notes", total=2)
+            reporter.set_description("ingest: in 1,200 | out 150 | $0.002000")
+            reporter.advance()
+
+        output = stream.getvalue()
+        self.assertIn("in 1,200", output)
+        self.assertIn("$0.002000", output)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -154,6 +154,16 @@ class ProgressReporter:
             self._plain_task.total = total
             self._plain_task.estimated_total = estimated_total
 
+    def set_description(self, description: str) -> None:
+        if self.mode == "off":
+            return
+        if self.mode == "rich":
+            if self._progress is not None and self._rich_task_id is not None:
+                self._progress.update(self._rich_task_id, description=description)
+            return
+        if self._plain_task is not None:
+            self._plain_task.description = description
+
     def finish_task(self, total: int) -> None:
         """Finalize the current phase with its actual count before preserving it."""
         if self.mode == "off":

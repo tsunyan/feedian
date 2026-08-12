@@ -3,13 +3,14 @@ from __future__ import annotations
 import argparse
 import os
 import sqlite3
+import subprocess
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
 from .locking import vault_write_lock
-from .cli_ui import RichArgumentParser, print_cli_error
+from .cli_ui import RichArgumentParser, print_cli_error, print_ingest_plan
 from .env import load_env_file
-from .ingest import ingest_source_notes, render_source_notes
+from .ingest import ingest_source_notes, plan_source_notes, render_source_notes
 from .notifications import notify_windows
 from .progress import PROGRESS_MODES, ProgressReporter
 from .restore import download_and_restore, restore_database
@@ -117,6 +118,12 @@ def build_parser() -> argparse.ArgumentParser:
     ingest.add_argument("--language", default="Japanese")
     ingest.add_argument("--limit", type=int)
     ingest.add_argument("--force", action="store_true", help="Ignore matching successful LLM results and run again.")
+    ingest.add_argument("--dry-run", action="store_true", help="Show targets, token estimate, and maximum cost without writes or API calls.")
+    ingest.add_argument(
+        "--auto", action="store_true",
+        help="Select representative resources from uncovered and largest fields (default limit: 20).",
+    )
+    ingest.add_argument("--progress", choices=PROGRESS_MODES, default="auto", help="Progress display mode.")
 
     search = subparsers.add_parser("search", help="Inspect or rebuild the disposable local full-text index.")
     search.add_argument("action", choices=("status", "rebuild"))
@@ -131,6 +138,7 @@ def main(argv: list[str]) -> int:
         parser.print_help()
         return 0
     args = parser.parse_args(argv)
+    args._invocation = subprocess.list2cmdline(["feedian", *argv])
     try:
         if args.command == "init":
             paths = initialize_vault(args.vault)
@@ -579,14 +587,51 @@ def _ingest(args: argparse.Namespace) -> int:
         raise FileNotFoundError(f"Database not found: {paths.database_path}; run feedian sync first.")
     store = VaultStore.open(paths.database_path)
     try:
-        with vault_write_lock(paths.state_dir):
-            report = ingest_source_notes(
-                store, root, config, model=args.model, language=args.language, limit=args.limit, force=args.force,
+        if args.limit is not None and args.limit < 0:
+            raise ValueError("--limit must be zero or greater.")
+        if args.dry_run:
+            plan = plan_source_notes(
+                store, model=args.model, language=args.language, limit=args.limit,
+                force=args.force, auto=args.auto,
             )
-            written, skipped = render_source_notes(store, root, config)
+            print_ingest_plan(
+                plan, model=args.model, dry_run=True, command=args._invocation,
+            )
+            return 0
+
+        reporter = ProgressReporter(args.progress)
+        with vault_write_lock(paths.state_dir):
+            plan = plan_source_notes(
+                store, model=args.model, language=args.language, limit=args.limit,
+                force=args.force, auto=args.auto,
+            )
+            print_ingest_plan(
+                plan, model=args.model, dry_run=False, command=args._invocation,
+            )
+
+            with reporter:
+                reporter.start_task("ingest: creating source notes", total=len(plan.candidates))
+
+                def ingest_progress(processed, total, candidate, current) -> None:
+                    reporter.set_description(
+                        f"ingest: in {current.input_tokens:,} | out {current.output_tokens:,} "
+                        f"| ${current.cost_usd:.6f}"
+                    )
+                    reporter.advance()
+                    reporter.log(
+                        f"  {processed}/{total}  ${current.cost_usd:.6f}  {candidate.title}"
+                    )
+
+                report = ingest_source_notes(
+                    store, root, config, model=args.model, language=args.language,
+                    limit=args.limit, force=args.force, auto=args.auto,
+                    progress=ingest_progress, plan=plan,
+                )
+                written, skipped = render_source_notes(store, root, config)
         print(
-            f"ingest: processed={report.processed} created={report.created} reused={report.reused} failed={report.failed} "
-            f"source_written={written} source_skipped={skipped}"
+            f"ingest: processed={report.processed} created={report.created} reused={report.reused} "
+            f"failed={report.failed} input_tokens={report.input_tokens} output_tokens={report.output_tokens} "
+            f"cost_usd={report.cost_usd:.6f} source_written={written} source_skipped={skipped}"
         )
         return 1 if report.failed else 0
     finally:

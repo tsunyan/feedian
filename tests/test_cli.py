@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from feedian.canonical import CanonicalItem
 from feedian.cli import main
 from feedian.store import VaultStore
 from feedian.__main__ import main as package_main
@@ -91,6 +92,44 @@ def test_migrate_does_not_copy_existing_raw_markdown_into_sqlite(tmp_path, capsy
             "SELECT 1 FROM sqlite_master WHERE name = 'legacy_artifact'"
         ).fetchone()
         assert legacy.read_bytes() == b"original\r\n"
+    finally:
+        store.close()
+
+
+def test_ingest_dry_run_prints_plan_without_writes(tmp_path, capsys, monkeypatch) -> None:
+    root = tmp_path / "vault"
+    root.mkdir()
+    monkeypatch.chdir(tmp_path)
+    assert main(["init", "--vault", str(root)]) == 0
+    assert main(["migrate", "--vault", str(root)]) == 0
+    store = VaultStore.open(root / ".feedian" / "feedian.sqlite3")
+    try:
+        item = store.upsert_canonical_item(
+            CanonicalItem(
+                source="hatena", source_id="one", content_key="url:one",
+                url="https://example.test", title="Dry Run Article", tags=["python"],
+            )
+        )
+        store.record_resource_revision(item.resource_id or "", content_markdown="Body", title="Dry Run Article")
+    finally:
+        store.close()
+
+    assert main(["ingest", "--vault", str(root), "--dry-run", "--auto", "--limit", "1"]) == 0
+
+    output = capsys.readouterr().out
+    assert "INGEST" in output and "PREVIEW" in output
+    assert "Command" in output
+    assert "feedian ingest --vault" in output
+    assert "--dry-run --auto --limit 1" in output
+    assert "Auto select" in output
+    assert "API calls" in output and "1" in output
+    assert "Maximum" in output and "$" in output
+    assert "python" in output and "New field" in output
+    assert "Dry Run Article" in output
+    store = VaultStore.open(root / ".feedian" / "feedian.sqlite3")
+    try:
+        assert store.connection.execute("SELECT COUNT(*) FROM llm_run").fetchone()[0] == 0
+        assert store.connection.execute("SELECT COUNT(*) FROM source_note").fetchone()[0] == 0
     finally:
         store.close()
 

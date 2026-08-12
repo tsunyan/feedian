@@ -4,8 +4,9 @@ import argparse
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import TextIO
+from typing import Any, TextIO
 
+from rich import box
 from rich.align import Align
 from rich.console import Console, Group
 from rich.panel import Panel
@@ -110,6 +111,134 @@ def print_cli_error(error: Exception, *, file: TextIO | None = None) -> None:
             padding=(1, 2),
         )
     )
+
+
+def print_ingest_plan(
+    plan: Any,
+    *,
+    model: str,
+    dry_run: bool,
+    command: str,
+    file: TextIO | None = None,
+) -> None:
+    console = _console(file or sys.stdout)
+    mode = "Auto select" if plan.auto else "All resources"
+    action = "Preview only  |  no API calls  |  no writes" if dry_run else "Ready to ingest"
+    heading = Text.assemble(
+        ("INGEST  ", f"bold {CYAN}"),
+        ("/  ", MUTED),
+        ("PREVIEW" if dry_run else "PLAN", f"bold {VIOLET}"),
+    )
+    flow = Text(justify="center")
+    flow.append(f"{plan.total_resources:,}", style="bold")
+    flow.append("  STORED  >  ", style=MUTED)
+    flow.append(f"{len(plan.candidates):,}", style=f"bold {CYAN}")
+    flow.append("  SELECTED  >  ", style=MUTED)
+    flow.append(f"{plan.new_requests:,}", style=f"bold {VIOLET}")
+    flow.append("  API CALLS", style=MUTED)
+    identity = Table.grid(expand=True)
+    identity.add_column(ratio=1)
+    identity.add_column(ratio=1)
+    identity.add_column(ratio=1)
+    identity.add_row(
+        Text.assemble(("Mode  ", MUTED), (mode, "bold")),
+        Text.assemble(("Model  ", MUTED), (model, f"bold {BLUE}")),
+        Text.assemble(("Cached  ", MUTED), (f"{plan.reusable:,}", "bold")),
+    )
+    command_line = Text.assemble(
+        ("Command  ", MUTED),
+        (command, f"bold {BLUE}"),
+    )
+    console.print(
+        Panel(
+            Group(
+                heading,
+                Text(action, style=MUTED),
+                Text(""),
+                command_line,
+                Text(""),
+                flow,
+                Text(""),
+                identity,
+            ),
+            border_style=VIOLET,
+            padding=(1, 2),
+        )
+    )
+
+    budget = Table(box=box.SIMPLE_HEAD, expand=True, header_style=f"bold {VIOLET}")
+    budget.add_column("Estimate", style=MUTED)
+    budget.add_column("Input", justify="right")
+    budget.add_column("Output", justify="right")
+    budget.add_column("Cost", justify="right")
+    if plan.estimated_output_tokens is None:
+        budget.add_row(
+            "Expected from history",
+            f"{plan.input_tokens:,}",
+            "-",
+            "-",
+        )
+    else:
+        budget.add_row(
+            f"Expected | {plan.usage_records:,} prior runs",
+            f"{plan.input_tokens:,}",
+            f"{plan.estimated_output_tokens:,}",
+            _money(plan.estimated_cost_usd),
+        )
+    budget.add_row(
+        "Maximum",
+        f"{plan.input_tokens:,}",
+        f"{plan.max_output_tokens:,}",
+        _money(plan.max_cost_usd),
+        style="bold",
+    )
+    console.print(budget)
+    if plan.estimated_output_tokens is None:
+        console.print(
+            Text.assemble(
+                ("  ! ", YELLOW),
+                ("Expected cost needs one completed ingest with this model. ", "bold"),
+                ("The maximum above is available now.", MUTED),
+            )
+        )
+
+    if not (dry_run or plan.auto):
+        return
+    console.print()
+    console.print(Text("SELECTED RAW MATERIAL", style=f"bold {VIOLET}"))
+    targets = Table(
+        box=box.SIMPLE_HEAD,
+        expand=True,
+        header_style=f"bold {CYAN}",
+        pad_edge=False,
+    )
+    targets.add_column("#", justify="right", style=MUTED, no_wrap=True)
+    targets.add_column("Action", no_wrap=True)
+    if plan.auto:
+        targets.add_column("Field", style=BLUE, no_wrap=True)
+        targets.add_column("Raw", justify="right", no_wrap=True)
+        targets.add_column("Why", style=MUTED, no_wrap=True)
+    targets.add_column("Tokens", justify="right", no_wrap=True)
+    targets.add_column("Title", ratio=3, overflow="fold")
+
+    displayed = plan.candidates[:100]
+    for index, candidate in enumerate(displayed, start=1):
+        action_text = Text("CACHE", style="bold green") if candidate.cached_result is not None else Text("LLM", style=f"bold {VIOLET}")
+        row: list[Any] = [str(index), action_text]
+        if plan.auto:
+            reason = "New field" if candidate.reason == "uncovered-field" else "Large field"
+            row.extend([candidate.topic, f"{candidate.topic_count:,}", reason])
+        row.extend([f"{candidate.input_tokens:,}", candidate.title])
+        targets.add_row(*row)
+    omitted = len(plan.candidates) - len(displayed)
+    if omitted:
+        targets.caption = f"{omitted:,} more targets omitted | use --limit to inspect a smaller batch"
+        targets.caption_style = MUTED
+    console.print(targets)
+
+
+def _money(value: float | None) -> str:
+    return "-" if value is None else f"${value:.6f}"
 
 
 def _print_root_help(console: Console, parser: argparse.ArgumentParser) -> None:
