@@ -24,7 +24,7 @@ def test_store_creates_schema_and_deduplicates_payload(tmp_path) -> None:
         second = store.put_payload(b"<html>same</html>", media_type="text/html")
 
         assert first == second
-        assert store.schema_version() == 4
+        assert store.schema_version() == 5
         assert store.quick_check() == "ok"
         assert store.integrity_check() == "ok"
     finally:
@@ -269,7 +269,7 @@ def test_v1_migration_prunes_history_images_and_inline_fts(tmp_path) -> None:
 
     migrated = VaultStore.open(path, allow_migration=True)
     try:
-        assert migrated.schema_version() == 4
+        assert migrated.schema_version() == 5
         assert migrated.status_counts()["source_item_revision"] == 1
         assert migrated.status_counts()["resource_revision"] == 1
         assert migrated.connection.execute("SELECT COUNT(*) FROM fetch_capture").fetchone()[0] == 1

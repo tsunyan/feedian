@@ -45,6 +45,7 @@ class PageFetchResult:
     raw_body: bytes | None = None
     rendered_html: str = ""
     payload_too_large: bool = False
+    not_modified: bool = False
 
 
 @dataclass
@@ -209,6 +210,8 @@ def fetch_page_text(
     timeout_seconds: int,
     max_chars: int,
     allow_private_urls: bool = False,
+    etag: str = "",
+    last_modified: str = "",
 ) -> PageFetchResult:
     # max_chars remains in the public call signature for compatibility. Extracted
     # text is stored in full; the limit is applied only when building an LLM prompt.
@@ -219,12 +222,17 @@ def fetch_page_text(
     except ValueError as exc:
         return PageFetchResult(url=url, text="", error=f"blocked URL: {exc}")
 
+    headers = {
+        "User-Agent": "feedian/0.1 (+https://github.com/) Python urllib",
+        "Accept": "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.1",
+    }
+    if etag:
+        headers["If-None-Match"] = etag
+    if last_modified:
+        headers["If-Modified-Since"] = last_modified
     request = Request(
         fetch_url,
-        headers={
-            "User-Agent": "feedian/0.1 (+https://github.com/) Python urllib",
-            "Accept": "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.1",
-        },
+        headers=headers,
         method="GET",
     )
     try:
@@ -244,6 +252,17 @@ def fetch_page_text(
             response_url = geturl() if callable(geturl) else None
             final_url = response_url if isinstance(response_url, str) else fetch_url
     except HTTPError as exc:
+        if exc.code == 304:
+            response_headers = {str(key): str(value) for key, value in exc.headers.items()} if exc.headers else {}
+            return PageFetchResult(
+                url=url,
+                text="",
+                final_url=fetch_url,
+                response_headers=response_headers,
+                http_status=304,
+                fetch_method="http",
+                not_modified=True,
+            )
         if exc.code in {401, 403, 406}:
             try:
                 return fetch_page_text_with_browser(

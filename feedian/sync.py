@@ -99,11 +99,14 @@ def sync_vault(
                     )
                     if should_fetch_page and stored.resource_id:
                         try:
+                            etag, last_modified = store.resource_fetch_validators(stored.resource_id)
                             page = fetch_page_text(
                                 item.url,
                                 timeout_seconds=30,
                                 max_chars=10_000,
                                 allow_private_urls=False,
+                                etag=etag,
+                                last_modified=last_modified,
                             )
                         except Exception:
                             if item.embedded_content and not _resource_has_revision(store, stored.resource_id):
@@ -115,11 +118,18 @@ def sync_vault(
                                     extracted_by="rss-feed-fallback",
                                 )
                             raise
-                        if not page.text.strip() and item.embedded_content:
+                        if page.not_modified:
+                            store.record_not_modified_fetch(
+                                stored.resource_id,
+                                final_url=page.final_url or item.url,
+                                response_headers=page.response_headers,
+                            )
+                        elif not page.text.strip() and item.embedded_content:
                             page.text = item.embedded_content
                             page.title = page.title or item.title
                             page.extraction_method = "rss-feed-fallback"
-                        _store_page(store, stored.resource_id, page)
+                        if not page.not_modified:
+                            _store_page(store, stored.resource_id, page)
                         fetched += 1
                     elif stored.resource_id and item.embedded_content and not _resource_has_revision(store, stored.resource_id):
                         store.record_resource_revision(
@@ -269,6 +279,7 @@ def _store_page(store: VaultStore, resource_id: str, page: PageFetchResult) -> N
         rendered_payload_id=None,
         content_truncated=page.content_truncated,
         warning=page.error,
+        response_headers=page.response_headers,
     )
     html = page.rendered_html
     if not html and page.raw_body is not None and "html" in page.media_type.lower():

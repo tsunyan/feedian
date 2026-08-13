@@ -71,7 +71,7 @@ def test_init_migrate_and_status(tmp_path, capsys) -> None:
 
     output = capsys.readouterr().out
     assert "initialized:" in output
-    assert "migrated: schema_version=4" in output
+    assert "migrated: schema_version=5" in output
     assert "integrity: ok" in output
 
 
@@ -85,7 +85,7 @@ def test_migrate_does_not_copy_existing_raw_markdown_into_sqlite(tmp_path, capsy
 
     assert main(["migrate", "--vault", str(root)]) == 0
 
-    assert "migrated: schema_version=4" in capsys.readouterr().out
+    assert "migrated: schema_version=5" in capsys.readouterr().out
     store = VaultStore.open(root / ".feedian" / "feedian.sqlite3")
     try:
         assert not store.connection.execute(

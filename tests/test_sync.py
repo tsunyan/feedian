@@ -138,6 +138,37 @@ def test_sync_skips_recent_page_fetches(monkeypatch, tmp_path) -> None:
         store.close()
 
 
+def test_sync_uses_page_validators_and_keeps_content_after_not_modified(monkeypatch, tmp_path) -> None:
+    item = CanonicalItem(source="hatena", source_id="hatena-1", content_key="url:one", url="https://example.test/a", title="A")
+    monkeypatch.setattr("feedian.sync._provider_items", lambda *_args, **_kwargs: iter([(item, b"{}")] ))
+    calls: list[dict[str, object]] = []
+
+    def fetch(url: str, **kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            return PageFetchResult(
+                url=url, final_url=url, text="article", media_type="text/html", response_headers={"ETag": '"one"'}
+            )
+        return PageFetchResult(
+            url=url, final_url=url, text="", fetch_method="http", http_status=304, not_modified=True
+        )
+
+    monkeypatch.setattr("feedian.sync.fetch_page_text", fetch)
+    config = VaultConfig(providers={"hatena": VaultConfig().providers["hatena"]})
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        sync_vault(store, config, source="hatena", fetch_comments=False)
+        report = sync_vault(store, config, source="hatena", fetch_comments=False, force_fetch=True)
+
+        assert calls[1]["etag"] == '"one"'
+        assert calls[1]["last_modified"] == ""
+        assert report.fetched == 1
+        assert store.connection.execute("SELECT content_markdown FROM resource_revision").fetchone()[0] == "article"
+        assert store.connection.execute("SELECT COUNT(*) FROM resource_revision").fetchone()[0] == 1
+    finally:
+        store.close()
+
+
 def test_sync_reports_each_processed_item(monkeypatch, tmp_path) -> None:
     items = [
         CanonicalItem(source="hatena", source_id=str(index), content_key=f"url:{index}", url=f"https://example.test/{index}")

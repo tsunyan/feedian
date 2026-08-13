@@ -186,7 +186,7 @@ The active model is shown in the ingest preview and execution header.
 | `providers.rss.category_routes` | Explicit feed-category-to-folder mappings. Unlisted categories never create folders automatically. |
 | `fetch.html_max_bytes` | Maximum HTML download size. |
 | `fetch.document_max_bytes` | Maximum retained non-HTML response size. |
-| `fetch.refresh_days` | Age after which linked-page content may be fetched again. |
+| `fetch.refresh_days` | Age after which Feedian checks a linked page for updates again. |
 | `fetch.comment_workers` | Parallel workers for Hatena comment retrieval. |
 | `fetch.star_refresh_days` | Default age for refreshing Hatena Star counts. |
 | `fetch.allow_private_hosts` | Explicit private/local hosts that page fetching may access. Empty by default. |
@@ -253,7 +253,7 @@ Collect provider metadata and linked-page content into SQLite without calling an
 | `--limit N` | Maximum items per selected provider. Useful for a staged first run. |
 | `--skip-page-fetch` | Store provider metadata without downloading linked-page content. |
 | `--skip-comments` | Do not check or retrieve public Hatena comments. |
-| `--force-fetch` | Fetch page content even when the stored copy is younger than `fetch.refresh_days`. |
+| `--force-fetch` | Check pages now, ignoring `fetch.refresh_days`. When a site supports it, unchanged pages return HTTP 304 and their content is not downloaded again. |
 | `--force-comments` | Retrieve full Hatena comments even when the public bookmark count is unchanged. |
 | `--progress` | `auto` uses Rich in a terminal and plain output elsewhere; it can be overridden. |
 | `--verbose` | Print each processed source item title. |

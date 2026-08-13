@@ -13,7 +13,7 @@ from .canonical import CanonicalItem, canonicalize_url
 from .ids import uuid7
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 def utc_now() -> str:
@@ -26,6 +26,13 @@ def sha256_bytes(value: bytes) -> str:
 
 def stable_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _header_value(headers: dict[str, str] | None, name: str) -> str:
+    if not headers:
+        return ""
+    wanted = name.lower()
+    return next((str(value) for key, value in headers.items() if str(key).lower() == wanted), "")
 
 
 def _comment_content_hash(
@@ -127,6 +134,10 @@ class VaultStore:
             if current == 3:
                 _migrate_v3_to_v4(self.connection)
                 current = 4
+                continue
+            if current == 4:
+                _migrate_v4_to_v5(self.connection)
+                current = 5
                 continue
             raise RuntimeError(f"No migration path from database schema {current}.")
 
@@ -322,6 +333,7 @@ class VaultStore:
         discussion_text: str = "",
         content_truncated: bool = False,
         warning: str | None = None,
+        response_headers: dict[str, str] | None = None,
     ) -> tuple[str, bool]:
         content_hash = sha256_bytes(
             stable_json(
@@ -377,22 +389,25 @@ class VaultStore:
                     """
                     INSERT INTO fetch_capture(fetch_capture_id, resource_id, resource_revision_id, http_payload_id,
                                               rendered_payload_id, final_url, extracted_by, content_truncated,
-                                              warning, fetched_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                              warning, response_etag, response_last_modified, fetched_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (uuid7(), resource_id, revision_id, http_payload_id, rendered_payload_id, final_url,
-                     extracted_by, int(content_truncated), warning, now),
+                     extracted_by, int(content_truncated), warning,
+                     _header_value(response_headers, "ETag"), _header_value(response_headers, "Last-Modified"), now),
                 )
             else:
                 connection.execute(
                     """
                     UPDATE fetch_capture
                     SET resource_revision_id = ?, http_payload_id = ?, rendered_payload_id = ?, final_url = ?,
-                        extracted_by = ?, content_truncated = ?, warning = ?, fetched_at = ?
+                        extracted_by = ?, content_truncated = ?, warning = ?, response_etag = ?,
+                        response_last_modified = ?, fetched_at = ?
                     WHERE fetch_capture_id = ?
                     """,
                     (revision_id, http_payload_id, rendered_payload_id, final_url, extracted_by,
-                     int(content_truncated), warning, now, capture["fetch_capture_id"]),
+                     int(content_truncated), warning, _header_value(response_headers, "ETag"),
+                     _header_value(response_headers, "Last-Modified"), now, capture["fetch_capture_id"]),
                 )
             if changed:
                 self._mark_search_dirty(connection)
@@ -656,6 +671,41 @@ class VaultStore:
         ):
             return datetime.now(timezone.utc) - fetched_at >= timedelta(minutes=30)
         return datetime.now(timezone.utc) - fetched_at >= timedelta(days=max(1, refresh_days))
+
+    def resource_fetch_validators(self, resource_id: str) -> tuple[str, str]:
+        row = self.connection.execute(
+            """
+            SELECT response_etag, response_last_modified
+            FROM fetch_capture
+            WHERE resource_id = ?
+            ORDER BY fetched_at DESC LIMIT 1
+            """,
+            (resource_id,),
+        ).fetchone()
+        if row is None:
+            return "", ""
+        return str(row["response_etag"] or ""), str(row["response_last_modified"] or "")
+
+    def record_not_modified_fetch(
+        self, resource_id: str, *, final_url: str, response_headers: dict[str, str] | None = None
+    ) -> None:
+        with self.transaction() as connection:
+            capture = connection.execute(
+                "SELECT fetch_capture_id FROM fetch_capture WHERE resource_id = ? ORDER BY fetched_at DESC LIMIT 1",
+                (resource_id,),
+            ).fetchone()
+            if capture is None:
+                return
+            connection.execute(
+                """
+                UPDATE fetch_capture
+                SET final_url = ?, response_etag = COALESCE(?, response_etag),
+                    response_last_modified = COALESCE(?, response_last_modified), fetched_at = ?
+                WHERE fetch_capture_id = ?
+                """,
+                (final_url, _header_value(response_headers, "ETag") or None,
+                 _header_value(response_headers, "Last-Modified") or None, utc_now(), capture["fetch_capture_id"]),
+            )
 
     def backup_to(self, destination: str | Path) -> None:
         """Create a consistent SQLite backup without copying WAL files by hand."""
@@ -1004,6 +1054,8 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             extracted_by TEXT NOT NULL DEFAULT '',
             content_truncated INTEGER NOT NULL DEFAULT 0,
             warning TEXT,
+            response_etag TEXT NOT NULL DEFAULT '',
+            response_last_modified TEXT NOT NULL DEFAULT '',
             fetched_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS comment (
@@ -1442,6 +1494,24 @@ def _migrate_v3_to_v4(connection: sqlite3.Connection) -> None:
             """
         )
         connection.execute("UPDATE schema_meta SET value = '4' WHERE key = 'schema_version'")
+    except BaseException:
+        connection.rollback()
+        raise
+    else:
+        connection.commit()
+
+
+def _migrate_v4_to_v5(connection: sqlite3.Connection) -> None:
+    """Keep page validators so refreshes can use conditional HTTP requests."""
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        if not _column_exists(connection, "fetch_capture", "response_etag"):
+            connection.execute("ALTER TABLE fetch_capture ADD COLUMN response_etag TEXT NOT NULL DEFAULT ''")
+        if not _column_exists(connection, "fetch_capture", "response_last_modified"):
+            connection.execute(
+                "ALTER TABLE fetch_capture ADD COLUMN response_last_modified TEXT NOT NULL DEFAULT ''"
+            )
+        connection.execute("UPDATE schema_meta SET value = '5' WHERE key = 'schema_version'")
     except BaseException:
         connection.rollback()
         raise
