@@ -83,11 +83,14 @@ class ProgressReporter:
 
     def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
         if self._progress is not None:
+            if self._retain_final:
+                # Remove the live display first, then print its final state
+                # once as ordinary terminal output.
+                self._progress.live.transient = True
             self._progress.stop()
             if self._retain_final and self._console is not None:
-                # Rich's live display can be cleared by some terminal hosts at
-                # shutdown. Print one final static copy for commands whose
-                # completed phases are useful as a run record.
+                # Some terminal hosts clear Rich's live display at shutdown.
+                # Keep a single static copy as the run record.
                 self._console.print(self._progress)
 
     def start_task(
