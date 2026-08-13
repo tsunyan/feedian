@@ -102,6 +102,20 @@ class ProgressReporterTests(unittest.TestCase):
         self.assertIn("in 1,200", output)
         self.assertIn("$0.002000", output)
 
+    def test_rich_mode_can_retain_a_final_static_progress_display(self) -> None:
+        stream = io.StringIO()
+        reporter = ProgressReporter("rich", stream=stream)
+
+        with reporter:
+            reporter.start_task("process: syncing items", total=2)
+            reporter.advance(2)
+            reporter.finish_task(2)
+            reporter.retain_final()
+
+        output = stream.getvalue()
+        self.assertGreaterEqual(output.count("process: syncing items"), 2)
+        self.assertIn("2/2", output)
+
 
 if __name__ == "__main__":
     unittest.main()

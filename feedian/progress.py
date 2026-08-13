@@ -62,6 +62,7 @@ class ProgressReporter:
         self._progress: Progress | None = None
         self._rich_task_id: TaskID | None = None
         self._plain_task: _PlainTask | None = None
+        self._retain_final = False
 
     def __enter__(self) -> ProgressReporter:
         if self.mode == "rich":
@@ -83,6 +84,11 @@ class ProgressReporter:
     def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
         if self._progress is not None:
             self._progress.stop()
+            if self._retain_final and self._console is not None:
+                # Rich's live display can be cleared by some terminal hosts at
+                # shutdown. Print one final static copy for commands whose
+                # completed phases are useful as a run record.
+                self._console.print(self._progress)
 
     def start_task(
         self,
@@ -190,6 +196,10 @@ class ProgressReporter:
             self._plain_task.estimated_total = False
             if not already_complete:
                 self._write(self._plain_text(self._plain_task))
+
+    def retain_final(self) -> None:
+        """Leave a static copy of the final Rich progress display in the terminal."""
+        self._retain_final = True
 
     def log(self, message: str) -> None:
         if self.mode == "off":

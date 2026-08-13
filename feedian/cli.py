@@ -65,7 +65,7 @@ def build_parser() -> argparse.ArgumentParser:
     sync.add_argument("--limit", type=int, help="Maximum items per provider.")
     sync.add_argument("--skip-page-fetch", action="store_true", help="Store provider data only.")
     sync.add_argument("--skip-comments", action="store_true", help="Do not request public Hatena comments.")
-    sync.add_argument("--force-fetch", action="store_true", help="Refetch page content even when it is younger than refresh_days.")
+    sync.add_argument("--force-fetch", action="store_true", help="Check pages now, ignoring refresh_days; unchanged pages use conditional HTTP.")
     sync.add_argument("--force-comments", action="store_true", help="Refetch Hatena comments even when bookmark counts are unchanged.")
     sync.add_argument("--progress", choices=PROGRESS_MODES, default="auto", help="Progress display mode.")
     sync.add_argument("--verbose", action="store_true", help="Show each processed source item title.")
@@ -339,8 +339,8 @@ def _sync(args: argparse.Namespace) -> int:
                     collection_progress=update_collection,
                     comment_progress=update_comments,
                 )
-                if not comments_started:
-                    reporter.finish_task(report.processed)
+                reporter.finish_task(comments_reported if comments_started else report.processed)
+                reporter.retain_final()
                 rebuild_search_index(store, paths.search_database_path)
         print(
             f"sync: run={report.run_id} processed={report.processed} changed={report.changed} "
