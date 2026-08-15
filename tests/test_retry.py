@@ -52,3 +52,42 @@ class RetryTests(unittest.TestCase):
             run_with_retries(lambda: (_ for _ in ()).throw(http_error(401)), max_retries=3, retry_base_seconds=1)
         raised.exception.close()
         sleep.assert_not_called()
+
+    @patch("feedian.retry.time.sleep")
+    def test_caller_can_add_a_transient_status_without_a_nested_loop(self, sleep) -> None:
+        calls = 0
+
+        def operation() -> str:
+            nonlocal calls
+            calls += 1
+            if calls < 3:
+                raise http_error(404)
+            return "ok"
+
+        with self.assertRaises(HTTPError) as raised:
+            run_with_retries(operation, max_retries=3, retry_base_seconds=1)
+        raised.exception.close()
+
+        calls = 0
+        result = run_with_retries(
+            operation, max_retries=3, retry_base_seconds=1,
+            transient_status_codes=frozenset({404}),
+        )
+        self.assertEqual(result, "ok")
+        self.assertEqual(calls, 3)
+
+    @patch("feedian.retry.time.sleep")
+    def test_backoff_is_capped_so_the_total_wait_stays_bounded(self, sleep) -> None:
+        calls = 0
+
+        def operation() -> str:
+            nonlocal calls
+            calls += 1
+            if calls < 5:
+                raise http_error(503)
+            return "ok"
+
+        run_with_retries(operation, max_retries=6, retry_base_seconds=1, max_delay_seconds=4.0)
+
+        # Uncapped this would be 1, 2, 4, 8.
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [1.0, 2.0, 4.0, 4.0])

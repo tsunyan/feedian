@@ -116,6 +116,7 @@ def print_ingest_plan(
     plan: Any,
     *,
     model: str,
+    provider: str = "openai",
     dry_run: bool,
     command: str,
     file: TextIO | None = None,
@@ -135,12 +136,14 @@ def print_ingest_plan(
     flow.append("  SELECTED  >  ", style=MUTED)
     flow.append(f"{plan.new_requests:,}", style=f"bold {VIOLET}")
     flow.append("  API CALLS", style=MUTED)
-    identity = Table.grid(expand=True)
+    identity = Table.grid(expand=True, padding=(0, 2))
+    identity.add_column(ratio=1)
     identity.add_column(ratio=1)
     identity.add_column(ratio=1)
     identity.add_column(ratio=1)
     identity.add_row(
         Text.assemble(("Mode  ", MUTED), (mode, "bold")),
+        Text.assemble(("Provider  ", MUTED), (provider, f"bold {CYAN}")),
         Text.assemble(("Model  ", MUTED), (model, f"bold {BLUE}")),
         Text.assemble(("Cached  ", MUTED), (f"{plan.reusable:,}", "bold")),
     )
@@ -192,7 +195,15 @@ def print_ingest_plan(
         style="bold",
     )
     console.print(budget)
-    if plan.estimated_output_tokens is None:
+    if plan.max_cost_usd is None:
+        console.print(
+            Text.assemble(
+                ("  ! ", YELLOW),
+                (f"Feedian has no price snapshot for {model}. ", "bold"),
+                ("Cost cannot be estimated now, and stays n/a during the run.", MUTED),
+            )
+        )
+    elif plan.estimated_output_tokens is None:
         console.print(
             Text.assemble(
                 ("  ! ", YELLOW),
@@ -234,6 +245,32 @@ def print_ingest_plan(
         targets.caption = f"{omitted:,} more targets omitted | use --limit to inspect a smaller batch"
         targets.caption_style = MUTED
     console.print(targets)
+
+
+def ingest_cost_text(report: Any) -> str:
+    """Render an ingest cost so that "not reported" stays distinct from a real zero."""
+    if report.unpriced_requests and not report.cost_usd:
+        return "n/a"
+    if report.unpriced_requests:
+        return f"${report.cost_usd:.6f} (+{report.unpriced_requests} unpriced)"
+    return f"${report.cost_usd:.6f}"
+
+
+def ingest_cost_value(report: Any) -> str:
+    """The same cost as a bare value, for the key=value summary line."""
+    if report.unpriced_requests and not report.cost_usd:
+        return "n/a"
+    return f"{report.cost_usd:.6f}"
+
+
+def ingest_tokens_text(report: Any) -> str:
+    """Render token totals; a provider that reports no usage shows n/a, not zero."""
+    if report.unmetered_requests and not (report.input_tokens or report.output_tokens):
+        return "in n/a | out n/a"
+    text = f"in {report.input_tokens:,} | out {report.output_tokens:,}"
+    if report.unmetered_requests:
+        text += f" (+{report.unmetered_requests} unmetered)"
+    return text
 
 
 def _money(value: float | None) -> str:

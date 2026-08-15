@@ -787,20 +787,25 @@ class VaultStore:
         self,
         run_id: str,
         *,
+        request: dict[str, Any] | None = None,
         response: dict[str, Any] | None = None,
         result: dict[str, Any] | None = None,
         usage: dict[str, Any] | None = None,
         price: dict[str, Any] | None = None,
         error: str | None = None,
     ) -> None:
+        """Close a run. `request` records what was actually sent, which can differ
+        in shape from the planned request the run started with (see llm providers)."""
         status = "failed" if error else "completed"
         with self.transaction() as connection:
             connection.execute(
                 """
-                UPDATE llm_run SET response_json = ?, result_json = ?, usage_json = ?, price_json = ?, status = ?, error = ?, finished_at = ?
+                UPDATE llm_run SET request_json = COALESCE(?, request_json), response_json = ?, result_json = ?,
+                                   usage_json = ?, price_json = ?, status = ?, error = ?, finished_at = ?
                 WHERE llm_run_id = ?
                 """,
-                (stable_json(response) if response is not None else None, stable_json(result) if result is not None else None,
+                (stable_json(request) if request is not None else None,
+                 stable_json(response) if response is not None else None, stable_json(result) if result is not None else None,
                  stable_json(usage) if usage is not None else None, stable_json(price) if price is not None else None,
                  status, error, utc_now(), run_id),
             )

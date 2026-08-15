@@ -58,7 +58,7 @@ OPENAI_API_KEY=your-openai-api-key
 OPENAI_MODEL=gpt-5.6-luna
 ```
 
-`OPENAI_API_KEY` is needed only when `ingest` must make a new API call. `OPENAI_MODEL` is optional and selects its default model. RSS needs no credential. Do not commit `.env`.
+`OPENAI_API_KEY` is needed only when OpenAI `ingest` must make a new API call. `OPENAI_MODEL` is optional and selects its default model. RSS needs no credential. Do not commit `.env`.
 
 Feedian reads `.env` from the current directory first, then a per-user file:
 
@@ -68,6 +68,18 @@ Feedian reads `.env` from the current directory first, then a per-user file:
 | `%APPDATA%\Feedian\.env` (Windows), `$XDG_CONFIG_HOME/feedian/.env` or `~/.config/feedian/.env` | Any working directory, including scheduled runs. |
 
 Real environment variables win over both, and the working-directory file wins over the per-user file. Because commands can select a Vault from anywhere, put credentials in the per-user file if you run Feedian from outside the repository — `feedian schedule` tasks start in an arbitrary directory and would otherwise find no `.env`. Keep credentials out of the Vault itself: a Vault is a Git repository that `snapshot` commits and pushes.
+
+To use Manus for ingest instead, set `MANUS_API_KEY` and select the provider:
+
+```dotenv
+MANUS_API_KEY=your-manus-api-key
+LLM_PROVIDER=manus
+# MANUS_MODEL=manus-1.6
+```
+
+You can also select it for one run with `feedian ingest --provider manus`. Manus uses its `x-manus-api-key` authentication header and structured output API.
+
+Manus runs as a remote agent task rather than a single request. Feedian cannot stop a task it has started, so every Manus failure message carries the `task_id` and `task_url`; if a run fails or times out, open that URL to check whether the task is still running.
 
 For Hatena, the API key is the key shown in the [posting email address settings](https://www.hatena.ne.jp/my/config/mail/upload), not the account password. If the address is shown as `API_KEY.HATENA_ID@...`, use the `API_KEY` part.
 
@@ -122,13 +134,20 @@ There are two different config formats in this repository:
 - `<vault>/.feedian/config.json`: current SQLite/Vault workflow; used by all modern commands documented below.
 - Repository-root `config.json`: legacy direct-export workflow only; it is **not** read by `feedian ingest`.
 
-For modern `ingest`, the model is selected in this order:
+For modern `ingest`, the provider is selected in this order:
 
-1. `--model MODEL`
-2. `OPENAI_MODEL` from the environment or `.env`
-3. Built-in default `gpt-5.6-terra`
+1. `--provider openai|manus`
+2. `LLM_PROVIDER` from the environment or `.env`
+3. Built-in default `openai`
 
-The active model is shown in the ingest preview and execution header.
+The model default then follows the selected provider:
+
+| Provider | Order |
+| --- | --- |
+| `openai` | `--model MODEL`, then `OPENAI_MODEL`, then built-in `gpt-5.6-terra` |
+| `manus` | `--model MODEL`, then `MANUS_MODEL`, then built-in `manus-1.6` |
+
+The active provider and model are shown in the ingest preview and execution header.
 
 ### Vault config fields
 
@@ -282,7 +301,7 @@ Render SQLite records as Obsidian Markdown. Without `--apply`, output goes to `.
 ### `ingest`
 
 ```powershell
-feedian ingest [--vault PATH] [--model MODEL] [--language LANGUAGE] [--limit N]
+feedian ingest [--vault PATH] [--provider openai|manus] [--model MODEL] [--language LANGUAGE] [--limit N]
                [--dry-run] [--auto] [--force]
                [--progress auto|rich|plain|off]
 ```
@@ -291,7 +310,8 @@ Create LLM-derived `source/` notes from resources already stored by `sync`.
 
 | Option | Meaning |
 | --- | --- |
-| `--model MODEL` | OpenAI model for this run. Overrides `OPENAI_MODEL`. |
+| `--provider openai\|manus` | LLM provider for this run. Overrides `LLM_PROVIDER`; default `openai`. |
+| `--model MODEL` | Model for this run. Overrides the selected provider's environment variable. |
 | `--language LANGUAGE` | Output language; default `Japanese`. |
 | `--limit N` | Maximum candidates to process. Without `--auto`, omitted means all stored resources. |
 | `--dry-run` | Show selection, token counts, and cost estimates without API calls or writes. |
@@ -304,6 +324,10 @@ Create LLM-derived `source/` notes from resources already stored by `sync`.
 LLM tags are stored in the `source/` note frontmatter and `## Tags` section. Provider tags collected by `sync` remain separate in raw metadata and are also supplied to the LLM as context.
 
 The displayed cost is a local estimate from Feedian's price snapshot; account credits, complimentary tokens, taxes, and the provider's final billed amount are not known to Feedian.
+
+Feedian's price snapshot covers OpenAI models only, and Manus reports no token usage. A run whose cost cannot be computed shows `n/a` for cost and tokens rather than zero, and the summary line reports `unpriced_requests` and `unmetered_requests` counts. `n/a` means "not reported", never "free".
+
+Whatever the provider returns is re-checked against Feedian's own schema before a note is written: field types are corrected, and title, summary, key point, and tag lengths and counts are capped. OpenAI enforces this schema itself, but Manus supports only a subset of it, so the check is what keeps a malformed Manus response out of `source/`. A response with no usable title or summary fails that resource, leaving it for the next run instead of writing a hollow note.
 
 ### `enrich-stars`
 
@@ -521,11 +545,13 @@ See [`config.example.json`](config.example.json) for legacy config fields. The l
 
 ## Security and operational behavior
 
-- Linked pages, bookmark metadata, and comments are treated as untrusted reference data. Instructions embedded in them are not followed by the summarization prompt.
-- Page fetching accepts only HTTP(S), blocks private/local addresses by default, and rechecks redirects. Add only trusted hosts to `fetch.allow_private_hosts`.
-- Raindrop and OpenAI requests retry bounded transient failures with exponential backoff.
+- Linked pages, bookmark metadata, and comments are treated as untrusted reference data. The prompt tags that material as untrusted and instructs the model not to follow instructions found inside it.
+- That defense is weaker with Manus than with OpenAI. OpenAI carries Feedian's instructions in a separate system field the page text cannot reach; Manus has no such field, so the instructions are placed before and repeated after the quoted material in one message, and Manus executes it as an agent. Prefer OpenAI when the material is untrusted enough to matter.
+- Whatever a provider returns is re-checked against Feedian's own schema before a note is written, so a provider that does not enforce the schema itself cannot write malformed frontmatter.
+- Page fetching accepts only HTTP(S), blocks private/local addresses by default, and rechecks redirects. Add only trusted hosts to `fetch.allow_private_hosts`. Addresses are checked by resolving the hostname, and the connection resolves it again independently, so this does not defeat a DNS entry that changes between the two.
+- Raindrop and LLM requests retry bounded transient failures with capped exponential backoff.
 - A Vault write lock prevents overlapping mutating operations.
-- Before every OpenAI request, Feedian checks that the Vault remains readable. LLM usage and the generated note are recorded per resource in SQLite.
+- Before every OpenAI request, Feedian checks that the Vault remains readable. The request as sent, the response, LLM usage, and the generated note are recorded per resource in SQLite.
 - Public Hatena comment and star retrieval uses Hatena's official APIs and does not require an LLM.
 - Full-text search is a rebuildable local cache; the SQLite Vault database remains authoritative.
 
