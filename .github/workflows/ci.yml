@@ -47,12 +47,10 @@ jobs:
         with:
           python-version: "3.13"
       - run: pip install ruff
-      # Pyflakes rules only: unused imports, undefined names, and similar real
-      # defects. The style and import-order rules are left off deliberately, so
-      # that this stays a defect gate rather than a reformatting demand on a
-      # codebase whose layout is already consistent.
+      # The rule selection lives in pyproject.toml, so a local run and this job
+      # cannot disagree about what counts as a defect.
       - name: Check for defects
-        run: ruff check --select F feedian tests
+        run: ruff check feedian tests
 
   secrets:
     runs-on: ubuntu-latest

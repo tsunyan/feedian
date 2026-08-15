@@ -1,0 +1,60 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "feedian"
+# Read from feedian.__version__ so the packaging metadata and the constant the
+# running code reports cannot drift apart.
+dynamic = ["version"]
+description = "Collect bookmarks and feeds into a per-Obsidian-vault SQLite archive and render Markdown views."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "tsunyan" }]
+# Enforced by pip at install time, unlike the README badge. 3.10 is excluded
+# because `datetime.fromisoformat` cannot read a Z suffix there, which this
+# codebase currently works around by hand at every call site.
+requires-python = ">=3.11"
+classifiers = [
+    "Environment :: Console",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+# Lower bounds only. requirements.txt keeps the exact pins that CI and a fresh
+# development checkout install.
+dependencies = [
+    "charset-normalizer>=3.4.9",
+    "lxml>=6.1.1",
+    "playwright>=1.62.0",
+    "pypdf>=6.12.1",
+    "rich>=15.0.0",
+    "tiktoken>=0.13.0",
+    "trafilatura>=2.2.0",
+    "w3lib>=2.4.1",
+]
+
+[project.urls]
+Homepage = "https://github.com/tsunyan/feedian"
+
+[project.scripts]
+# Replaces the feedian.bat shim, which had to repeat cli.COMMANDS to choose
+# between the modern and legacy adapters, and had already drifted from it.
+feedian = "feedian.__main__:main"
+
+[tool.setuptools]
+packages = ["feedian"]
+
+[tool.setuptools.dynamic]
+version = { attr = "feedian.__version__" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff.lint]
+# Pyflakes only: unused imports, undefined names, and similar real defects. The
+# style and import-order rules are left off deliberately, so that linting stays
+# a defect gate rather than a reformatting demand on a codebase whose layout is
+# already consistent.
+select = ["F"]
