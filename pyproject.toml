@@ -52,6 +52,16 @@ version = { attr = "feedian.__version__" }
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
+[tool.coverage.run]
+source = ["feedian"]
+
+[tool.coverage.report]
+# A floor a little below the current figure. It is here to catch a large drop,
+# not to push the number up: raising it is a decision to make deliberately after
+# writing tests, not something a passing build should imply.
+fail_under = 75
+show_missing = true
+
 [tool.ruff.lint]
 # Pyflakes only: unused imports, undefined names, and similar real defects. The
 # style and import-order rules are left off deliberately, so that linting stays
