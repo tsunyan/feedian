@@ -56,6 +56,11 @@ jobs:
 
   secrets:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # gitleaks reads the pull request's commit list, which the workflow-wide
+      # contents-only permission does not cover.
+      pull-requests: read
     steps:
       - uses: actions/checkout@v7
         with:
