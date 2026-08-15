@@ -60,6 +60,15 @@ OPENAI_MODEL=gpt-5.6-luna
 
 `OPENAI_API_KEY` is needed only when `ingest` must make a new API call. `OPENAI_MODEL` is optional and selects its default model. RSS needs no credential. Do not commit `.env`.
 
+Feedian reads `.env` from the current directory first, then a per-user file:
+
+| Path | When it is used |
+| --- | --- |
+| `./.env` | Running from the repository or any directory holding a `.env`. |
+| `%APPDATA%\Feedian\.env` (Windows), `$XDG_CONFIG_HOME/feedian/.env` or `~/.config/feedian/.env` | Any working directory, including scheduled runs. |
+
+Real environment variables win over both, and the working-directory file wins over the per-user file. Because commands can select a Vault from anywhere, put credentials in the per-user file if you run Feedian from outside the repository — `feedian schedule` tasks start in an arbitrary directory and would otherwise find no `.env`. Keep credentials out of the Vault itself: a Vault is a Git repository that `snapshot` commits and pushes.
+
 For Hatena, the API key is the key shown in the [posting email address settings](https://www.hatena.ne.jp/my/config/mail/upload), not the account password. If the address is shown as `API_KEY.HATENA_ID@...`, use the `API_KEY` part.
 
 ### 3. Initialize a Vault

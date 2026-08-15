@@ -23,7 +23,14 @@ from .scheduler import install_schedule, remove_schedule, schedule_status
 from .snapshots import create_snapshot
 from .search import rebuild_search_index, search_index_generation
 from .store import SCHEMA_VERSION
-from .vault import find_vault_root, initialize_vault, load_vault_config, save_default_vault, vault_paths
+from .vault import (
+    find_vault_root,
+    initialize_vault,
+    load_vault_config,
+    save_default_vault,
+    user_env_path,
+    vault_paths,
+)
 
 
 COMMANDS = frozenset({"init", "config", "status", "migrate", "sync", "reextract", "enrich-stars", "render", "run", "snapshot", "restore", "schedule", "auth", "ingest", "search"})
@@ -133,6 +140,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str]) -> int:
     load_env_file(Path(".env"))
+    load_env_file(user_env_path())
     parser = build_parser()
     if not argv:
         parser.print_help()

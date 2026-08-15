@@ -50,6 +50,7 @@ from .progress import PROGRESS_MODES, ProgressReporter
 from .raindrop import RaindropClient
 from .recovery import PendingTransaction, load_pending, remove_pending, save_pending
 from .source_state import load_raindrop_collection_count, save_raindrop_collection_count
+from .vault import user_env_path
 
 
 NON_CONTENT_TAGS = frozenset({"x", "sns"})
@@ -1471,6 +1472,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(command_args)
     try:
         load_env_file(Path(".env"))
+        load_env_file(user_env_path())
         config = apply_overrides(load_config(args.config), args)
         sync_actions = int(args.sync_raindrop_summary) + int(args.sync_raindrop_tags)
         if sync_actions > 1:
