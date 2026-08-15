@@ -4,6 +4,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  # gitleaks scans only the commits of the triggering event. A full sweep of the
+  # history needs an event that is not tied to a diff, which is what the audit
+  # before publishing the repository requires.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -60,3 +64,6 @@ jobs:
           # repository.
           fetch-depth: 0
       - uses: gitleaks/gitleaks-action@v3
+        env:
+          # Required since v3 to scan pull requests.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
