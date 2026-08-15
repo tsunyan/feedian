@@ -4,7 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "feedian"
-version = "0.1.0"
+# Read from feedian.__version__ so the packaging metadata and the constant the
+# running code reports cannot drift apart.
+dynamic = ["version"]
 description = "Collect bookmarks and feeds into a per-Obsidian-vault SQLite archive and render Markdown views."
 readme = "README.md"
 license = "MIT"
@@ -43,6 +45,9 @@ feedian = "feedian.__main__:main"
 
 [tool.setuptools]
 packages = ["feedian"]
+
+[tool.setuptools.dynamic]
+version = { attr = "feedian.__version__" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

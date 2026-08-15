@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import importlib.metadata
 import json
 import re
 import shutil
@@ -12,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from . import __version__
 from .ids import uuid7
 from .store import VaultStore
 from .vault import VaultConfig, vault_paths
@@ -162,11 +162,14 @@ def _base_manifest(
 
 
 def _feedian_build_info() -> dict[str, Any]:
+    """Describe the build that produced a snapshot.
+
+    The version comes from the running package rather than installed
+    distribution metadata, so a snapshot taken from a plain checkout records the
+    real version instead of a placeholder.
+    """
     root = Path(__file__).resolve().parents[1]
-    try:
-        version = importlib.metadata.version("feedian")
-    except importlib.metadata.PackageNotFoundError:
-        version = "development"
+    version = __version__
     commit = _git_output(root, ["rev-parse", "HEAD"], required=False)
     dirty = bool(_git_output(root, ["status", "--porcelain"], required=False))
     return {"version": version, "commit": commit or None, "dirty": dirty}
