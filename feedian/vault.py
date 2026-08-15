@@ -100,6 +100,17 @@ def user_settings_path() -> Path:
     return config_home / "feedian" / "settings.json"
 
 
+def user_env_path() -> Path:
+    """A per-user .env beside the user settings file.
+
+    Vault selection is already independent of the working directory, so
+    credentials must be too: a scheduled run starts in an arbitrary directory and
+    would otherwise find no .env at all. This location is outside every Vault, so
+    it cannot be committed by a Vault's own Git repository.
+    """
+    return user_settings_path().with_name(".env")
+
+
 def load_user_settings() -> dict[str, Any]:
     path = user_settings_path()
     if not path.exists():

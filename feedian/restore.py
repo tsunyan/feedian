@@ -4,7 +4,6 @@ import hashlib
 import json
 import shutil
 import sqlite3
-import subprocess
 from pathlib import Path
 
 from .snapshots import _find_7zip, _github_repository, _run

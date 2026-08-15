@@ -29,6 +29,13 @@ class IngestReport:
     input_tokens: int = 0
     output_tokens: int = 0
     cost_usd: float = 0.0
+    # API calls that returned no price and no token usage. Without these, a
+    # provider Feedian cannot price (Manus) is indistinguishable from a free run.
+    unpriced_requests: int = 0
+    unmetered_requests: int = 0
+    last_status: str = ""
+    last_run_id: str | None = None
+    last_error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -50,6 +57,15 @@ class IngestCandidate:
     @property
     def title(self) -> str:
         return str(self.row["title"] or self.metadata.get("title") or "Untitled")
+
+    @property
+    def source_ref(self) -> str:
+        provider = str(self.metadata.get("_feedian_source") or "unknown")
+        native_id = str(
+            self.metadata.get("_feedian_source_id") or self.metadata.get("_id") or "unknown"
+        )
+        safe_native_id = re.sub(r"\s+", " ", native_id).strip()[:120]
+        return f"{provider}:{safe_native_id}"
 
 
 @dataclass(frozen=True)
@@ -78,9 +94,13 @@ def plan_source_notes(
     limit: int | None = None,
     force: bool = False,
     auto: bool = False,
+    provider: str = "openai",
 ) -> IngestPlan:
     rows = _source_rows(store)
-    all_candidates = [_candidate(store, row, model=model, language=language, force=force) for row in rows]
+    all_candidates = [
+        _candidate(store, row, model=model, language=language, force=force, provider=provider)
+        for row in rows
+    ]
     if auto:
         effective_limit = 20 if limit is None else limit
         candidates = _select_auto_candidates(store, all_candidates, effective_limit)
@@ -125,17 +145,21 @@ def ingest_source_notes(
     dry_run: bool = False,
     progress: IngestProgress | None = None,
     plan: IngestPlan | None = None,
+    provider: str = "openai",
 ) -> IngestReport:
     plan = plan or plan_source_notes(
-        store, model=model, language=language, limit=limit, force=force, auto=auto,
+        store, model=model, language=language, limit=limit, force=force, auto=auto, provider=provider,
     )
     if dry_run:
         return IngestReport(processed=len(plan.candidates), reused=plan.reusable)
-    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    api_key_name = "MANUS_API_KEY" if provider == "manus" else "OPENAI_API_KEY"
+    api_key = os.environ.get(api_key_name, "").strip()
     if plan.new_requests and not api_key:
-        raise RuntimeError("Missing required environment variable: OPENAI_API_KEY")
+        raise RuntimeError(f"Missing required environment variable: {api_key_name}")
     processed = created = reused = failed = input_tokens = output_tokens = 0
+    unpriced = unmetered = 0
     cost_usd = 0.0
+    max_article_chars = 3_000 if provider == "manus" else 10_000
     for candidate in plan.candidates:
         row = candidate.row
         metadata = candidate.metadata
@@ -149,7 +173,10 @@ def ingest_source_notes(
             if progress is not None:
                 progress(
                     processed, len(plan.candidates), candidate,
-                    IngestReport(processed, created, reused, failed, input_tokens, output_tokens, cost_usd),
+                    IngestReport(
+                        processed, created, reused, failed, input_tokens, output_tokens, cost_usd,
+                        unpriced, unmetered, last_status="reused",
+                    ),
                 )
             continue
         run_id = store.start_llm_run(
@@ -157,13 +184,19 @@ def ingest_source_notes(
             operation="source-note", model=model, prompt_version=PROMPT_VERSION,
             input_fingerprint=candidate.fingerprint, request=candidate.request,
         )
+        item_status = "created"
+        item_error = None
         try:
             page = _page(row, metadata)
             audit = summarize_bookmark_with_audit(
-                api_key, model, metadata, page, language, 60, 800, "low", 3, 1.0, 10_000,
+                api_key, model, metadata, page, language, 60, 800, "low", 3, 1.0, max_article_chars,
+                provider=provider,
             )
             price = _price_record(audit.usage, model)
-            store.finish_llm_run(run_id, response=audit.response, result=audit.result, usage=audit.usage, price=price)
+            store.finish_llm_run(
+                run_id, request=audit.request, response=audit.response,
+                result=audit.result, usage=audit.usage, price=price,
+            )
             store.put_source_note(
                 resource_id=candidate.resource_id, llm_run_id=run_id,
                 markdown=render_source_note(row, metadata, audit.result, model=model),
@@ -171,18 +204,30 @@ def ingest_source_notes(
             created += 1
             input_tokens += _usage_count(audit.usage.get("input_tokens"))
             output_tokens += _usage_count(audit.usage.get("output_tokens"))
+            if not audit.usage:
+                unmetered += 1
             estimated_cost = price.get("estimated_cost_usd")
             if isinstance(estimated_cost, (int, float)):
                 cost_usd += float(estimated_cost)
+            else:
+                unpriced += 1
         except Exception as exc:
-            store.finish_llm_run(run_id, error=str(exc))
+            item_status = "failed"
+            item_error = str(exc)
+            store.finish_llm_run(run_id, error=item_error)
             failed += 1
         if progress is not None:
             progress(
                 processed, len(plan.candidates), candidate,
-                IngestReport(processed, created, reused, failed, input_tokens, output_tokens, cost_usd),
+                IngestReport(
+                    processed, created, reused, failed, input_tokens, output_tokens, cost_usd,
+                    unpriced, unmetered,
+                    last_status=item_status, last_run_id=run_id, last_error=item_error,
+                ),
             )
-    return IngestReport(processed, created, reused, failed, input_tokens, output_tokens, cost_usd)
+    return IngestReport(
+        processed, created, reused, failed, input_tokens, output_tokens, cost_usd, unpriced, unmetered,
+    )
 
 
 def _source_rows(store: VaultStore) -> list[Any]:
@@ -203,13 +248,15 @@ def _source_rows(store: VaultStore) -> list[Any]:
 
 
 def _candidate(
-    store: VaultStore, row: Any, *, model: str, language: str, force: bool,
+    store: VaultStore, row: Any, *, model: str, language: str, force: bool, provider: str = "openai",
 ) -> IngestCandidate:
     metadata = json.loads(str(row["metadata_json"]))
+    max_article_chars = 3_000 if provider == "manus" else 10_000
     request = build_summary_request(
         model=model, item=metadata, page=_page(row, metadata), language=language,
-        max_output_tokens=800, reasoning_effort="low", max_article_chars=10_000,
+        max_output_tokens=800, reasoning_effort="low", max_article_chars=max_article_chars,
     )
+    request["provider"] = provider
     fingerprint = hashlib.sha256(stable_json(request).encode("utf-8")).hexdigest()
     cached = None if force else store.successful_llm_result(
         resource_revision_id=str(row["resource_revision_id"]), operation="source-note", model=model,

@@ -8,7 +8,14 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
 from .locking import vault_write_lock
-from .cli_ui import RichArgumentParser, print_cli_error, print_ingest_plan
+from .cli_ui import (
+    RichArgumentParser,
+    ingest_cost_text,
+    ingest_cost_value,
+    ingest_tokens_text,
+    print_cli_error,
+    print_ingest_plan,
+)
 from .env import load_env_file
 from .ingest import ingest_source_notes, plan_source_notes, render_source_notes
 from .notifications import notify_windows
@@ -23,7 +30,14 @@ from .scheduler import install_schedule, remove_schedule, schedule_status
 from .snapshots import create_snapshot
 from .search import rebuild_search_index, search_index_generation
 from .store import SCHEMA_VERSION
-from .vault import find_vault_root, initialize_vault, load_vault_config, save_default_vault, vault_paths
+from .vault import (
+    find_vault_root,
+    initialize_vault,
+    load_vault_config,
+    save_default_vault,
+    user_env_path,
+    vault_paths,
+)
 
 
 COMMANDS = frozenset({"init", "config", "status", "migrate", "sync", "reextract", "enrich-stars", "render", "run", "snapshot", "restore", "schedule", "auth", "ingest", "search"})
@@ -114,7 +128,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     ingest = subparsers.add_parser("ingest", help="Use the LLM to create source notes from stored resources.")
     ingest.add_argument("--vault", help="Vault root. Defaults to the current or configured Vault.")
-    ingest.add_argument("--model", default=os.environ.get("OPENAI_MODEL", "gpt-5.6-terra"))
+    ingest.add_argument("--model", help="Model/profile for this run. Uses the provider default when omitted.")
+    ingest.add_argument(
+        "--provider", choices=("openai", "manus"),
+        default=os.environ.get("LLM_PROVIDER", "openai"),
+        help="LLM provider for this run (default: openai).",
+    )
     ingest.add_argument("--language", default="Japanese")
     ingest.add_argument("--limit", type=int)
     ingest.add_argument("--force", action="store_true", help="Ignore matching successful LLM results and run again.")
@@ -133,6 +152,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str]) -> int:
     load_env_file(Path(".env"))
+    load_env_file(user_env_path())
     parser = build_parser()
     if not argv:
         parser.print_help()
@@ -587,26 +607,31 @@ def _ingest(args: argparse.Namespace) -> int:
         raise FileNotFoundError(f"Database not found: {paths.database_path}; run feedian sync first.")
     store = VaultStore.open(paths.database_path)
     try:
+        model = args.model or (
+            os.environ.get("MANUS_MODEL", "manus-1.6")
+            if args.provider == "manus"
+            else os.environ.get("OPENAI_MODEL", "gpt-5.6-terra")
+        )
         if args.limit is not None and args.limit < 0:
             raise ValueError("--limit must be zero or greater.")
         if args.dry_run:
             plan = plan_source_notes(
-                store, model=args.model, language=args.language, limit=args.limit,
-                force=args.force, auto=args.auto,
+                store, model=model, language=args.language, limit=args.limit,
+                force=args.force, auto=args.auto, provider=args.provider,
             )
             print_ingest_plan(
-                plan, model=args.model, dry_run=True, command=args._invocation,
+                plan, provider=args.provider, model=model, dry_run=True, command=args._invocation,
             )
             return 0
 
         reporter = ProgressReporter(args.progress)
         with vault_write_lock(paths.state_dir):
             plan = plan_source_notes(
-                store, model=args.model, language=args.language, limit=args.limit,
-                force=args.force, auto=args.auto,
+                store, model=model, language=args.language, limit=args.limit,
+                force=args.force, auto=args.auto, provider=args.provider,
             )
             print_ingest_plan(
-                plan, model=args.model, dry_run=False, command=args._invocation,
+                plan, provider=args.provider, model=model, dry_run=False, command=args._invocation,
             )
 
             with reporter:
@@ -614,24 +639,33 @@ def _ingest(args: argparse.Namespace) -> int:
 
                 def ingest_progress(processed, total, candidate, current) -> None:
                     reporter.set_description(
-                        f"ingest: in {current.input_tokens:,} | out {current.output_tokens:,} "
-                        f"| ${current.cost_usd:.6f}"
+                        f"ingest: {ingest_tokens_text(current)} | {ingest_cost_text(current)}"
                     )
                     reporter.advance()
-                    reporter.log(
-                        f"  {processed}/{total}  ${current.cost_usd:.6f}  {candidate.title}"
+                    identity = (
+                        f"source={candidate.source_ref} resource={candidate.resource_id} "
+                        f"run={current.last_run_id or '-'}"
                     )
+                    reporter.log(
+                        f"  {processed}/{total}  {current.last_status.upper()}  {identity}  "
+                        f"{ingest_cost_text(current)}  {candidate.title}"
+                    )
+                    if current.last_error:
+                        error = " ".join(current.last_error.split())
+                        reporter.log(f"    error={error[:500]}")
 
                 report = ingest_source_notes(
-                    store, root, config, model=args.model, language=args.language,
+                    store, root, config, model=model, language=args.language,
                     limit=args.limit, force=args.force, auto=args.auto,
-                    progress=ingest_progress, plan=plan,
+                    progress=ingest_progress, plan=plan, provider=args.provider,
                 )
                 written, skipped = render_source_notes(store, root, config)
         print(
             f"ingest: processed={report.processed} created={report.created} reused={report.reused} "
             f"failed={report.failed} input_tokens={report.input_tokens} output_tokens={report.output_tokens} "
-            f"cost_usd={report.cost_usd:.6f} source_written={written} source_skipped={skipped}"
+            f"unmetered_requests={report.unmetered_requests} cost_usd={ingest_cost_value(report)} "
+            f"unpriced_requests={report.unpriced_requests} "
+            f"source_written={written} source_skipped={skipped}"
         )
         return 1 if report.failed else 0
     finally:

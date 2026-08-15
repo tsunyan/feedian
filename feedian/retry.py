@@ -14,23 +14,36 @@ def run_with_retries(
     operation: Callable[[], T],
     max_retries: int,
     retry_base_seconds: float,
+    *,
+    transient_status_codes: frozenset[int] = frozenset(),
+    max_delay_seconds: float = 60.0,
 ) -> T:
+    """Retry a bounded number of times.
+
+    `transient_status_codes` adds call-specific statuses to the retryable set, so
+    a caller never needs its own nested retry loop; nesting one inside this
+    function multiplies the attempts and makes the total wait unpredictable.
+    """
     for attempt in range(max_retries + 1):
         try:
             return operation()
         except (HTTPError, URLError, TimeoutError, ConnectionError) as exc:
-            if attempt >= max_retries or not is_transient_error(exc):
+            if attempt >= max_retries or not is_transient_error(exc, transient_status_codes):
                 raise
-            delay = retry_delay_seconds(exc, retry_base_seconds, attempt)
+            delay = min(max_delay_seconds, retry_delay_seconds(exc, retry_base_seconds, attempt))
             if isinstance(exc, HTTPError):
                 exc.close()
             time.sleep(delay)
     raise AssertionError("retry loop exited without returning or raising")
 
 
-def is_transient_error(exc: Exception) -> bool:
+def is_transient_error(exc: Exception, extra_status_codes: frozenset[int] = frozenset()) -> bool:
     if isinstance(exc, HTTPError):
-        return exc.code in TRANSIENT_HTTP_STATUS_CODES or 500 <= exc.code <= 599
+        return (
+            exc.code in TRANSIENT_HTTP_STATUS_CODES
+            or exc.code in extra_status_codes
+            or 500 <= exc.code <= 599
+        )
     return True
 
 

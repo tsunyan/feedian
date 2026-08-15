@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .ids import uuid7
-from .store import VaultStore, stable_json
+from .store import VaultStore
 from .vault import VaultConfig, vault_paths
 
 
