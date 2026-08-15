@@ -166,9 +166,13 @@ class LlmTests(unittest.TestCase):
         mock_request.side_effect = [
             {"task_id": "task-1", "request_id": "req-1", "task_url": "https://manus.ai/task-1"},
             {
-                "agent_status": "running",
+                "ok": True,
+                "task_id": "task-1",
+                # Newest first, as the request asks for. A finished task still
+                # reports a status, so the result has to win over it.
                 "messages": [
                     {
+                        "type": "structured_output",
                         "structured_output_result": {
                             "success": True,
                             "value": {
@@ -178,8 +182,9 @@ class LlmTests(unittest.TestCase):
                                 "tags": "ai, python",
                                 "content_type": "article",
                             },
-                        }
-                    }
+                        },
+                    },
+                    {"type": "status_update", "status_update": {"agent_status": "stopped"}},
                 ],
             },
         ]
@@ -236,7 +241,10 @@ class LlmTests(unittest.TestCase):
     def test_manus_failure_names_the_task_so_it_can_be_stopped(self, _slot, mock_request, _sleep) -> None:
         mock_request.side_effect = [
             {"task_id": "task-1", "request_id": "req-1", "task_url": "https://manus.ai/task-1"},
-            {"agent_status": "error", "messages": []},
+            {
+                "ok": True,
+                "messages": [{"type": "status_update", "status_update": {"agent_status": "error"}}],
+            },
         ]
 
         with self.assertRaises(RuntimeError) as raised:
@@ -258,6 +266,42 @@ class LlmTests(unittest.TestCase):
         self.assertIn("task_id=task-1", message)
         self.assertIn("https://manus.ai/task-1", message)
         self.assertIn("may still be running", message)
+
+    @patch("feedian.llm.time.sleep")
+    @patch("feedian.llm._manus_request")
+    @patch("feedian.llm._wait_for_manus_create_slot")
+    def test_manus_stops_on_a_status_it_cannot_recover_from(self, _slot, mock_request, _sleep) -> None:
+        # An agent asking for confirmation will never get an answer from a
+        # non-interactive run. Only two responses are supplied, so polling on
+        # instead of failing would exhaust them rather than quietly time out.
+        mock_request.side_effect = [
+            {"task_id": "task-1", "request_id": "req-1", "task_url": "https://manus.ai/task-1"},
+            {
+                "ok": True,
+                "messages": [
+                    {"type": "status_update", "status_update": {"agent_status": "waiting"}},
+                    {"type": "status_update", "status_update": {"agent_status": "running"}},
+                ],
+            },
+        ]
+
+        with self.assertRaises(RuntimeError) as raised:
+            summarize_bookmark_with_audit(
+                api_key="key",
+                model="manus-1.6",
+                item={"title": "Title", "link": "https://example.com"},
+                page=PageFetchResult(url="https://example.com", text="Body", title="Title", error=None),
+                language="ja",
+                timeout_seconds=30,
+                max_output_tokens=800,
+                reasoning_effort="low",
+                max_retries=3,
+                retry_base_seconds=1.0,
+                provider="manus",
+            )
+
+        self.assertIn("task ended with status: waiting", str(raised.exception))
+        self.assertEqual(mock_request.call_count, 2)
 
 
 if __name__ == "__main__":

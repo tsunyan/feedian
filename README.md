@@ -4,7 +4,7 @@
 ![Dependencies](https://img.shields.io/badge/dependencies-see%20requirements.txt-4C8CBF)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
 
-Feedian collects bookmarks and feeds into a per-Obsidian-vault SQLite archive, renders the collected material as `raw/` Markdown, and optionally uses OpenAI to create summarized and tagged `source/` notes.
+Feedian collects bookmarks and feeds into a per-Obsidian-vault SQLite archive, renders the collected material as `raw/` Markdown, and optionally uses an LLM — OpenAI or Manus — to create summarized and tagged `source/` notes.
 
 Supported providers are Raindrop.io, Hatena Bookmark, and RSS/Atom. Public Hatena comments can be attached to URLs collected from **any** provider.
 
@@ -21,7 +21,7 @@ Raindrop / Hatena / RSS
        |             |
        v             v
 feedian render    feedian ingest
-       |             |       OpenAI is used here only
+       |             |       the LLM is used here only
        v             v
      raw/          source/
 ```
@@ -385,7 +385,7 @@ Run the due non-LLM pipeline: sync due providers, refresh due Hatena stars, rebu
 | `--if-due` | Exit without work if no provider or snapshot is due. Used by the logon catch-up task. |
 | `--skip-snapshot` | Run sync, star enrichment, search, and render without creating a snapshot. |
 
-`run` never invokes `ingest` and therefore never calls OpenAI.
+`run` never invokes `ingest` and therefore never calls an LLM.
 
 ### `schedule`
 
@@ -562,7 +562,7 @@ See [`config.example.json`](config.example.json) for legacy config fields. The l
 - Page fetching accepts only HTTP(S), blocks private/local addresses by default, and rechecks redirects. Add only trusted hosts to `fetch.allow_private_hosts`. Addresses are checked by resolving the hostname, and the connection resolves it again independently, so this does not defeat a DNS entry that changes between the two.
 - Raindrop and LLM requests retry bounded transient failures with capped exponential backoff.
 - A Vault write lock prevents overlapping mutating operations.
-- Before every OpenAI request, Feedian checks that the Vault remains readable. The request as sent, the response, LLM usage, and the generated note are recorded per resource in SQLite.
+- Before every LLM request, Feedian checks that the Vault remains readable. The request as sent, the response, LLM usage, and the generated note are recorded per resource in SQLite.
 - Public Hatena comment and star retrieval uses Hatena's official APIs and does not require an LLM.
 - Full-text search is a rebuildable local cache; the SQLite Vault database remains authoritative.
 
