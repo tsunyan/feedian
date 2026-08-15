@@ -20,6 +20,10 @@ MANUS_CREATE_INTERVAL_SECONDS = 6.1
 # ceiling on any single backoff, so the worst-case wait per request stays bounded.
 MANUS_NOT_FOUND_RETRIES = 6
 MANUS_MAX_RETRY_DELAY_SECONDS = 4.0
+# Agent states a non-interactive run can never recover from. "waiting" means the
+# agent is asking the user to confirm something, and nobody is there to answer;
+# "stopped" without a result means it will not produce one.
+MANUS_UNRECOVERABLE_STATUSES = frozenset({"error", "stopped", "waiting"})
 _manus_last_create_at = 0.0
 _manus_create_lock = threading.Lock()
 
@@ -269,6 +273,7 @@ def _summarize_with_manus(
             )
         except RuntimeError as exc:
             raise _manus_failure(task_identity, str(exc)) from exc
+        latest_status: str | None = None
         for message in messages.get("messages", []):
             if not isinstance(message, dict):
                 continue
@@ -284,9 +289,17 @@ def _summarize_with_manus(
             error = message.get("error_message")
             if isinstance(error, dict) and error.get("content"):
                 raise _manus_failure(task_identity, f"task failed: {error['content']}")
-        status = messages.get("agent_status")
-        if status in {"error", "waiting"}:
-            raise _manus_failure(task_identity, f"task ended with status: {status}")
+            # The status lives on the message, not on the response. Messages are
+            # requested newest first, so the first one seen is the current state,
+            # and it is acted on only after the whole page has been searched for
+            # a result, so a finished task is never reported as a failure.
+            status_update = message.get("status_update")
+            if latest_status is None and isinstance(status_update, dict):
+                agent_status = status_update.get("agent_status")
+                if isinstance(agent_status, str):
+                    latest_status = agent_status
+        if latest_status in MANUS_UNRECOVERABLE_STATUSES:
+            raise _manus_failure(task_identity, f"task ended with status: {latest_status}")
         time.sleep(1.0)
     raise _manus_failure(task_identity, "task timed out while waiting for a result")
 
