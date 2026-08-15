@@ -1,0 +1,23 @@
+version: 2
+updates:
+  # Version bump PRs. Security-only PRs for known CVEs are handled separately
+  # by "Dependabot security updates", enabled in the repository settings —
+  # this is not a duplicate of that.
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      # requirements.txt and pyproject.toml both declare dependencies in this
+      # directory; one PR per week covering every update is easier to review
+      # than one per package.
+      python-dependencies:
+        patterns: ["*"]
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns: ["*"]
