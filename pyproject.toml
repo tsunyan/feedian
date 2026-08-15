@@ -37,9 +37,8 @@ dependencies = [
 Homepage = "https://github.com/tsunyan/feedian"
 
 [project.scripts]
-# The same entry point feedian.bat shells out to. Installing the project makes
-# `feedian` a real command, so the command list no longer has to be repeated in
-# a batch file that can drift from cli.COMMANDS.
+# Replaces the feedian.bat shim, which had to repeat cli.COMMANDS to choose
+# between the modern and legacy adapters, and had already drifted from it.
 feedian = "feedian.__main__:main"
 
 [tool.setuptools]

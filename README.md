@@ -39,12 +39,23 @@ feedian render    feedian ingest
 ```powershell
 git clone https://github.com/tsunyan/feedian.git
 cd feedian
-python -m venv .venv
+py -3.11 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m pip install -e .
 .\.venv\Scripts\python.exe -m playwright install chromium --only-shell
 ```
 
-Examples below use `feedian`. From PowerShell in the repository, use `.\feedian.bat` if the repository is not on `PATH`.
+Installing the project provides the `feedian` command, which every example below uses. Activate the virtual environment to put it on `PATH`:
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+```
+
+To use it from any directory without activating anything, add a function to your PowerShell profile (`$PROFILE`) instead:
+
+```powershell
+function feedian { & "C:\path\to\feedian\.venv\Scripts\feedian.exe" @args }
+```
 
 ### 2. Set credentials
 
