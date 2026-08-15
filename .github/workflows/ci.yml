@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # gitleaks scans only the commits of the triggering event. A full sweep of the
+  # history needs an event that is not tied to a diff, which is what the audit
+  # before publishing the repository requires.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: tests (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install dependencies
+        # `playwright install` is deliberately skipped. The browser is downloaded
+        # on demand by page rendering, which no test reaches.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pytest
+      - name: Run tests
+        run: python -m pytest -q
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - run: pip install ruff
+      # Pyflakes rules only: unused imports, undefined names, and similar real
+      # defects. The style and import-order rules are left off deliberately, so
+      # that this stays a defect gate rather than a reformatting demand on a
+      # codebase whose layout is already consistent.
+      - name: Check for defects
+        run: ruff check --select F feedian tests
+
+  secrets:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # gitleaks reads the pull request's commit list, which the workflow-wide
+      # contents-only permission does not cover.
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Secrets have to be hunted through the whole history, not just the
+          # diff: a key removed in a later commit is still published with the
+          # repository.
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v3
+        env:
+          # Required since v3 to scan pull requests.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
