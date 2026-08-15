@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import sqlite3
+
+import pytest
+
 from feedian.canonical import CanonicalItem
-from feedian.store import VaultStore
+from feedian.store import VaultStore, _column_exists, _transaction
 
 
 def _item(*, title: str = "Title", comment: str = "", url: str = "https://example.test/article") -> CanonicalItem:
@@ -350,3 +354,79 @@ def test_v3_migration_normalizes_and_prunes_hatena_comments(tmp_path) -> None:
         assert tuple(state) == ("https://b.hatena.ne.jp/entry/example", "123")
     finally:
         migrated.close()
+
+
+def test_transaction_discards_every_write_when_the_batch_fails(tmp_path) -> None:
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        with pytest.raises(RuntimeError):
+            with _transaction(store.connection) as connection:
+                connection.execute(
+                    "INSERT INTO schema_meta(key, value) VALUES ('probe', 'written')"
+                )
+                raise RuntimeError("batch failed")
+
+        assert store.connection.execute(
+            "SELECT COUNT(*) FROM schema_meta WHERE key = 'probe'"
+        ).fetchone()[0] == 0
+    finally:
+        store.close()
+
+
+def _downgrade_to_v4(path) -> None:
+    connection = sqlite3.connect(path)
+    try:
+        connection.executescript(
+            """
+            ALTER TABLE fetch_capture DROP COLUMN response_etag;
+            ALTER TABLE fetch_capture DROP COLUMN response_last_modified;
+            UPDATE schema_meta SET value = '4' WHERE key = 'schema_version';
+            """
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def test_v4_migration_adds_fetch_validators_and_commits(tmp_path) -> None:
+    path = tmp_path / "feedian.sqlite3"
+    VaultStore.open(path).close()
+    _downgrade_to_v4(path)
+
+    migrated = VaultStore.open(path, allow_migration=True)
+    try:
+        columns = {
+            str(row[1]) for row in migrated.connection.execute("PRAGMA table_info(fetch_capture)")
+        }
+        assert {"response_etag", "response_last_modified"} <= columns
+        assert migrated.schema_version() == 5
+    finally:
+        migrated.close()
+
+
+def test_failed_v4_migration_leaves_the_database_at_version_four(tmp_path, monkeypatch) -> None:
+    path = tmp_path / "feedian.sqlite3"
+    VaultStore.open(path).close()
+    _downgrade_to_v4(path)
+
+    def fail_on_the_second_column(connection, table, column):
+        if column == "response_last_modified":
+            raise RuntimeError("migration step failed")
+        return _column_exists(connection, table, column)
+
+    # Fail after the first ALTER has already run inside the transaction.
+    monkeypatch.setattr("feedian.store._column_exists", fail_on_the_second_column)
+    with pytest.raises(RuntimeError, match="migration step failed"):
+        VaultStore.open(path, allow_migration=True)
+
+    connection = sqlite3.connect(path)
+    try:
+        version = connection.execute(
+            "SELECT value FROM schema_meta WHERE key = 'schema_version'"
+        ).fetchone()[0]
+        columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(fetch_capture)")}
+    finally:
+        connection.close()
+
+    assert version == "4"
+    assert "response_etag" not in columns

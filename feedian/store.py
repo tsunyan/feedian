@@ -51,6 +51,24 @@ def _comment_content_hash(
     )
 
 
+@contextmanager
+def _transaction(connection: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+    """Run a write batch atomically.
+
+    Schema migrations use this as well as ordinary writes, so a migration that
+    fails part way through leaves the database at its previous schema version
+    rather than half upgraded.
+    """
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        yield connection
+    except BaseException:
+        connection.rollback()
+        raise
+    else:
+        connection.commit()
+
+
 @dataclass(frozen=True)
 class StoredItem:
     source_item_id: str
@@ -89,14 +107,8 @@ class VaultStore:
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
-        try:
-            self.connection.execute("BEGIN IMMEDIATE")
-            yield self.connection
-        except BaseException:
-            self.connection.rollback()
-            raise
-        else:
-            self.connection.commit()
+        with _transaction(self.connection) as connection:
+            yield connection
 
     def migrate(self, *, allow_migration: bool = False) -> None:
         self.connection.execute("CREATE TABLE IF NOT EXISTS schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
@@ -1201,8 +1213,7 @@ def _migrate_v1_to_v2(connection: sqlite3.Connection) -> None:
     Revision-shaped tables remain, but only the row referenced by each parent is
     retained. Search data and downloaded image bytes are deliberately removed.
     """
-    try:
-        connection.execute("BEGIN IMMEDIATE")
+    with _transaction(connection):
         if not _column_exists(connection, "comment_revision", "star_checked_at"):
             connection.execute("ALTER TABLE comment_revision ADD COLUMN star_checked_at TEXT")
         connection.execute(
@@ -1338,11 +1349,6 @@ def _migrate_v1_to_v2(connection: sqlite3.Connection) -> None:
         connection.execute(
             "UPDATE schema_meta SET value = '2' WHERE key = 'schema_version'"
         )
-    except BaseException:
-        connection.rollback()
-        raise
-    else:
-        connection.commit()
 
 
 def _column_exists(connection: sqlite3.Connection, table: str, column: str) -> bool:
@@ -1351,8 +1357,7 @@ def _column_exists(connection: sqlite3.Connection, table: str, column: str) -> b
 
 def _migrate_v2_to_v3(connection: sqlite3.Connection) -> None:
     """Discard reproducible HTML and the one-time legacy Markdown safety copy."""
-    try:
-        connection.execute("BEGIN IMMEDIATE")
+    with _transaction(connection):
         connection.execute(
             """
             UPDATE fetch_capture
@@ -1379,17 +1384,11 @@ def _migrate_v2_to_v3(connection: sqlite3.Connection) -> None:
         )
         connection.execute("DROP TABLE IF EXISTS legacy_artifact")
         connection.execute("UPDATE schema_meta SET value = '3' WHERE key = 'schema_version'")
-    except BaseException:
-        connection.rollback()
-        raise
-    else:
-        connection.commit()
 
 
 def _migrate_v3_to_v4(connection: sqlite3.Connection) -> None:
     """Normalize Hatena comment metadata and retain the top twenty comments per resource."""
-    try:
-        connection.execute("BEGIN IMMEDIATE")
+    with _transaction(connection):
         if not _column_exists(connection, "comment_revision", "posted_at"):
             connection.execute("ALTER TABLE comment_revision ADD COLUMN posted_at TEXT NOT NULL DEFAULT ''")
         if not _column_exists(connection, "resource_comment_state", "entry_url"):
@@ -1494,17 +1493,11 @@ def _migrate_v3_to_v4(connection: sqlite3.Connection) -> None:
             """
         )
         connection.execute("UPDATE schema_meta SET value = '4' WHERE key = 'schema_version'")
-    except BaseException:
-        connection.rollback()
-        raise
-    else:
-        connection.commit()
 
 
 def _migrate_v4_to_v5(connection: sqlite3.Connection) -> None:
     """Keep page validators so refreshes can use conditional HTTP requests."""
-    try:
-        connection.execute("BEGIN IMMEDIATE")
+    with _transaction(connection):
         if not _column_exists(connection, "fetch_capture", "response_etag"):
             connection.execute("ALTER TABLE fetch_capture ADD COLUMN response_etag TEXT NOT NULL DEFAULT ''")
         if not _column_exists(connection, "fetch_capture", "response_last_modified"):
@@ -1512,8 +1505,3 @@ def _migrate_v4_to_v5(connection: sqlite3.Connection) -> None:
                 "ALTER TABLE fetch_capture ADD COLUMN response_last_modified TEXT NOT NULL DEFAULT ''"
             )
         connection.execute("UPDATE schema_meta SET value = '5' WHERE key = 'schema_version'")
-    except BaseException:
-        connection.rollback()
-        raise
-    else:
-        connection.commit()
