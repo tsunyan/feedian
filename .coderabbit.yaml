@@ -1,0 +1,13 @@
+language: ja-JP
+
+reviews:
+  profile: chill
+  auto_review:
+    enabled: true
+    drafts: false
+  path_filters:
+    # Generated or vendored content: reviewing it produces findings about code
+    # nobody wrote by hand.
+    - "!graft/**"
+    - "!**/*.lock"
+  poem: false
