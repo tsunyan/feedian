@@ -155,3 +155,102 @@ def test_plan_uses_historical_output_ratio_for_expected_cost(tmp_path, monkeypat
         assert plan.estimated_cost_usd < (plan.max_cost_usd or 0)
     finally:
         store.close()
+
+
+def test_llm_run_records_the_request_that_was_actually_sent(tmp_path, monkeypatch) -> None:
+    root = tmp_path / "vault"
+    root.mkdir()
+    initialize_vault(root)
+    monkeypatch.setenv("MANUS_API_KEY", "test-key")
+    store = VaultStore.open(root / ".feedian" / "feedian.sqlite3")
+    try:
+        item = store.upsert_canonical_item(
+            CanonicalItem(
+                source="hatena", source_id="one", content_key="url:one",
+                url="https://example.test", title="Article",
+            )
+        )
+        store.record_resource_revision(item.resource_id or "", content_markdown="Body", title="Article")
+
+        class Audit:
+            result = {"note_title": "One", "summary": "Short", "key_points": [], "tags": ["one"], "content_type": "article"}
+            # A Manus payload has a different shape from the planned OpenAI request.
+            request = {"message": {"content": "sent to manus"}, "agent_profile": "manus-1.6"}
+            response = {"id": "response"}
+            usage: dict[str, int] = {}
+
+        monkeypatch.setattr("feedian.ingest.summarize_bookmark_with_audit", lambda *args, **kwargs: Audit())
+        ingest_source_notes(store, root, VaultConfig(), model="manus-1.6", provider="manus")
+
+        stored = store.connection.execute("SELECT request_json FROM llm_run").fetchone()[0]
+        assert "sent to manus" in stored
+        assert "input_text" not in stored
+    finally:
+        store.close()
+
+
+def test_failed_run_keeps_the_request_it_started_with(tmp_path, monkeypatch) -> None:
+    root = tmp_path / "vault"
+    root.mkdir()
+    initialize_vault(root)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    store = VaultStore.open(root / ".feedian" / "feedian.sqlite3")
+    try:
+        item = store.upsert_canonical_item(
+            CanonicalItem(
+                source="hatena", source_id="one", content_key="url:one",
+                url="https://example.test", title="Article",
+            )
+        )
+        store.record_resource_revision(item.resource_id or "", content_markdown="Body", title="Article")
+        monkeypatch.setattr(
+            "feedian.ingest.summarize_bookmark_with_audit",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+
+        report = ingest_source_notes(store, root, VaultConfig(), model="gpt-5.6-terra")
+
+        row = store.connection.execute("SELECT status, request_json FROM llm_run").fetchone()
+        assert report.failed == 1
+        assert row[0] == "failed"
+        assert "input_text" in row[1]
+    finally:
+        store.close()
+
+
+def test_ingest_counts_requests_it_cannot_price_or_meter(tmp_path, monkeypatch) -> None:
+    root = tmp_path / "vault"
+    root.mkdir()
+    initialize_vault(root)
+    monkeypatch.setenv("MANUS_API_KEY", "test-key")
+    store = VaultStore.open(root / ".feedian" / "feedian.sqlite3")
+    try:
+        item = store.upsert_canonical_item(
+            CanonicalItem(
+                source="hatena", source_id="one", content_key="url:one",
+                url="https://example.test", title="Article",
+            )
+        )
+        store.record_resource_revision(item.resource_id or "", content_markdown="Body", title="Article")
+
+        class Audit:
+            result = {"note_title": "One", "summary": "Short", "key_points": [], "tags": ["one"], "content_type": "article"}
+            request = {}
+            response = {"id": "response"}
+            usage: dict[str, int] = {}
+
+        monkeypatch.setattr("feedian.ingest.summarize_bookmark_with_audit", lambda *args, **kwargs: Audit())
+
+        plan = plan_source_notes(store, model="manus-1.6", provider="manus")
+        report = ingest_source_notes(
+            store, root, VaultConfig(), model="manus-1.6", provider="manus", plan=plan,
+        )
+
+        # A provider Feedian cannot price must not read as a completed free run.
+        assert plan.max_cost_usd is None
+        assert report.created == 1
+        assert report.cost_usd == 0.0
+        assert report.unpriced_requests == 1
+        assert report.unmetered_requests == 1
+    finally:
+        store.close()

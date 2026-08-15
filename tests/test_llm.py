@@ -2,7 +2,19 @@ import unittest
 from unittest.mock import patch
 
 from feedian.extract import PageFetchResult
-from feedian.llm import SUMMARY_INSTRUCTIONS, build_prompt, extract_output_text, summarize_bookmark
+from feedian.llm import (
+    MANUS_MAX_MESSAGE_CHARS,
+    MANUS_UNTRUSTED_REMINDER,
+    SUMMARY_INSTRUCTIONS,
+    SUMMARY_SCHEMA,
+    _manus_schema,
+    build_manus_message,
+    build_prompt,
+    extract_output_text,
+    normalize_summary_result,
+    summarize_bookmark,
+    summarize_bookmark_with_audit,
+)
 
 
 class LlmTests(unittest.TestCase):
@@ -83,6 +95,169 @@ class LlmTests(unittest.TestCase):
 
         self.assertIn("abcd\n</untrusted_page_text>", prompt)
         self.assertEqual(page.text, "abcdefghij")
+
+    def test_manus_schema_removes_unsupported_constraints(self) -> None:
+        schema = _manus_schema(SUMMARY_SCHEMA)
+
+        self.assertNotIn("maxLength", schema["properties"]["summary"])
+        self.assertNotIn("minItems", schema["properties"]["tags"])
+        self.assertNotIn("maxItems", schema["properties"]["tags"])
+        self.assertEqual(schema["properties"]["tags"]["type"], "array")
+        self.assertEqual(schema["required"], SUMMARY_SCHEMA["required"])
+
+    def test_normalize_restores_limits_the_manus_schema_cannot_carry(self) -> None:
+        result = normalize_summary_result(
+            {
+                "note_title": "T" * 200,
+                "summary": "S" * 900,
+                "key_points": ["a", "b", "c", "d", "e", "f"],
+                "tags": ["t" * 60, "ai", "python", "go", "rust", "c", "zig"],
+                "content_type": "article",
+            }
+        )
+
+        self.assertEqual(len(result["note_title"]), 80)
+        self.assertEqual(len(result["summary"]), 300)
+        self.assertEqual(len(result["key_points"]), 4)
+        self.assertEqual(len(result["tags"]), 6)
+        self.assertEqual(len(result["tags"][0]), 40)
+
+    def test_normalize_splits_a_string_returned_where_a_list_belongs(self) -> None:
+        result = normalize_summary_result(
+            {
+                "note_title": "Title",
+                "summary": "Summary",
+                "key_points": "",
+                "tags": "ai, python",
+                "content_type": "article",
+            }
+        )
+
+        self.assertEqual(result["tags"], ["ai", "python"])
+        self.assertEqual(result["key_points"], [])
+
+    def test_normalize_drops_non_text_entries_and_unknown_fields(self) -> None:
+        result = normalize_summary_result(
+            {
+                "note_title": "Title",
+                "summary": "Summary",
+                "key_points": ["ok", {"nested": 1}, None, "  "],
+                "tags": [1, "ai"],
+                "content_type": None,
+                "injected": "ignored",
+            }
+        )
+
+        self.assertEqual(result["key_points"], ["ok"])
+        self.assertEqual(result["tags"], ["1", "ai"])
+        self.assertEqual(result["content_type"], "")
+        self.assertNotIn("injected", result)
+
+    def test_normalize_rejects_a_result_without_usable_text(self) -> None:
+        with self.assertRaises(RuntimeError):
+            normalize_summary_result({"note_title": "Title", "tags": ["ai"]})
+        with self.assertRaises(RuntimeError):
+            normalize_summary_result(["not", "an", "object"])
+
+    @patch("feedian.llm.time.sleep")
+    @patch("feedian.llm._manus_request")
+    @patch("feedian.llm._wait_for_manus_create_slot")
+    def test_manus_result_is_normalized_before_it_reaches_a_note(self, _slot, mock_request, _sleep) -> None:
+        mock_request.side_effect = [
+            {"task_id": "task-1", "request_id": "req-1", "task_url": "https://manus.ai/task-1"},
+            {
+                "agent_status": "running",
+                "messages": [
+                    {
+                        "structured_output_result": {
+                            "success": True,
+                            "value": {
+                                "note_title": "Title",
+                                "summary": "S" * 400,
+                                "key_points": [],
+                                "tags": "ai, python",
+                                "content_type": "article",
+                            },
+                        }
+                    }
+                ],
+            },
+        ]
+
+        audit = summarize_bookmark_with_audit(
+            api_key="key",
+            model="manus-1.6",
+            item={"title": "Title", "link": "https://example.com"},
+            page=PageFetchResult(url="https://example.com", text="Body", title="Title", error=None),
+            language="ja",
+            timeout_seconds=30,
+            max_output_tokens=800,
+            reasoning_effort="low",
+            max_retries=3,
+            retry_base_seconds=1.0,
+            max_article_chars=3_000,
+            provider="manus",
+        )
+
+        self.assertEqual(len(audit.result["summary"]), 300)
+        self.assertEqual(audit.result["tags"], ["ai", "python"])
+        self.assertEqual(audit.usage, {})
+
+    def test_manus_message_repeats_instructions_after_untrusted_material(self) -> None:
+        prompt = build_prompt(
+            item={"title": "Title", "link": "https://example.com"},
+            page=PageFetchResult(url="https://example.com", text="Body", title="Page", error=None),
+            language="ja",
+        )
+
+        message = build_manus_message(prompt)
+
+        self.assertTrue(message.startswith(SUMMARY_INSTRUCTIONS))
+        self.assertTrue(message.endswith(MANUS_UNTRUSTED_REMINDER))
+        self.assertLess(message.index("<untrusted_page_text>"), message.index(MANUS_UNTRUSTED_REMINDER))
+
+    def test_manus_message_truncation_never_leaves_the_untrusted_block_open(self) -> None:
+        prompt = build_prompt(
+            item={"title": "Title", "link": "https://example.com"},
+            page=PageFetchResult(url="https://example.com", text="x" * 20_000, title="Page", error=None),
+            language="ja",
+        )
+
+        message = build_manus_message(prompt)
+
+        self.assertLessEqual(len(message), MANUS_MAX_MESSAGE_CHARS)
+        self.assertIn("[Source text truncated.]", message)
+        # The reminder must stay outside the untrusted block, not inside a dangling one.
+        self.assertLess(message.index("</untrusted_page_text>"), message.index(MANUS_UNTRUSTED_REMINDER))
+
+    @patch("feedian.llm.time.sleep")
+    @patch("feedian.llm._manus_request")
+    @patch("feedian.llm._wait_for_manus_create_slot")
+    def test_manus_failure_names_the_task_so_it_can_be_stopped(self, _slot, mock_request, _sleep) -> None:
+        mock_request.side_effect = [
+            {"task_id": "task-1", "request_id": "req-1", "task_url": "https://manus.ai/task-1"},
+            {"agent_status": "error", "messages": []},
+        ]
+
+        with self.assertRaises(RuntimeError) as raised:
+            summarize_bookmark_with_audit(
+                api_key="key",
+                model="manus-1.6",
+                item={"title": "Title", "link": "https://example.com"},
+                page=PageFetchResult(url="https://example.com", text="Body", title="Title", error=None),
+                language="ja",
+                timeout_seconds=30,
+                max_output_tokens=800,
+                reasoning_effort="low",
+                max_retries=3,
+                retry_base_seconds=1.0,
+                provider="manus",
+            )
+
+        message = str(raised.exception)
+        self.assertIn("task_id=task-1", message)
+        self.assertIn("https://manus.ai/task-1", message)
+        self.assertIn("may still be running", message)
 
 
 if __name__ == "__main__":

@@ -61,6 +61,23 @@ def test_write_lock_error_is_human_readable(tmp_path, capsys) -> None:
     assert '{"pid"' not in error
 
 
+def test_unpriced_ingest_reads_as_unknown_not_free() -> None:
+    from feedian.cli_ui import ingest_cost_text, ingest_cost_value, ingest_tokens_text
+    from feedian.ingest import IngestReport
+
+    unpriced = IngestReport(processed=2, created=2, unpriced_requests=2, unmetered_requests=2)
+    priced = IngestReport(processed=1, created=1, input_tokens=120, output_tokens=34, cost_usd=0.00123)
+    mixed = IngestReport(processed=2, created=2, input_tokens=120, cost_usd=0.00123, unpriced_requests=1)
+
+    assert ingest_cost_text(unpriced) == "n/a"
+    assert ingest_cost_value(unpriced) == "n/a"
+    assert ingest_tokens_text(unpriced) == "in n/a | out n/a"
+    assert ingest_cost_text(priced) == "$0.001230"
+    assert ingest_tokens_text(priced) == "in 120 | out 34"
+    assert "unpriced" in ingest_cost_text(mixed)
+    assert ingest_cost_value(mixed) == "0.001230"
+
+
 def test_init_migrate_and_status(tmp_path, capsys) -> None:
     root = tmp_path / "vault"
     root.mkdir()
