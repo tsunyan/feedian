@@ -7,10 +7,15 @@ import shutil
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from .extract import PageFetchResult
 from .llm import (
+    LLMAuthError,
+    LLMProtocolError,
+    LLMRateLimitError,
+    LLMServiceError,
+    LLMUnavailableError,
     PROVIDER_OUTPUT_SCHEMA,
     SummaryAudit,
     build_summary_request,
@@ -20,6 +25,7 @@ from .llm import (
 )
 from .local_agent import (
     LocalAgentResult,
+    LocalAgentProcessError,
     ProcessRunner,
     SubprocessRunner,
     run_isolated_local_agent,
@@ -28,11 +34,15 @@ from .local_agent import (
 
 BACKEND_IDS = ("openai-responses", "manus-api", "codex-local", "claude-code-local")
 BACKEND_ALIASES = {"openai": "openai-responses", "manus": "manus-api"}
-BACKEND_IMPLEMENTATION_REVISION = "llm-backends-v1"
+BACKEND_IMPLEMENTATION_REVISION = "llm-backends-v2"
 
 
 class BackendError(RuntimeError):
     fallback_eligible = False
+
+    def __init__(self, message: str, *, request: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.request = request
 
 
 class BackendAuthError(BackendError):
@@ -180,6 +190,16 @@ class ApiBackend:
                 self.capabilities.max_article_chars,
                 provider=self.provider,
             )
+        except LLMAuthError as exc:
+            raise BackendAuthError(str(exc)) from exc
+        except LLMRateLimitError as exc:
+            raise BackendRateLimitError(str(exc)) from exc
+        except LLMUnavailableError as exc:
+            raise BackendUnavailableError(str(exc)) from exc
+        except LLMProtocolError as exc:
+            raise BackendProtocolError(str(exc)) from exc
+        except LLMServiceError as exc:
+            raise BackendExecutionError(str(exc)) from exc
         except BackendError:
             raise
         except Exception as exc:
@@ -246,11 +266,14 @@ class CodexLocalBackend:
         runner: ProcessRunner | None = None,
         executable: str = "codex",
         version: str = "",
+        control_runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
     ) -> None:
         self.runner = runner or SubprocessRunner()
         self.executable = executable
         self.version = version
+        self.control_runner = control_runner or subprocess.run
         self._resolved_executable = ""
+        self._preflight_metadata: dict[str, Any] | None = None
 
     def _resolve_executable(self) -> str:
         """Resolve the name on PATH once and use the result everywhere after.
@@ -273,6 +296,8 @@ class CodexLocalBackend:
         return not model.startswith("manus-")
 
     def preflight(self) -> dict[str, Any]:
+        if self._preflight_metadata is not None:
+            return dict(self._preflight_metadata)
         version = self.version or self._detect_version()
         if version not in CODEX_VERIFIED_VERSIONS:
             raise BackendPolicyError(
@@ -281,16 +306,34 @@ class CodexLocalBackend:
                 f"{', '.join(CODEX_VERIFIED_VERSIONS)}."
             )
         self.version = version
-        return {
+        self._verify_login()
+        self._preflight_metadata = {
             "implementation_revision": BACKEND_IMPLEMENTATION_REVISION,
             "cli_version": version,
             "disabled_features": list(CODEX_DISABLED_FEATURES),
         }
+        return dict(self._preflight_metadata)
+
+    def _control_executable(self) -> str:
+        if isinstance(self.runner, SubprocessRunner):
+            return self._resolve_executable()
+        return self.executable
+
+    def _verify_login(self) -> None:
+        try:
+            completed = self.control_runner(
+                [self._control_executable(), "login", "status"],
+                capture_output=True, text=True, timeout=30, check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise BackendUnavailableError(f"Could not check Codex CLI login status: {exc}") from exc
+        if completed.returncode != 0:
+            raise BackendAuthError("Codex CLI is not logged in; run `codex login` first.")
 
     def _detect_version(self) -> str:
         """Detect the CLI version once per run; callers cache it on the instance."""
         try:
-            completed = subprocess.run(
+            completed = self.control_runner(
                 [self._resolve_executable(), "--version"],
                 capture_output=True, text=True, timeout=30, check=False,
             )
@@ -343,6 +386,8 @@ class CodexLocalBackend:
                 "--ephemeral",
                 "--ignore-user-config",
                 "--ignore-rules",
+                "--config",
+                "mcp_servers={}",
                 "--json",
                 "--sandbox",
                 "read-only",
@@ -354,6 +399,10 @@ class CodexLocalBackend:
                 str(schema_path),
                 "-",
             )
+
+        audit_argv = list(command(Path("<temporary>") / "output-schema.json"))
+        audit_argv[0] = Path(audit_argv[0]).name
+        audit_request = {"mode": "stdin", "argv": audit_argv}
 
         try:
             local = run_isolated_local_agent(
@@ -367,21 +416,41 @@ class CodexLocalBackend:
             )
             result = normalize_summary_result(local.result)
         except subprocess.TimeoutExpired as exc:
-            raise BackendTimeoutError(f"codex-local exceeded {timeout_seconds}s.") from exc
-        except BackendError:
+            raise BackendTimeoutError(
+                f"codex-local exceeded {timeout_seconds}s.", request=audit_request,
+            ) from exc
+        except LocalAgentProcessError as exc:
+            raise _classify_codex_process_error(exc, audit_request) from exc
+        except BackendError as exc:
+            if exc.request is None:
+                exc.request = audit_request
             raise
         except Exception as exc:
-            raise BackendExecutionError(str(exc)) from exc
+            raise BackendExecutionError(str(exc), request=audit_request) from exc
         return BackendAudit(
             result=result,
-            # argv carries only control information; the article goes over stdin.
-            request={"mode": "stdin", "argv": list(local.argv)},
+            # The audit copy omits machine-specific paths; the article goes over stdin.
+            request=audit_request,
             response={"final_response": result},
             usage=local.usage,
             auth_mode=self.capabilities.auth_mode,
             billing_mode=self.capabilities.billing_mode,
             metadata=metadata,
         )
+
+
+def _classify_codex_process_error(
+    error: LocalAgentProcessError, request: dict[str, Any],
+) -> BackendError:
+    detail = f"{error.result.stderr}\n{error.result.stdout}".lower()
+    message = f"Codex CLI exited with status {error.result.returncode}."
+    if any(marker in detail for marker in ("not logged in", "unauthorized", "authentication", "login required")):
+        return BackendAuthError(message, request=request)
+    if any(marker in detail for marker in ("rate limit", "usage limit", "quota", "too many requests", "429")):
+        return BackendRateLimitError(message, request=request)
+    if any(marker in detail for marker in ("connection", "network", "service unavailable", "temporarily unavailable", "503")):
+        return BackendUnavailableError(message, request=request)
+    return BackendExecutionError(message, request=request)
 
 
 class ClaudeCodeLocalBackend:

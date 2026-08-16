@@ -16,14 +16,16 @@ class FakeBackend:
         audit,
         *,
         backend: str = "openai-responses",
+        auth_mode: str = "api-key",
         billing_mode: str = "metered-api",
         error: Exception | None = None,
     ) -> None:
         self.audit = audit
         self.error = error
+        self.summarize_kwargs = {}
         self.capabilities = BackendCapabilities(
             backend=backend,
-            auth_mode="api-key",
+            auth_mode=auth_mode,
             billing_mode=billing_mode,
             max_article_chars=3_000 if backend == "manus-api" else 10_000,
             usage_available=bool(getattr(audit, "usage", {})),
@@ -39,7 +41,8 @@ class FakeBackend:
     def preflight(self):
         return {"implementation_revision": "test"}
 
-    def summarize(self, **_kwargs):
+    def summarize(self, **kwargs):
+        self.summarize_kwargs = kwargs
         if self.error is not None:
             raise self.error
         return BackendAudit(
@@ -234,14 +237,16 @@ def test_llm_run_records_the_request_that_was_actually_sent(tmp_path, monkeypatc
             backend_instance=backend,
         )
 
-        stored = store.connection.execute("SELECT request_json FROM llm_run").fetchone()[0]
-        assert "sent to manus" in stored
-        assert "input_text" not in stored
+        stored = json.loads(
+            store.connection.execute("SELECT request_json FROM llm_run").fetchone()[0]
+        )
+        assert stored["actual"]["message"]["content"] == "sent to manus"
+        assert stored["logical"]["input"][0]["content"][0]["type"] == "input_text"
     finally:
         store.close()
 
 
-def test_failed_run_keeps_the_request_it_started_with(tmp_path, monkeypatch) -> None:
+def test_failed_run_keeps_a_stable_logical_and_actual_request_envelope(tmp_path, monkeypatch) -> None:
     root = tmp_path / "vault"
     root.mkdir()
     initialize_vault(root)
@@ -264,7 +269,52 @@ def test_failed_run_keeps_the_request_it_started_with(tmp_path, monkeypatch) -> 
         row = store.connection.execute("SELECT status, request_json FROM llm_run").fetchone()
         assert report.failed == 1
         assert row[0] == "failed"
-        assert "input_text" in row[1]
+        request = json.loads(row[1])
+        assert request["logical"]["input"][0]["content"][0]["type"] == "input_text"
+        assert request["actual"] is None
+    finally:
+        store.close()
+
+
+def test_local_backend_runs_outside_the_vault_project(tmp_path, monkeypatch) -> None:
+    root = tmp_path / "vault"
+    root.mkdir()
+    initialize_vault(root)
+    (root / ".git").mkdir()
+    (root / "AGENTS.md").write_text("project instructions", encoding="utf-8")
+    system_temp = tmp_path / "system-temp"
+    system_temp.mkdir()
+    monkeypatch.setattr("feedian.local_agent.tempfile.gettempdir", lambda: str(system_temp))
+    store = VaultStore.open(root / ".feedian" / "feedian.sqlite3")
+    try:
+        item = store.upsert_canonical_item(
+            CanonicalItem(
+                source="hatena", source_id="one", content_key="url:one",
+                url="https://example.test", title="Article",
+            )
+        )
+        store.record_resource_revision(item.resource_id or "", content_markdown="Body", title="Article")
+
+        class Audit:
+            result = {
+                "note_title": "One", "summary": "Short", "key_points": [],
+                "tags": [], "content_type": "",
+            }
+            request = {"mode": "stdin", "argv": ["codex-test", "exec", "-"]}
+            response = {}
+            usage = {}
+
+        backend = FakeBackend(
+            Audit(), backend="codex-local", auth_mode="local-session",
+            billing_mode="subscription",
+        )
+        ingest_source_notes(
+            store, root, VaultConfig(), model="gpt-test", backend="codex-local",
+            backend_instance=backend,
+        )
+
+        assert backend.summarize_kwargs["temporary_parent"] == system_temp.resolve()
+        assert root.resolve() not in system_temp.resolve().parents
     finally:
         store.close()
 

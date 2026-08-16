@@ -19,7 +19,7 @@ from .llm import (
     build_summary_request,
 )
 from .llm_backends import BackendPolicyError, LLMBackend, canonical_backend_id, get_backend
-from .local_agent import sanitize_error
+from .local_agent import isolated_local_agent_parent, sanitize_error
 from .markdown import escape_markdown_heading, sanitize_filename, yaml_frontmatter
 from .store import VaultStore, stable_json
 from .vault import VaultConfig, vault_paths
@@ -193,6 +193,12 @@ def ingest_source_notes(
     if plan.new_requests and not selected_backend.supports_model(model):
         raise BackendPolicyError(f"Backend {backend_id} does not support model {model!r}.")
     preflight_metadata = selected_backend.preflight() if plan.new_requests else {}
+    temporary_parent = vault_paths(vault_root).state_dir / "tmp"
+    if plan.new_requests and selected_backend.capabilities.auth_mode == "local-session":
+        try:
+            temporary_parent = isolated_local_agent_parent(vault_root)
+        except RuntimeError as exc:
+            raise BackendPolicyError(str(exc)) from exc
     start_interval = selected_backend.capabilities.min_start_interval_seconds
     last_start = 0.0
     processed = created = reused = failed = input_tokens = output_tokens = 0
@@ -229,7 +235,8 @@ def ingest_source_notes(
         run_id = store.start_llm_run(
             resource_id=candidate.resource_id, resource_revision_id=str(row["resource_revision_id"]),
             operation="source-note", model=model, prompt_version=PROMPT_VERSION,
-            input_fingerprint=candidate.fingerprint, request=candidate.request,
+            input_fingerprint=candidate.fingerprint,
+            request={"logical": candidate.request, "actual": None},
             backend=backend_id,
             summary_schema_version=CANONICAL_SUMMARY_SCHEMA_VERSION,
             fingerprint_version=2,
@@ -257,13 +264,15 @@ def ingest_source_notes(
                 reasoning_effort="low",
                 max_retries=3,
                 retry_base_seconds=1.0,
-                temporary_parent=vault_paths(vault_root).state_dir / "tmp",
+                temporary_parent=temporary_parent,
             )
             price = _price_record(
                 audit.usage, model, billing_mode=audit.billing_mode,
             )
             store.finish_llm_run(
-                run_id, request=audit.request, response=audit.response,
+                run_id,
+                request={"logical": candidate.request, "actual": audit.request},
+                response=audit.response,
                 result=audit.result, usage=audit.usage or None, price=price,
                 auth_mode=audit.auth_mode,
                 billing_mode=audit.billing_mode,
@@ -294,6 +303,10 @@ def ingest_source_notes(
             )
             store.finish_llm_run(
                 run_id,
+                request={
+                    "logical": candidate.request,
+                    "actual": getattr(exc, "request", None),
+                },
                 error=item_error,
                 duration_ms=round((time.monotonic() - started_at) * 1000),
             )

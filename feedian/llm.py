@@ -26,6 +26,37 @@ MANUS_MAX_RETRY_DELAY_SECONDS = 4.0
 # "stopped" without a result means it will not produce one.
 MANUS_UNRECOVERABLE_STATUSES = frozenset({"error", "stopped", "waiting"})
 _manus_last_create_at = 0.0
+
+
+class LLMServiceError(RuntimeError):
+    pass
+
+
+class LLMAuthError(LLMServiceError):
+    pass
+
+
+class LLMRateLimitError(LLMServiceError):
+    pass
+
+
+class LLMUnavailableError(LLMServiceError):
+    pass
+
+
+class LLMProtocolError(LLMServiceError):
+    pass
+
+
+def _http_service_error(provider: str, code: int, body: str) -> LLMServiceError:
+    message = f"{provider} API error HTTP {code}: {body}"
+    if code in {401, 403}:
+        return LLMAuthError(message)
+    if code == 429:
+        return LLMRateLimitError(message)
+    if code in {408, 425} or code >= 500:
+        return LLMUnavailableError(message)
+    return LLMServiceError(message)
 _manus_create_lock = threading.Lock()
 
 
@@ -262,17 +293,17 @@ def summarize_bookmark_with_audit(
         )
     except HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"OpenAI API error HTTP {exc.code}: {body}") from exc
+        raise _http_service_error("OpenAI", exc.code, body) from exc
     except URLError as exc:
-        raise RuntimeError(f"OpenAI API network error: {exc.reason}") from exc
+        raise LLMUnavailableError(f"OpenAI API network error: {exc.reason}") from exc
 
     output_text = extract_output_text(data)
     if not output_text:
-        raise RuntimeError("OpenAI API response did not include output text.")
+        raise LLMProtocolError("OpenAI API response did not include output text.")
     try:
         result = json.loads(output_text)
     except json.JSONDecodeError as exc:
-        raise RuntimeError(f"OpenAI output was not valid JSON: {output_text[:500]}") from exc
+        raise LLMProtocolError(f"OpenAI output was not valid JSON: {output_text[:500]}") from exc
     return SummaryAudit(
         result=normalize_summary_result(result),
         request=payload,
@@ -325,6 +356,8 @@ def _summarize_with_manus(
                 retry_base_seconds=retry_base_seconds,
                 retry_not_found=True,
             )
+        except LLMServiceError:
+            raise
         except RuntimeError as exc:
             raise _manus_failure(task_identity, str(exc)) from exc
         latest_status: str | None = None
@@ -424,9 +457,9 @@ def _manus_request(
         return response
     except HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Manus API error HTTP {exc.code}: {body}") from exc
+        raise _http_service_error("Manus", exc.code, body) from exc
     except URLError as exc:
-        raise RuntimeError(f"Manus API network error: {exc.reason}") from exc
+        raise LLMUnavailableError(f"Manus API network error: {exc.reason}") from exc
 
 
 def _wait_for_manus_create_slot() -> None:
@@ -498,7 +531,10 @@ def build_summary_request(
 
 def _read_response(request: Request, timeout_seconds: int) -> dict[str, Any]:
     with urlopen(request, timeout=timeout_seconds) as response:
-        return json.loads(response.read().decode("utf-8"))
+        try:
+            return json.loads(response.read().decode("utf-8"))
+        except json.JSONDecodeError as exc:
+            raise LLMProtocolError("LLM API response was not valid JSON.") from exc
 
 
 def build_prompt(

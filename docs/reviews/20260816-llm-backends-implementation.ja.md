@@ -7,11 +7,9 @@
 
 ## 結論
 
-マージ不可。テストが赤であり、仕様の中心である再利用キーの互換パスが原理的に機能しない。
+再レビューの指摘24から27はすべて採用し、同一の修正commitで解消した。legacy fingerprint、canonical schema検証、Rich進捗テスト、Codex CLIのバージョン固定とtool denylistに加え、projectからのcwd隔離、CLI login preflight、共通エラー分類、監査requestの固定形式まで実装され、テストスイートは緑である。マージ可能である。
 
-指摘1から3を解消するまで先へ進めない。1は無関係なテストの破壊、2は互換パスの不成立、3は2を直した瞬間に顕在化する読み取り経路からの書き込みである。4以降は同一ブランチで直す必要はない。
-
-方向性そのものは妥当である。backendとmodelとauth modeの分離、Vault config format version 2による明示移行、untrusted wrappingの共通化は、いずれも仕様のレビューで合意した内容を正しく実装している。
+`codex-local`の一時cwdはVaultおよび既存Git projectの外へ移し、MCP設定も空で上書きする。安全な一時領域を確保できない環境では、記事本文を送る前に`BackendPolicyError`で拒否する。
 
 ## 指摘
 
@@ -417,3 +415,82 @@ Codexが報告した`224 passed, 1 failed`は、同一のWindows環境かつ同�
 - [x] argvは58要素が監査へ残り、うち`--disable`が22組ある。記事本文はargvに含まれない。
 - [x] 一時ディレクトリは実行後に残らない。
 - [ ] タイムアウト時のプロセスツリー終了は、実プロセスによる検証を行っていない。fake runnerによる契約テストのみである。
+
+## Codex再レビュー（2026-08-17）
+
+レビュー者: Codex
+
+再レビュー対象: `6d6fcb1` feat: run codex-local against a measured Codex CLI lockdown
+
+Claude Codeの再対応で、指摘18から23に直接対応する修正とRich進捗テストの幅依存解消を確認した。その上で、確定仕様と現在の実装を再度突き合わせ、以下の未解消項目を確認した。
+
+### 24. Vault配下のcwdでプロジェクト指示とMCP設定を隔離できない — 重大度: 高
+
+**根拠:** `feedian/ingest.py:260`、`feedian/local_agent.py:122-145`、`feedian/llm_backends.py:343-355`、`docs/specs/20260816-llm-backends.ja.md:58-65`
+
+**現象:** 実行cwdはVault内の`.feedian/tmp/llm-*`である。Codexの公式仕様では、[プロジェクトrootからcwdまでの`AGENTS.md`を指示チェーンに含める](https://developers.openai.com/codex/guides/agents-md)ほか、[trusted projectの`.codex/config.toml`もプロジェクト設定として読み込む](https://developers.openai.com/codex/config-basic)。`--ignore-user-config`はuser configを、`--ignore-rules`はexec policyのrulesを対象とするため、これらはプロジェクト指示とproject configを無効化する根拠にならない。現在のdisable listはpluginsやMCP elicitationを含むが、project configから定義される一般のMCP serverを明示的に空にしていない。
+
+**影響:** Git管理されたObsidian Vaultなど、Vault自体がCodex projectと認識される構成では、Feedianの固定prompt以外のプロジェクト指示が混入する。project configのMCP serverが有効なら、untrusted記事からMCPへ到達し得る。ファイルcanaryだけでは、確定仕様の「project rulesを読まない」と「MCPを利用できない」を実証したことにならない。
+
+**提案:** ローカルagentのcwdをVaultおよび既存project rootの外にあるFeedian専用rootへ移す。その上で、canary `AGENTS.md`とproject `.codex/config.toml`に定義したfake MCP serverが読まれないことをopt-in統合テストで確認する。CLI単体で実証できなければ、確定仕様どおり`codex-local`を`BackendPolicyError`で事前拒否する。
+
+### 25. CodexのpreflightがCLI login状態を検証しない — 重大度: 中
+
+**根拠:** `feedian/llm_backends.py:275-306`、`feedian/ingest.py:193-195`、`docs/specs/20260816-llm-backends.ja.md:48-52`
+
+**現象:** `CodexLocalBackend.preflight`が確認するのはCLIの存在とversionだけで、`codex login status`相当の認証確認を行わない。未ログインまたは期限切れの場合もpreflightを通過し、記事promptをstdinで`codex exec`へ渡した後に失敗する。
+
+**影響:** 確定仕様の「CLI login不足は実行前に`BackendAuthError`」を満たさず、バッチの先頭で認証問題を明示できない。
+
+**提案:** ingest runに1回のpreflightで、同じ実行ファイルによる`codex login status`を確認する。未ログインと失効は`BackendAuthError`にし、記事ごとのrunを開く前に停止する。
+
+### 26. 共通エラー分類がAPIとCodexの実失敗経路へ接続されていない — 重大度: 中
+
+**根拠:** `feedian/llm_backends.py:38-63`、`feedian/llm_backends.py:168-186`、`feedian/llm_backends.py:358-374`、`feedian/local_agent.py:146-147`、`feedian/llm.py:257-267`
+
+**現象:** `BackendRateLimitError`は定義以外に一度も使われていない。OpenAIのHTTP 429は`llm.py`で`RuntimeError`に変換され、`ApiBackend`がさらに`BackendExecutionError`へまとめる。Codexも、利用枠到達や認証失敗でprocessが非0終了するとstderrを分類せず`RuntimeError`から`BackendExecutionError`になる。実装された対応は、Codexのprocess timeoutとfinal JSON不正の写像に限られる。
+
+**影響:** 本書の指摘6は「採用」とされているが、利用枠、認証、到達不能を呼び出し側が依然区別できない。後続のfallback判断やretry方針の根拠として使えない。
+
+**提案:** transport固有の失敗をadapter境界で共通例外へ写像する。少なくともAPIの401/403、429、network不通、Codex CLIの未認証と利用枠到達に回帰テストを追加する。
+
+### 27. `request_json`の意味がローカルrunの成否で変わる — 重大度: 中
+
+**根拠:** `feedian/ingest.py:229-238`、`feedian/ingest.py:265-299`、`feedian/store.py:881-915`、`tests/test_ingest.py:244-267`、`docs/specs/20260816-llm-backends.ja.md:480-482`
+
+**現象:** run開始時は`candidate.request`を`request_json`へ入れるため、記事本文を含む論理requestが保存される。成功時はその同じ列をCodexのargvを含む実requestで上書きするが、失敗時は上書きしない。この状態依存の振る舞いはテストでも明示的に固定されている。
+
+**影響:** 同じ`request_json`が、成功runでは「本文を含まない実argv」、失敗runでは「本文を含む論理request」になる。確定仕様の「論理requestとsecret除去済み実requestを保持する」をどちらの状態でも満たさず、監査コンシューマがstatusによって別のJSON shapeを解釈しなければならない。
+
+**提案:** logical requestとactual requestの格納先を分けるか、`request_json`内を`{"logical": ..., "actual": ...}`の固定shapeにする。失敗時もactual requestとして、実際に起動した場合はサニタイズ済みargv、起動前失敗なら`null`を保存する。
+
+## Codex再レビューの検証
+
+- [x] `.venv\Scripts\python.exe -m pytest -q`: 229 passed。
+- [x] `COLUMNS=40`、`80`、`200`のそれぞれで`tests/test_progress.py`: 9 passed。
+- [x] Ruffと`git diff --check`が成功する。
+- [x] `BackendRateLimitError`の使用箇所はクラス定義1箇所だけである。
+- [x] Codex公式ドキュメントで、project rootからcwdまでの`AGENTS.md`の読み込みと、trusted projectの`.codex/config.toml`の読み込みを確認した。
+- [ ] project `AGENTS.md`、project MCP、networkのcanaryを使った実CLIテストは行われていない。
+- [ ] タイムアウト時の実プロセスツリー終了テストは引き続き未実施である。
+
+## Codex再レビューの採否
+
+| # | 指摘 | 採否 | 対応 |
+| --- | --- | --- | --- |
+| 24 | Vault配下のcwdでproject指示とMCP設定を隔離できない | 採用 | system tempがVaultまたはGit project内でないことを事前検証し、記事ごとのcwdをそこへ作る。`mcp_servers={}`もCLI overrideとして渡す |
+| 25 | CodexのpreflightがCLI loginを検証しない | 採用 | `codex login status`をingest runごとに1回実行し、未ログインを`BackendAuthError`にする |
+| 26 | 共通エラー分類が実失敗経路へ接続されていない | 採用 | APIの401/403、429、network・5xx、protocol不正と、Codex CLIの認証、利用枠、到達不能を共通例外へ写像する |
+| 27 | `request_json`の意味がrunの成否で変わる | 採用 | 新規runは常に`{"logical": ..., "actual": ...}`を保存し、実requestを取得できない失敗は`actual: null`、local CLI起動後の失敗ではサニタイズ済みactual requestを残す |
+
+## Codexによる修正後の検証（2026-08-17）
+
+- [x] 全体テスト: 239 passed、既存のDeprecationWarning 2件のみ。
+- [x] `COLUMNS=40`、`80`、`200`のそれぞれで`tests/test_progress.py`: 9 passed。
+- [x] Ruffと`git diff --check`が成功する。
+- [x] 実物のCodex CLI 0.147.0で、version検出と`codex login status`を含むpreflightが成功する。
+- [x] 実物のCodex CLI 0.147.0が`mcp_servers={}`のconfig overrideを受理する。
+- [x] Vaultに`.git`と`AGENTS.md`が存在しても、local backendへ渡す一時parentがVault外になることを契約テストで確認する。
+- [x] 未ログイン、API 401/403、API 429、network・5xx、protocol不正、Codex利用枠到達の分類を回帰テストで確認する。
+- [x] 成功runと失敗runの両方で、監査requestが`logical`と`actual`の固定shapeになる。
+- [ ] タイムアウト時の実プロセスツリー終了テストは未実施のままである。実装はfake runnerの契約テストで検証し、既存の保留事項として維持する。

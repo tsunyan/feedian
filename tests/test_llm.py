@@ -3,10 +3,14 @@ from unittest.mock import patch
 
 from feedian.extract import PageFetchResult
 from feedian.llm import (
+    LLMAuthError,
+    LLMRateLimitError,
+    LLMUnavailableError,
     MANUS_MAX_MESSAGE_CHARS,
     MANUS_UNTRUSTED_REMINDER,
     SUMMARY_INSTRUCTIONS,
     SUMMARY_SCHEMA,
+    _http_service_error,
     _manus_schema,
     build_manus_message,
     build_prompt,
@@ -18,6 +22,11 @@ from feedian.llm import (
 
 
 class LlmTests(unittest.TestCase):
+    def test_http_failures_keep_auth_rate_limit_and_availability_categories(self) -> None:
+        self.assertIsInstance(_http_service_error("OpenAI", 401, "unauthorized"), LLMAuthError)
+        self.assertIsInstance(_http_service_error("OpenAI", 429, "limited"), LLMRateLimitError)
+        self.assertIsInstance(_http_service_error("OpenAI", 503, "down"), LLMUnavailableError)
+
     def test_extract_output_text_prefers_direct_field(self) -> None:
         self.assertEqual(extract_output_text({"output_text": "{}"}), "{}")
 
@@ -207,6 +216,29 @@ class LlmTests(unittest.TestCase):
         self.assertEqual(len(audit.result["summary"]), 300)
         self.assertEqual(audit.result["tags"], ["ai", "python"])
         self.assertEqual(audit.usage, {})
+
+    @patch("feedian.llm.time.sleep")
+    @patch("feedian.llm._manus_request")
+    @patch("feedian.llm._wait_for_manus_create_slot")
+    def test_manus_polling_preserves_rate_limit_classification(
+        self, _slot, mock_request, _sleep,
+    ) -> None:
+        mock_request.side_effect = [
+            {"task_id": "task-1", "request_id": "req-1", "task_url": "https://manus.ai/task-1"},
+            LLMRateLimitError("Manus API error HTTP 429"),
+        ]
+
+        with self.assertRaises(LLMRateLimitError):
+            summarize_bookmark_with_audit(
+                api_key="key", model="manus-1.6",
+                item={"title": "Title", "link": "https://example.com"},
+                page=PageFetchResult(
+                    url="https://example.com", text="Body", title="Title", error=None,
+                ),
+                language="ja", timeout_seconds=30, max_output_tokens=800,
+                reasoning_effort="low", max_retries=3, retry_base_seconds=1.0,
+                max_article_chars=3_000, provider="manus",
+            )
 
     def test_manus_message_repeats_instructions_after_untrusted_material(self) -> None:
         prompt = build_prompt(

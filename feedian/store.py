@@ -893,8 +893,11 @@ class VaultStore:
         backend_metadata: dict[str, Any] | None = None,
         duration_ms: int | None = None,
     ) -> None:
-        """Close a run. `request` records what was actually sent, which can differ
-        in shape from the planned request the run started with (see llm providers)."""
+        """Close a run.
+
+        New LLM runs use a stable ``{"logical": ..., "actual": ...}`` envelope;
+        legacy rows retain their provider-specific request shape.
+        """
         status = "failed" if error else "completed"
         with self.transaction() as connection:
             connection.execute(

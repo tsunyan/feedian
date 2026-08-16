@@ -22,6 +22,18 @@ class ProcessResult:
     stderr: str
 
 
+class LocalAgentProcessError(RuntimeError):
+    def __init__(self, result: ProcessResult, argv: Sequence[str]) -> None:
+        self.result = result
+        self.argv = tuple(str(value) for value in argv)
+        detail = result.stderr.strip() or result.stdout.strip()
+        detail = detail[-2048:]
+        message = f"Local agent exited with status {result.returncode}."
+        if detail:
+            message = f"{message} {detail}"
+        super().__init__(message)
+
+
 class ProcessRunner(Protocol):
     def run(
         self,
@@ -31,6 +43,20 @@ class ProcessRunner(Protocol):
         cwd: Path,
         timeout_seconds: float,
     ) -> ProcessResult: ...
+
+
+def isolated_local_agent_parent(vault_root: str | Path) -> Path:
+    """Choose a cwd parent that Codex cannot treat as part of the Vault project."""
+    vault = Path(vault_root).resolve()
+    temporary_parent = Path(tempfile.gettempdir()).resolve()
+    if temporary_parent == vault or vault in temporary_parent.parents:
+        raise RuntimeError("The system temporary directory is inside the Feedian Vault.")
+    for ancestor in (temporary_parent, *temporary_parent.parents):
+        if (ancestor / ".git").exists():
+            raise RuntimeError(
+                "The system temporary directory is inside a Git project and cannot isolate local agents."
+            )
+    return temporary_parent
 
 
 class SubprocessRunner:
@@ -144,7 +170,7 @@ def run_isolated_local_agent(
             timeout_seconds=timeout_seconds,
         )
         if completed.returncode != 0:
-            raise RuntimeError(f"Local agent exited with status {completed.returncode}.")
+            raise LocalAgentProcessError(completed, argv)
         parsed = parse(completed.stdout)
         return replace(parsed, argv=argv)
     finally:
