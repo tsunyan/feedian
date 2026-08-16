@@ -23,14 +23,21 @@ class ProcessResult:
 
 
 class LocalAgentProcessError(RuntimeError):
+    """A local agent exited non-zero.
+
+    Only stderr reaches the message and the caller's classification. stdout is
+    the agent's own output, written from untrusted article text, so quoting it
+    would copy article fragments into audit records and terminal output and let
+    a page steer which error Feedian reports.
+    """
+
     def __init__(self, result: ProcessResult, argv: Sequence[str]) -> None:
         self.result = result
         self.argv = tuple(str(value) for value in argv)
-        detail = result.stderr.strip() or result.stdout.strip()
-        detail = detail[-2048:]
+        self.diagnostics = result.stderr.strip()[-2048:]
         message = f"Local agent exited with status {result.returncode}."
-        if detail:
-            message = f"{message} {detail}"
+        if self.diagnostics:
+            message = f"{message} {self.diagnostics}"
         super().__init__(message)
 
 
@@ -161,6 +168,15 @@ class LocalAgentResult:
     argv: tuple[str, ...] = ()
 
 
+def sanitized_argv(argv: Sequence[str], temporary_path: Path) -> tuple[str, ...]:
+    """Strip machine-specific paths from a real argv so it can be audited."""
+    placeholder = "<temporary>"
+    sanitized = [Path(str(argv[0])).name]
+    for argument in argv[1:]:
+        sanitized.append(str(argument).replace(str(temporary_path), placeholder))
+    return tuple(sanitized)
+
+
 def run_isolated_local_agent(
     *,
     runner: ProcessRunner,
@@ -205,10 +221,11 @@ def run_isolated_local_agent(
             timeout_seconds=timeout_seconds,
             env=env,
         )
+        audit_argv = sanitized_argv(argv, temporary_path)
         if completed.returncode != 0:
-            raise LocalAgentProcessError(completed, argv)
+            raise LocalAgentProcessError(completed, audit_argv)
         parsed = parse(completed.stdout)
-        return replace(parsed, argv=argv)
+        return replace(parsed, argv=audit_argv)
     finally:
         shutil.rmtree(temporary_path, ignore_errors=True)
 

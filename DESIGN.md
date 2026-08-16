@@ -12,7 +12,8 @@
 - 子processの環境変数はallowlistで組み立て、version検出・login確認・`codex exec`へ同一の環境を渡す。providerのAPI keyは渡さない。
 - **既知の制約:** CLI内蔵のsystem instructionsと内蔵skillsカタログは`CODEX_HOME`では除去できない。利用者由来の指示はすべて隔離済みである。
 - `claude-code-local` は将来用に予約するが、CLI契約と隔離ポリシーが定義されるまで利用不可とする。
-- Vault設定はformat version 2で`llm.backend`、`llm.model`、`llm.fallback`を持つ。version 1からは`feedian migrate`による明示移行が必要で、fallbackは既定で無効とする。
+- Vault設定はformat version 2で`llm.backend`、`llm.model`、`llm.fallback`を持つ。version 1からは`feedian migrate`による明示移行が必要である。
+- fallbackは既定で無効であり、有効化にはbackendとmodelの両方を明示する。実行前のプラン画面に宛先を表示し、無効なら`disabled`と示す。切り替わるのは`BackendUnavailableError`、`BackendRateLimitError`、`BackendTimeoutError`のときだけである。認証、ポリシー、プロトコルの失敗は設定または実装の不具合であり、別backendへの課金で覆い隠さない。fallbackの実行は宛先backendの`llm_run`として別に記録するため、監査上どちらが要約を作ったかが残る。
 - SQLite schema version 6の`llm_run`はbackend、canonical schema version、fingerprint version、auth/billing mode、実装メタデータ、所要時間を監査情報として保存する。新規runの`request_json`は成否にかかわらず`logical`と`actual`の固定envelopeを使う。
 - 再利用キーはbackend境界を越えない。旧fingerprintは移行期間中だけ検索し、再利用した記事の書き込み時にversion 2へ昇格する。計画は読み取りのみで、`--dry-run`は書き込まない。
 - 再利用キーはrequest全体のハッシュである。旧キーは凍結した`LEGACY_V1_PROVIDER_SCHEMA`から組み立てるため、`PROVIDER_OUTPUT_SCHEMA`を変更しても移行期間中の検索は壊れない。`tests/test_ingest.py`が旧キーを実測値で固定し、この分離も検証する。

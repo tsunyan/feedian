@@ -117,6 +117,7 @@ def print_ingest_plan(
     *,
     model: str,
     backend: str = "openai-responses",
+    fallback: str = "",
     dry_run: bool,
     command: str,
     file: TextIO | None = None,
@@ -151,6 +152,12 @@ def print_ingest_plan(
         ("Command  ", MUTED),
         (command, f"bold {BLUE}"),
     )
+    # The specification requires the destination be named before the run starts,
+    # so that no article can move to another backend unannounced.
+    fallback_line = Text.assemble(
+        ("Fallback  ", MUTED),
+        (fallback or "disabled", f"bold {VIOLET}" if fallback else MUTED),
+    )
     console.print(
         Panel(
             Group(
@@ -158,6 +165,7 @@ def print_ingest_plan(
                 Text(action, style=MUTED),
                 Text(""),
                 command_line,
+                fallback_line,
                 Text(""),
                 flow,
                 Text(""),

@@ -348,13 +348,8 @@ def _parse_llm(raw: object) -> LLMSettings:
         backend=fallback_backend.strip(),
         model=fallback_model.strip(),
     )
-    if fallback.enabled:
-        # Accepting this while nothing acts on it would leave the operator believing
-        # a metered-API fallback is armed when no backend would ever switch.
-        raise ValueError(
-            "llm.fallback.enabled is not implemented yet; leave it false. "
-            "Feedian never switches backends on its own."
-        )
+    if fallback.enabled and (not fallback.backend or not fallback.model):
+        raise ValueError("Enabled llm.fallback requires both backend and model.")
     if fallback.backend and fallback.backend not in allowed_backends:
         raise ValueError(f"Unknown llm.fallback.backend: {fallback.backend}")
     return LLMSettings(backend=backend, model=model, fallback=fallback)

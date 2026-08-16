@@ -175,6 +175,7 @@ def ingest_source_notes(
     backend: str = "openai-responses",
     provider: str | None = None,
     backend_instance: LLMBackend | None = None,
+    fallback_instance: LLMBackend | None = None,
 ) -> IngestReport:
     backend_id = canonical_backend_id(provider or backend)
     selected_backend = backend_instance or get_backend(backend_id)
@@ -194,11 +195,15 @@ def ingest_source_notes(
         raise BackendPolicyError(f"Backend {backend_id} does not support model {model!r}.")
     preflight_metadata = selected_backend.preflight() if plan.new_requests else {}
     temporary_parent = vault_paths(vault_root).state_dir / "tmp"
-    if plan.new_requests and selected_backend.capabilities.auth_mode == "local-session":
+    if plan.new_requests and selected_backend.capabilities.execution_kind == "local-agent":
         try:
             temporary_parent = isolated_local_agent_parent(vault_root)
         except RuntimeError as exc:
             raise BackendPolicyError(str(exc)) from exc
+    fallback = (
+        resolve_fallback(config, backend_id, backend_instance=fallback_instance)
+        if plan.new_requests else None
+    )
     start_interval = selected_backend.capabilities.min_start_interval_seconds
     last_start = 0.0
     processed = created = reused = failed = input_tokens = output_tokens = 0
@@ -232,84 +237,62 @@ def ingest_source_notes(
                     ),
                 )
             continue
-        run_id = store.start_llm_run(
-            resource_id=candidate.resource_id, resource_revision_id=str(row["resource_revision_id"]),
-            operation="source-note", model=model, prompt_version=PROMPT_VERSION,
-            input_fingerprint=candidate.fingerprint,
-            request={"logical": candidate.request, "actual": None},
-            backend=backend_id,
-            summary_schema_version=CANONICAL_SUMMARY_SCHEMA_VERSION,
-            fingerprint_version=2,
-            auth_mode=selected_backend.capabilities.auth_mode,
-            billing_mode=selected_backend.capabilities.billing_mode,
-            backend_metadata=preflight_metadata,
+        if start_interval > 0:
+            delay = start_interval - (time.monotonic() - last_start)
+            if delay > 0:
+                time.sleep(delay)
+        last_start = time.monotonic()
+        attempt = _attempt_candidate(
+            store, vault_root, row=row, metadata=metadata, candidate=candidate,
+            backend_id=backend_id, backend=selected_backend, model=model, language=language,
+            temporary_parent=temporary_parent, preflight_metadata=preflight_metadata,
         )
-        item_status = "created"
-        item_error = None
-        started_at = time.monotonic()
-        try:
-            page = _page(row, metadata)
-            if start_interval > 0:
-                delay = start_interval - (time.monotonic() - last_start)
-                if delay > 0:
-                    time.sleep(delay)
-            last_start = time.monotonic()
-            audit = selected_backend.summarize(
-                model=model,
-                item=metadata,
-                page=page,
-                language=language,
-                timeout_seconds=60,
-                max_output_tokens=800,
-                reasoning_effort="low",
-                max_retries=3,
-                retry_base_seconds=1.0,
-                temporary_parent=temporary_parent,
+        if (
+            attempt.error is not None
+            and fallback is not None
+            and getattr(attempt.error, "fallback_eligible", False)
+        ):
+            # Named in the plan before the run started; Feedian never picks a
+            # destination on its own.
+            fallback_candidate = _candidate(
+                store, row, model=fallback.model, language=language, force=force,
+                backend=fallback.backend_id, backend_instance=fallback.backend,
             )
-            price = _price_record(
-                audit.usage, model, billing_mode=audit.billing_mode,
-            )
-            store.finish_llm_run(
-                run_id,
-                request={"logical": candidate.request, "actual": audit.request},
-                response=audit.response,
-                result=audit.result, usage=audit.usage or None, price=price,
-                auth_mode=audit.auth_mode,
-                billing_mode=audit.billing_mode,
-                backend_metadata=audit.metadata,
-                duration_ms=round((time.monotonic() - started_at) * 1000),
-            )
-            store.put_source_note(
-                resource_id=candidate.resource_id, llm_run_id=run_id,
-                markdown=render_source_note(row, metadata, audit.result, model=model),
-            )
+            if fallback_candidate.cached_result is not None:
+                store.put_source_note(
+                    resource_id=candidate.resource_id, llm_run_id=None,
+                    markdown=render_source_note(
+                        row, metadata, fallback_candidate.cached_result, model=fallback.model,
+                    ),
+                )
+                attempt = _Attempt(run_id=attempt.run_id, audit=None, error=None, reused=True)
+            else:
+                attempt = _attempt_candidate(
+                    store, vault_root, row=row, metadata=metadata, candidate=fallback_candidate,
+                    backend_id=fallback.backend_id, backend=fallback.backend,
+                    model=fallback.model, language=language,
+                    temporary_parent=temporary_parent,
+                    preflight_metadata=fallback.preflight(),
+                )
+        run_id = attempt.run_id
+        item_error = attempt.error_text
+        if attempt.reused:
+            item_status = "reused"
+            reused += 1
+        elif attempt.audit is not None:
+            item_status = "created"
             created += 1
+            audit = attempt.audit
             input_tokens += _usage_count(audit.usage.get("input_tokens"))
             output_tokens += _usage_count(audit.usage.get("output_tokens"))
-            if not audit.usage:
+            if not audit.usage or not attempt.usage_available:
                 unmetered += 1
-            estimated_cost = price.get("estimated_cost_usd")
-            if isinstance(estimated_cost, (int, float)):
-                cost_usd += float(estimated_cost)
+            if isinstance(attempt.estimated_cost, (int, float)):
+                cost_usd += float(attempt.estimated_cost)
             else:
                 unpriced += 1
-        except Exception as exc:
+        else:
             item_status = "failed"
-            prompt = str(candidate.request["input"][0]["content"][0]["text"])
-            item_error = sanitize_error(
-                str(exc),
-                Path(vault_root).resolve(),
-                private_values=(prompt, str(row["content_markdown"] or "")),
-            )
-            store.finish_llm_run(
-                run_id,
-                request={
-                    "logical": candidate.request,
-                    "actual": getattr(exc, "request", None),
-                },
-                error=item_error,
-                duration_ms=round((time.monotonic() - started_at) * 1000),
-            )
             failed += 1
         if progress is not None:
             progress(
@@ -323,6 +306,109 @@ def ingest_source_notes(
     return IngestReport(
         processed, created, reused, failed, input_tokens, output_tokens, cost_usd, unpriced, unmetered,
     )
+
+
+@dataclass(frozen=True)
+class _Attempt:
+    run_id: str
+    audit: Any = None
+    error: Exception | None = None
+    reused: bool = False
+    error_text: str | None = None
+    estimated_cost: Any = None
+    usage_available: bool = True
+
+
+@dataclass(frozen=True)
+class _Fallback:
+    backend_id: str
+    backend: LLMBackend
+    model: str
+    _metadata: dict[str, Any] | None = None
+
+    def preflight(self) -> dict[str, Any]:
+        """Deferred: a fallback that never fires must not demand credentials."""
+        return self.backend.preflight()
+
+
+def _attempt_candidate(
+    store: VaultStore,
+    vault_root: str | Path,
+    *,
+    row: Any,
+    metadata: dict[str, Any],
+    candidate: IngestCandidate,
+    backend_id: str,
+    backend: LLMBackend,
+    model: str,
+    language: str,
+    temporary_parent: Path,
+    preflight_metadata: dict[str, Any],
+) -> _Attempt:
+    """Open one llm_run, execute it, and close it either way."""
+    run_id = store.start_llm_run(
+        resource_id=candidate.resource_id, resource_revision_id=str(row["resource_revision_id"]),
+        operation="source-note", model=model, prompt_version=PROMPT_VERSION,
+        input_fingerprint=candidate.fingerprint,
+        request={"logical": candidate.request, "actual": None},
+        backend=backend_id,
+        summary_schema_version=CANONICAL_SUMMARY_SCHEMA_VERSION,
+        fingerprint_version=2,
+        auth_mode=backend.capabilities.auth_mode,
+        billing_mode=backend.capabilities.billing_mode,
+        backend_metadata=preflight_metadata,
+    )
+    started_at = time.monotonic()
+    try:
+        audit = backend.summarize(
+            model=model, item=metadata, page=_page(row, metadata), language=language,
+            timeout_seconds=60, max_output_tokens=800, reasoning_effort="low",
+            max_retries=3, retry_base_seconds=1.0, temporary_parent=temporary_parent,
+        )
+    except Exception as exc:
+        prompt = str(candidate.request["input"][0]["content"][0]["text"])
+        error_text = sanitize_error(
+            str(exc), Path(vault_root).resolve(),
+            private_values=(prompt, str(row["content_markdown"] or "")),
+        )
+        store.finish_llm_run(
+            run_id,
+            request={"logical": candidate.request, "actual": getattr(exc, "request", None)},
+            error=error_text,
+            duration_ms=round((time.monotonic() - started_at) * 1000),
+        )
+        return _Attempt(run_id=run_id, error=exc, error_text=error_text)
+    price = _price_record(audit.usage, model, billing_mode=audit.billing_mode)
+    store.finish_llm_run(
+        run_id,
+        request={"logical": candidate.request, "actual": audit.request},
+        response=audit.response, result=audit.result, usage=audit.usage or None, price=price,
+        auth_mode=audit.auth_mode, billing_mode=audit.billing_mode,
+        backend_metadata=audit.metadata,
+        duration_ms=round((time.monotonic() - started_at) * 1000),
+    )
+    store.put_source_note(
+        resource_id=candidate.resource_id, llm_run_id=run_id,
+        markdown=render_source_note(row, metadata, audit.result, model=model),
+    )
+    return _Attempt(
+        run_id=run_id, audit=audit,
+        estimated_cost=price.get("estimated_cost_usd"),
+        usage_available=backend.capabilities.usage_available,
+    )
+
+
+def resolve_fallback(
+    config: VaultConfig, backend_id: str, *, backend_instance: LLMBackend | None = None,
+) -> _Fallback | None:
+    """The configured fallback, or None. Disabled by default and never inferred."""
+    settings = config.llm.fallback
+    if not settings.enabled:
+        return None
+    destination = canonical_backend_id(settings.backend)
+    if destination == backend_id:
+        return None
+    return _Fallback(destination, backend_instance or get_backend(destination), settings.model)
 
 
 def _source_rows(store: VaultStore) -> list[Any]:

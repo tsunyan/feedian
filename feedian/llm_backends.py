@@ -25,6 +25,7 @@ from .llm import (
 )
 from .local_agent import (
     LocalAgentResult,
+    sanitized_argv,
     LocalAgentProcessError,
     ProcessRunner,
     SubprocessRunner,
@@ -55,7 +56,7 @@ class BackendPolicyError(BackendError):
 
 
 class BackendUnavailableError(BackendError):
-    pass
+    fallback_eligible = True
 
 
 class BackendExecutionError(BackendError):
@@ -63,11 +64,11 @@ class BackendExecutionError(BackendError):
 
 
 class BackendTimeoutError(BackendError):
-    pass
+    fallback_eligible = True
 
 
 class BackendRateLimitError(BackendError):
-    pass
+    fallback_eligible = True
 
 
 class BackendProtocolError(BackendError):
@@ -77,6 +78,7 @@ class BackendProtocolError(BackendError):
 @dataclass(frozen=True)
 class BackendCapabilities:
     backend: str
+    execution_kind: str
     auth_mode: str
     billing_mode: str
     max_article_chars: int
@@ -138,6 +140,7 @@ class ApiBackend:
         self.model_name = model_name
         self.capabilities = BackendCapabilities(
             backend=backend,
+            execution_kind="http",
             auth_mode="api-key",
             billing_mode="metered-api",
             max_article_chars=max_article_chars,
@@ -293,6 +296,7 @@ def codex_login_command(home: Path | None = None) -> str:
 class CodexLocalBackend:
     capabilities = BackendCapabilities(
         backend="codex-local",
+        execution_kind="local-agent",
         auth_mode="local-session",
         billing_mode="subscription",
         max_article_chars=10_000,
@@ -472,9 +476,10 @@ class CodexLocalBackend:
                 "-",
             )
 
-        audit_argv = list(command(Path("<temporary>") / "output-schema.json"))
-        audit_argv[0] = Path(audit_argv[0]).name
-        audit_request = {"mode": "stdin", "argv": audit_argv}
+        # Used only when the process never started; otherwise the real argv is
+        # sanitized and recorded below.
+        planned_argv = sanitized_argv(command(Path("<temporary>") / "output-schema.json"), Path())
+        audit_request: dict[str, Any] = {"mode": "stdin", "argv": list(planned_argv)}
 
         try:
             local = run_isolated_local_agent(
@@ -488,12 +493,15 @@ class CodexLocalBackend:
                 env=self.child_environment(),
             )
             result = normalize_summary_result(local.result)
+            audit_request = {"mode": "stdin", "argv": list(local.argv)}
         except subprocess.TimeoutExpired as exc:
             raise BackendTimeoutError(
                 f"codex-local exceeded {timeout_seconds}s.", request=audit_request,
             ) from exc
         except LocalAgentProcessError as exc:
-            raise _classify_codex_process_error(exc, audit_request) from exc
+            raise _classify_codex_process_error(
+                exc, {"mode": "stdin", "argv": list(exc.argv)},
+            ) from exc
         except BackendError as exc:
             if exc.request is None:
                 exc.request = audit_request
@@ -515,7 +523,9 @@ class CodexLocalBackend:
 def _classify_codex_process_error(
     error: LocalAgentProcessError, request: dict[str, Any],
 ) -> BackendError:
-    detail = f"{error.result.stderr}\n{error.result.stdout}".lower()
+    # stderr only: stdout carries the agent's reply, written from untrusted
+    # article text, so a page must not decide how Feedian classifies a failure.
+    detail = error.diagnostics.lower()
     message = f"Codex CLI exited with status {error.result.returncode}."
     if any(marker in detail for marker in ("not logged in", "unauthorized", "authentication", "login required")):
         return BackendAuthError(message, request=request)
@@ -529,6 +539,7 @@ def _classify_codex_process_error(
 class ClaudeCodeLocalBackend:
     capabilities = BackendCapabilities(
         backend="claude-code-local",
+        execution_kind="local-agent",
         auth_mode="local-session",
         billing_mode="subscription",
         max_article_chars=10_000,

@@ -1,6 +1,6 @@
 # LLMバックエンド実装のコードレビュー
 
-ステータス: 対応中
+ステータス: 完了
 対象: `7e9d09e` feat: add LLM execution backends
 仕様: [LLM実行バックエンド](../specs/20260816-llm-backends.ja.md)
 レビュー者: Claude Code (2026-08-16)、Codex (2026-08-17)
@@ -705,3 +705,39 @@ untrusted本文にファイル読み取りを注入したエンドツーエン�
 ### 指摘28・33の結論
 
 いずれも**採用・解消**とする。残るCLI内蔵分は`DESIGN.md`へ既知の制約として記載する。
+
+## 残る保留指摘の対応（2026-08-17）
+
+対応者: Claude Code
+
+保留としていた指摘をすべて処理した。
+
+| # | 指摘 | 採否 | 対応 |
+| --- | --- | --- | --- |
+| 8 | 無視される`fallback`設定 | 採用 | 確定仕様どおり実装した。既定で無効、有効化にはbackendとmodelの明示が必要で、宛先をプラン画面へ表示する。切り替わるのは`BackendUnavailableError`、`BackendRateLimitError`、`BackendTimeoutError`のみとし、認証・ポリシー・プロトコルの失敗では切り替えない |
+| 9 | 強制されないcapability | 採用 | `usage_available`を`unmetered_requests`の判定へ接続した。`max_parallelism`はingestが逐次実行である限り自明に満たされるため宣言のままとし、並列化の時点で強制対象へ加える |
+| 22 | rich進捗テストの幅依存 | 採用 | `setUp`での`COLUMNS`固定が全テストへ及んでおり、幅40・80・200で9件成功する |
+| 29 | untrusted出力の分類と監査への混入 | 採用 | `LocalAgentProcessError`はstderrだけをメッセージと`diagnostics`に採る。分類も`diagnostics`のみを見るため、記事に`rate limit`とあってもFeedianの分類は変わらない |
+| 30 | 監査argvの再構築 | 採用 | `sanitized_argv`が実際に実行したargvから一時ディレクトリのpathだけを置換する。プロセスが起動しなかった場合に限り、組み立てたargvを記録する |
+| 31 | `auth_mode`によるlocal-agent判別 | 採用 | `BackendCapabilities`へ確定仕様どおり`execution_kind`を追加し、隔離した一時親の判定をそちらへ移した |
+
+### fallbackの設計
+
+fallbackは宛先backendの`llm_run`を新しく開いて実行する。同じrunを上書きしないため、`backend`列と再利用キーが常に実行した組み合わせを指す。宛先のmodelはbackendごとに`max_article_chars`が異なるため、候補を宛先backendで組み立て直してから実行する。宛先に再利用可能な結果があればそれを使い、APIを呼ばない。
+
+宛先backendの`preflight`は初回のfallback発生時にだけ行う。使われないfallbackのために資格情報を要求しないためである。
+
+### タイムアウト時のプロセスツリー終了
+
+`tests/test_local_agent.py`に実プロセスによる検証を追加した。孫プロセスを起こす親を1.5秒でタイムアウトさせ、孫が自分の待機時間を過ぎてもマーカーファイルを書かないことを確認する。fake runnerの契約テストでは原理的に検証できなかった項目である。
+
+### 検証
+
+- [x] テストスイートが緑である（249件）。`ruff check`も通る。
+- [x] 実プロセスのプロセスツリーがタイムアウトで完全に終了する。
+- [x] fallbackが有効なとき、利用枠到達では宛先backendで別runが作られ、認証失敗では作られない。
+- [x] fallbackが無効なとき、利用枠到達でも別backendを呼ばない。
+- [x] プラン画面が宛先を表示し、無効なら`disabled`と示す。
+- [x] 進捗テストが幅40・80・200で通る。
+
+これで本レビューの指摘1から33はすべて解消または明示的な不採用となった。ステータスを`完了`とする。

@@ -5,9 +5,14 @@ import json
 from feedian.canonical import CanonicalItem
 from feedian.ingest import ingest_source_notes, plan_source_notes, render_source_notes
 from feedian.llm import PROVIDER_OUTPUT_SCHEMA
-from feedian.llm_backends import BackendAudit, BackendCapabilities
+from feedian.llm_backends import (
+    BackendAudit,
+    BackendAuthError,
+    BackendCapabilities,
+    BackendRateLimitError,
+)
 from feedian.store import VaultStore
-from feedian.vault import VaultConfig, initialize_vault
+from feedian.vault import LLMFallbackSettings, VaultConfig, initialize_vault
 
 
 class FakeBackend:
@@ -17,6 +22,7 @@ class FakeBackend:
         *,
         backend: str = "openai-responses",
         auth_mode: str = "api-key",
+        execution_kind: str = "http",
         billing_mode: str = "metered-api",
         error: Exception | None = None,
     ) -> None:
@@ -25,6 +31,7 @@ class FakeBackend:
         self.summarize_kwargs = {}
         self.capabilities = BackendCapabilities(
             backend=backend,
+            execution_kind=execution_kind,
             auth_mode=auth_mode,
             billing_mode=billing_mode,
             max_article_chars=3_000 if backend == "manus-api" else 10_000,
@@ -305,7 +312,7 @@ def test_local_backend_runs_outside_the_vault_project(tmp_path, monkeypatch) -> 
             usage = {}
 
         backend = FakeBackend(
-            Audit(), backend="codex-local", auth_mode="local-session",
+            Audit(), backend="codex-local", auth_mode="local-session", execution_kind="local-agent",
             billing_mode="subscription",
         )
         ingest_source_notes(
@@ -539,5 +546,114 @@ def test_legacy_fingerprint_is_isolated_from_provider_schema_changes(tmp_path) -
 
         assert after.fingerprint != before.fingerprint
         assert after.legacy_fingerprint == before.legacy_fingerprint
+    finally:
+        store.close()
+
+
+def _vault_with_one_article(root):
+    initialize_vault(root)
+    store = VaultStore.open(root / ".feedian" / "feedian.sqlite3")
+    item = store.upsert_canonical_item(
+        CanonicalItem(
+            source="hatena", source_id="one", content_key="url:one",
+            url="https://example.test", title="Article",
+        )
+    )
+    store.record_resource_revision(
+        item.resource_id or "", content_markdown="Body", title="Article"
+    )
+    return store
+
+
+class _Audit:
+    result = {
+        "note_title": "One", "summary": "Short", "key_points": [],
+        "tags": ["one"], "content_type": "article",
+    }
+    request = {}
+    response = {"id": "response"}
+    usage = {"input_tokens": 5, "output_tokens": 2}
+
+
+def test_enabled_fallback_runs_the_named_backend_and_records_it_separately(tmp_path) -> None:
+    """An allowance that runs out is why fallback exists; the audit must show both."""
+
+    root = tmp_path / "vault"
+    root.mkdir()
+    store = _vault_with_one_article(root)
+    try:
+        config = VaultConfig()
+        config.llm.fallback = LLMFallbackSettings(
+            enabled=True, backend="openai-responses", model="gpt-5.6-terra"
+        )
+        primary = FakeBackend(
+            None, backend="codex-local", execution_kind="local-agent",
+            auth_mode="local-session", billing_mode="subscription",
+            error=BackendRateLimitError("weekly allowance reached"),
+        )
+        fallback = FakeBackend(_Audit())
+
+        report = ingest_source_notes(
+            store, root, config, model="gpt-test", backend="codex-local",
+            backend_instance=primary, fallback_instance=fallback,
+        )
+
+        rows = store.connection.execute(
+            "SELECT backend, model, status FROM llm_run ORDER BY started_at"
+        ).fetchall()
+        assert report.created == 1
+        assert report.failed == 0
+        assert [tuple(row) for row in rows] == [
+            ("codex-local", "gpt-test", "failed"),
+            ("openai-responses", "gpt-5.6-terra", "completed"),
+        ]
+    finally:
+        store.close()
+
+
+def test_fallback_does_not_rescue_a_credential_or_policy_failure(tmp_path) -> None:
+    """A rejected credential is a fault to fix, not a reason to start billing."""
+
+    root = tmp_path / "vault"
+    root.mkdir()
+    store = _vault_with_one_article(root)
+    try:
+        config = VaultConfig()
+        config.llm.fallback = LLMFallbackSettings(
+            enabled=True, backend="openai-responses", model="gpt-5.6-terra"
+        )
+        primary = FakeBackend(
+            None, backend="codex-local", execution_kind="local-agent",
+            auth_mode="local-session", billing_mode="subscription",
+            error=BackendAuthError("not logged in"),
+        )
+        fallback = FakeBackend(_Audit(), error=AssertionError("fallback must not run"))
+
+        report = ingest_source_notes(
+            store, root, config, model="gpt-test", backend="codex-local",
+            backend_instance=primary, fallback_instance=fallback,
+        )
+
+        assert report.failed == 1
+        assert report.created == 0
+        assert store.connection.execute("SELECT COUNT(*) FROM llm_run").fetchone()[0] == 1
+    finally:
+        store.close()
+
+
+def test_fallback_stays_off_unless_the_config_enables_it(tmp_path) -> None:
+    root = tmp_path / "vault"
+    root.mkdir()
+    store = _vault_with_one_article(root)
+    try:
+        primary = FakeBackend(None, error=BackendRateLimitError("429"))
+        fallback = FakeBackend(_Audit(), error=AssertionError("fallback must not run"))
+
+        report = ingest_source_notes(
+            store, root, VaultConfig(), model="gpt-test", backend_instance=primary,
+            fallback_instance=fallback,
+        )
+
+        assert report.failed == 1
     finally:
         store.close()

@@ -17,7 +17,12 @@ from .cli_ui import (
     print_ingest_plan,
 )
 from .env import load_env_file
-from .ingest import ingest_source_notes, plan_source_notes, render_source_notes
+from .ingest import (
+    ingest_source_notes,
+    plan_source_notes,
+    render_source_notes,
+    resolve_fallback,
+)
 from .llm_backends import BACKEND_IDS, canonical_backend_id, get_backend
 from .notifications import notify_windows
 from .progress import PROGRESS_MODES, ProgressReporter
@@ -618,6 +623,10 @@ def _ingest(args: argparse.Namespace) -> int:
             or legacy_environment or config.llm.backend
         )
         backend = get_backend(backend_id)
+        fallback = resolve_fallback(config, backend_id)
+        fallback_label = (
+            f"{fallback.backend_id} / {fallback.model}" if fallback is not None else ""
+        )
         configured_backend = canonical_backend_id(config.llm.backend)
         backend_model_environment = {
             "openai-responses": "OPENAI_MODEL",
@@ -641,7 +650,7 @@ def _ingest(args: argparse.Namespace) -> int:
                 force=args.force, auto=args.auto, backend=backend_id, backend_instance=backend,
             )
             print_ingest_plan(
-                plan, backend=backend_id, model=model, dry_run=True, command=args._invocation,
+                plan, backend=backend_id, fallback=fallback_label, model=model, dry_run=True, command=args._invocation,
             )
             return 0
 
@@ -652,7 +661,7 @@ def _ingest(args: argparse.Namespace) -> int:
                 force=args.force, auto=args.auto, backend=backend_id, backend_instance=backend,
             )
             print_ingest_plan(
-                plan, backend=backend_id, model=model, dry_run=False, command=args._invocation,
+                plan, backend=backend_id, fallback=fallback_label, model=model, dry_run=False, command=args._invocation,
             )
 
             with reporter:

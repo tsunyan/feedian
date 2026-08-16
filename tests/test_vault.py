@@ -126,18 +126,29 @@ def test_v1_config_requires_explicit_migration(tmp_path) -> None:
     assert migrate_vault_config(root) is False
 
 
-def test_enabled_fallback_is_refused_while_nothing_acts_on_it(tmp_path) -> None:
+def test_enabled_fallback_requires_both_a_backend_and_a_model(tmp_path) -> None:
+    """Feedian never picks the destination itself, so the config must name it."""
+
     root = tmp_path / "vault"
     root.mkdir()
     initialize_vault(root)
     config_path = root / ".feedian" / "config.json"
     config_path.write_text(
-        '{"format_version":2,"llm":{"backend":"openai-responses","model":"gpt-test",'
-        '"fallback":{"enabled":true,"backend":"manus-api","model":"manus-1.6"}}}',
+        '{"format_version":2,"llm":{"backend":"codex-local","model":"gpt-test",'
+        '"fallback":{"enabled":true,"backend":"openai-responses"}}}',
         encoding="utf-8",
     )
 
-    # A fully specified fallback is still refused: nothing switches backends yet,
-    # and silently accepting it would suggest otherwise.
-    with pytest.raises(ValueError, match="not implemented yet"):
+    with pytest.raises(ValueError, match="requires both backend and model"):
         load_vault_config(root)
+
+    config_path.write_text(
+        '{"format_version":2,"llm":{"backend":"codex-local","model":"gpt-test",'
+        '"fallback":{"enabled":true,"backend":"openai-responses","model":"gpt-5.6-terra"}}}',
+        encoding="utf-8",
+    )
+    config = load_vault_config(root)
+
+    assert config.llm.fallback.enabled
+    assert config.llm.fallback.backend == "openai-responses"
+    assert config.llm.fallback.model == "gpt-5.6-terra"
