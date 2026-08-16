@@ -657,3 +657,29 @@ codex --config cli_auth_credentials_store="file" login
 - [ ] version検出、login確認、`codex exec`が同一のallowlist環境を受け取る。
 - [ ] 親環境のsecretとprocess挙動を変更する禁止変数が子processへ渡らない。
 - [ ] 認証保存方式がsetup時と実行時の双方でfileに固定され、専用homeの`auth.json`を使う。
+
+## 指摘28・33の実装（2026-08-17）
+
+実装者: Claude Code
+
+Codexの補足レビューの推奨どおり、Feedian専用の`CODEX_HOME`と環境変数allowlistを実装した。`cli_auth_credentials_store="file"`の指摘は正しく、これが無いとOS keyring経由で既定homeの認証が共有され得るため分離が成立しない。
+
+### 実装内容
+
+- `minimal_child_environment`をallowlist方式で追加した。共通（`PATH`、`LANG`、`LC_ALL`、`TZ`）、プラットフォーム別、proxyの三系統だけを引き継ぐ。`ProcessRunner`の契約へ`env`を追加し、`SubprocessRunner`は`Popen(env=...)`へ渡す。
+- `codex_home()`は`~/.feedian/codex-home`を返す。他のユーザー単位状態（`~/.feedian/pending`、`source-state.json`）と同じ場所である。
+- version検出、`login status`、`codex exec`の三経路すべてが`child_environment()`の同一の環境を受け取る。契約テストで三者の一致と、`OPENAI_API_KEY`・`MANUS_API_KEY`・`CODEX_ACCESS_TOKEN`・`NODE_OPTIONS`が渡らないことを検証する。
+- `cli_auth_credentials_store="file"`を`login status`と`codex exec`の両方でCLI overrideとして渡す。`--ignore-user-config`が専用homeの`config.toml`も無視するため、設定ファイルへ書くだけでは効かない。
+- preflightが専用homeを検証する。`auth.json`が無ければ`BackendAuthError`にログインコマンドを添えて返す。`AGENTS.md`、`AGENTS.override.md`、`skills`、`plugins`、`rules`、`hooks`、`memories`のいずれかが存在すれば`BackendPolicyError`で拒否する。
+- 検証順はversion、home、loginとした。未検証versionではログインしても無駄になるためである。
+- `_detect_version`が`_resolve_executable`を直接使っており、fake runnerでは到達できなかった。`_verify_login`と同じ`_control_executable`へ揃えた。
+
+実CLIで`--strict-config`を付けて実行し、`cli_auth_credentials_store`と`mcp_servers`がいずれも実在する設定キーであることを確認した。
+
+### 未完了
+
+利用者による専用homeへのログインが必要である。完了後に指摘28のプローブを再実行し、グローバル`AGENTS.md`とskillsカタログが届かないことを実測するまで、指摘28は解消としない。
+
+```
+CODEX_HOME="<user home>/.feedian/codex-home" codex --config cli_auth_credentials_store="file" login
+```

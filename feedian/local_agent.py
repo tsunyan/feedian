@@ -9,7 +9,7 @@ import subprocess
 import tempfile
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Callable, Protocol, Sequence
+from typing import Callable, Mapping, Protocol, Sequence
 
 
 MAX_ERROR_BYTES = 8 * 1024
@@ -42,7 +42,39 @@ class ProcessRunner(Protocol):
         stdin_text: str,
         cwd: Path,
         timeout_seconds: float,
+        env: Mapping[str, str],
     ) -> ProcessResult: ...
+
+
+# What a CLI needs to start and reach the network, and nothing else. An allowlist
+# rather than a denylist because the parent process holds provider API keys that
+# a local agent must never see, and new secrets appear in an environment over
+# time while this list does not.
+_SHARED_ENVIRONMENT_KEYS = ("PATH", "LANG", "LC_ALL", "TZ")
+_WINDOWS_ENVIRONMENT_KEYS = (
+    "SystemRoot", "SystemDrive", "COMSPEC", "PATHEXT", "windir",
+    "TEMP", "TMP", "USERPROFILE", "APPDATA", "LOCALAPPDATA",
+    "ProgramData", "ProgramFiles", "ProgramFiles(x86)",
+    "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE",
+)
+_POSIX_ENVIRONMENT_KEYS = ("HOME", "TMPDIR", "USER", "LOGNAME")
+# Kept because a proxied network is unreachable without them. A proxy URL can
+# embed credentials, so this is a deliberate trade-off rather than an oversight.
+_PROXY_ENVIRONMENT_KEYS = (
+    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+    "http_proxy", "https_proxy", "no_proxy",
+)
+
+
+def minimal_child_environment(**overrides: str) -> dict[str, str]:
+    """Build a child environment from an allowlist, then apply explicit overrides."""
+    allowed = _SHARED_ENVIRONMENT_KEYS + _PROXY_ENVIRONMENT_KEYS
+    allowed += _WINDOWS_ENVIRONMENT_KEYS if os.name == "nt" else _POSIX_ENVIRONMENT_KEYS
+    environment = {
+        key: os.environ[key] for key in allowed if os.environ.get(key) is not None
+    }
+    environment.update(overrides)
+    return environment
 
 
 def isolated_local_agent_parent(vault_root: str | Path) -> Path:
@@ -67,6 +99,7 @@ class SubprocessRunner:
         stdin_text: str,
         cwd: Path,
         timeout_seconds: float,
+        env: Mapping[str, str],
     ) -> ProcessResult:
         """Run one agent process, terminating its whole tree on timeout.
 
@@ -88,6 +121,7 @@ class SubprocessRunner:
             encoding="utf-8",
             errors="replace",
             cwd=cwd,
+            env=dict(env),
             **popen_kwargs,  # type: ignore[arg-type]
         )
         try:
@@ -136,6 +170,7 @@ def run_isolated_local_agent(
     output_schema: dict[str, object],
     temporary_parent: Path,
     timeout_seconds: float,
+    env: Mapping[str, str],
 ) -> LocalAgentResult:
     """Run one local-agent process without placing untrusted input in argv.
 
@@ -168,6 +203,7 @@ def run_isolated_local_agent(
             stdin_text=stdin_text,
             cwd=temporary_path,
             timeout_seconds=timeout_seconds,
+            env=env,
         )
         if completed.returncode != 0:
             raise LocalAgentProcessError(completed, argv)

@@ -28,6 +28,7 @@ from .local_agent import (
     LocalAgentProcessError,
     ProcessRunner,
     SubprocessRunner,
+    minimal_child_environment,
     run_isolated_local_agent,
 )
 
@@ -249,6 +250,26 @@ CODEX_DISABLED_FEATURES = (
 # another default-on tool would reopen the surface silently. Re-run the check in
 # the review document before adding a version here.
 CODEX_VERIFIED_VERSIONS = ("0.147.0",)
+# Codex looks for the global AGENTS.md, skills, plugins, rules and hooks under
+# CODEX_HOME, and --ignore-user-config excludes only config.toml from it. Pointing
+# CODEX_HOME at a home Feedian owns is what actually keeps a personal instruction
+# file out of a turn that also carries untrusted article text.
+CODEX_HOME_ENTRIES_THAT_REACH_THE_MODEL = (
+    "AGENTS.md", "AGENTS.override.md", "skills", "plugins", "rules", "hooks", "memories",
+)
+
+
+def codex_home() -> Path:
+    """The Codex home Feedian runs against, beside the other per-user state."""
+    return Path.home() / ".feedian" / "codex-home"
+
+
+def codex_login_command(home: Path | None = None) -> str:
+    """The one command a user runs to authenticate the dedicated home."""
+    target = home or codex_home()
+    return (
+        f'CODEX_HOME="{target}" codex --config cli_auth_credentials_store="file" login'
+    )
 
 
 class CodexLocalBackend:
@@ -267,10 +288,12 @@ class CodexLocalBackend:
         executable: str = "codex",
         version: str = "",
         control_runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+        home: Path | None = None,
     ) -> None:
         self.runner = runner or SubprocessRunner()
         self.executable = executable
         self.version = version
+        self.home = home or codex_home()
         self.control_runner = control_runner or subprocess.run
         self._resolved_executable = ""
         self._preflight_metadata: dict[str, Any] | None = None
@@ -295,6 +318,26 @@ class CodexLocalBackend:
     def supports_model(self, model: str) -> bool:
         return not model.startswith("manus-")
 
+    def child_environment(self) -> dict[str, str]:
+        """The one environment every Codex invocation gets: version, login, exec."""
+        return minimal_child_environment(CODEX_HOME=str(self.home))
+
+    def _verify_home(self) -> None:
+        home = self.home
+        if not (home / "auth.json").is_file():
+            raise BackendAuthError(
+                f"The Feedian Codex home is not logged in: {home}. "
+                f"Run: {codex_login_command(home)}"
+            )
+        present = [
+            name for name in CODEX_HOME_ENTRIES_THAT_REACH_THE_MODEL if (home / name).exists()
+        ]
+        if present:
+            raise BackendPolicyError(
+                f"The Feedian Codex home must hold credentials only, but contains "
+                f"{', '.join(present)}: {home}. These reach the model as instructions."
+            )
+
     def preflight(self) -> dict[str, Any]:
         if self._preflight_metadata is not None:
             return dict(self._preflight_metadata)
@@ -306,11 +349,13 @@ class CodexLocalBackend:
                 f"{', '.join(CODEX_VERIFIED_VERSIONS)}."
             )
         self.version = version
+        self._verify_home()
         self._verify_login()
         self._preflight_metadata = {
             "implementation_revision": BACKEND_IMPLEMENTATION_REVISION,
             "cli_version": version,
             "disabled_features": list(CODEX_DISABLED_FEATURES),
+            "codex_home": "<feedian>",
         }
         return dict(self._preflight_metadata)
 
@@ -322,8 +367,13 @@ class CodexLocalBackend:
     def _verify_login(self) -> None:
         try:
             completed = self.control_runner(
-                [self._control_executable(), "login", "status"],
+                [
+                    self._control_executable(),
+                    "--config", 'cli_auth_credentials_store="file"',
+                    "login", "status",
+                ],
                 capture_output=True, text=True, timeout=30, check=False,
+                env=self.child_environment(),
             )
         except (OSError, subprocess.SubprocessError) as exc:
             raise BackendUnavailableError(f"Could not check Codex CLI login status: {exc}") from exc
@@ -334,8 +384,9 @@ class CodexLocalBackend:
         """Detect the CLI version once per run; callers cache it on the instance."""
         try:
             completed = self.control_runner(
-                [self._resolve_executable(), "--version"],
+                [self._control_executable(), "--version"],
                 capture_output=True, text=True, timeout=30, check=False,
+                env=self.child_environment(),
             )
         except (OSError, subprocess.SubprocessError) as exc:
             raise BackendUnavailableError(f"Could not run the Codex CLI: {exc}") from exc
@@ -388,6 +439,8 @@ class CodexLocalBackend:
                 "--ignore-rules",
                 "--config",
                 "mcp_servers={}",
+                "--config",
+                'cli_auth_credentials_store="file"',
                 "--json",
                 "--sandbox",
                 "read-only",
@@ -413,6 +466,7 @@ class CodexLocalBackend:
                 output_schema=PROVIDER_OUTPUT_SCHEMA,
                 temporary_parent=temporary_parent,
                 timeout_seconds=timeout_seconds,
+                env=self.child_environment(),
             )
             result = normalize_summary_result(local.result)
         except subprocess.TimeoutExpired as exc:
