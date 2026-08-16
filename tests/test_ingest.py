@@ -4,6 +4,7 @@ import json
 
 from feedian.canonical import CanonicalItem
 from feedian.ingest import ingest_source_notes, plan_source_notes, render_source_notes
+from feedian.llm import PROVIDER_OUTPUT_SCHEMA
 from feedian.llm_backends import BackendAudit, BackendCapabilities
 from feedian.store import VaultStore
 from feedian.vault import VaultConfig, initialize_vault
@@ -443,5 +444,46 @@ def test_legacy_fingerprint_matches_the_key_the_previous_release_stored(tmp_path
         assert candidate.legacy_fingerprint == (
             "b2cccd34551a6f6eefca14a5a31af494413d33ee4f84c2fd3bedd781f088cd95"
         )
+    finally:
+        store.close()
+
+
+def test_legacy_fingerprint_is_isolated_from_provider_schema_changes(tmp_path) -> None:
+    """Changing what providers are asked for must not end the migration window.
+
+    The current key covers the whole request and is meant to move; the version-one
+    key is rebuilt from a frozen schema and must not.
+    """
+
+    root = tmp_path / "vault"
+    root.mkdir()
+    initialize_vault(root)
+    store = VaultStore.open(root / ".feedian" / "feedian.sqlite3")
+    try:
+        item = store.upsert_canonical_item(
+            CanonicalItem(
+                source="hatena", source_id="one", content_key="url:one",
+                url="https://example.test", title="Article",
+            )
+        )
+        store.record_resource_revision(
+            item.resource_id or "", content_markdown="Body", title="Article"
+        )
+
+        def plan() -> object:
+            return plan_source_notes(
+                store, model="gpt-test", backend_instance=FakeBackend(None)
+            ).candidates[0]
+
+        before = plan()
+        original = PROVIDER_OUTPUT_SCHEMA["properties"]["tags"]["minItems"]
+        PROVIDER_OUTPUT_SCHEMA["properties"]["tags"]["minItems"] = 2
+        try:
+            after = plan()
+        finally:
+            PROVIDER_OUTPUT_SCHEMA["properties"]["tags"]["minItems"] = original
+
+        assert after.fingerprint != before.fingerprint
+        assert after.legacy_fingerprint == before.legacy_fingerprint
     finally:
         store.close()

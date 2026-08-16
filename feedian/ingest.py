@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 import time
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -11,7 +12,12 @@ from urllib.parse import urlsplit
 
 from .estimate import MODEL_PRICES, comparison_model, count_prompt_tokens, usage_cost_usd
 from .extract import PageFetchResult
-from .llm import CANONICAL_SUMMARY_SCHEMA_VERSION, SUMMARY_INSTRUCTIONS, build_summary_request
+from .llm import (
+    CANONICAL_SUMMARY_SCHEMA_VERSION,
+    LEGACY_V1_PROVIDER_SCHEMA,
+    SUMMARY_INSTRUCTIONS,
+    build_summary_request,
+)
 from .llm_backends import LLMBackend, canonical_backend_id, get_backend
 from .local_agent import sanitize_error
 from .markdown import escape_markdown_heading, sanitize_filename, yaml_frontmatter
@@ -338,7 +344,12 @@ def _candidate(
         max_article_chars=selected_backend.capabilities.max_article_chars,
     )
     fingerprint = hashlib.sha256(stable_json(request).encode("utf-8")).hexdigest()
-    legacy_request = dict(request)
+    # Rebuild the key exactly as the release before backend IDs wrote it, from a
+    # frozen schema, so editing the provider schema cannot silently end the
+    # migration window. A prompt change is meant to invalidate reuse and does so
+    # through PROMPT_VERSION.
+    legacy_request = deepcopy(request)
+    legacy_request["text"]["format"]["schema"] = LEGACY_V1_PROVIDER_SCHEMA
     legacy_request["provider"] = "manus" if backend_id == "manus-api" else "openai"
     legacy_fingerprint = hashlib.sha256(stable_json(legacy_request).encode("utf-8")).hexdigest()
     cached = None if force else store.successful_llm_result(

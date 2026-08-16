@@ -41,10 +41,12 @@ CANONICAL_SUMMARY_SCHEMA: dict[str, Any] = {
             "minItems": 0,
             "maxItems": 4,
         },
+        # Empty tags are accepted so that results stored by earlier releases stay
+        # reusable; tightening this raises CANONICAL_SUMMARY_SCHEMA_VERSION.
         "tags": {
             "type": "array",
             "items": {"type": "string", "maxLength": 40},
-            "minItems": 1,
+            "minItems": 0,
             "maxItems": 6,
         },
         "content_type": {"type": "string"},
@@ -52,11 +54,19 @@ CANONICAL_SUMMARY_SCHEMA: dict[str, Any] = {
     "required": ["note_title", "summary", "key_points", "tags", "content_type"],
     "additionalProperties": False,
 }
-# The provider-facing schema is intentionally a separate object. Adapters may
-# derive supported subsets from it without weakening canonical validation.
-PROVIDER_OUTPUT_SCHEMA = deepcopy(CANONICAL_SUMMARY_SCHEMA)
+# What providers are asked to produce, kept separate from what Feedian accepts:
+# asking for at least one tag is worth doing even though a reply without one is
+# still storable. Adapters may narrow this further (see _manus_schema).
+PROVIDER_OUTPUT_SCHEMA: dict[str, Any] = deepcopy(CANONICAL_SUMMARY_SCHEMA)
+PROVIDER_OUTPUT_SCHEMA["properties"]["tags"]["minItems"] = 1
 # Compatibility name retained for callers and tests that imported the old name.
 SUMMARY_SCHEMA = PROVIDER_OUTPUT_SCHEMA
+
+# The provider schema exactly as commit 2385ec2 hashed it into the reuse key.
+# The key covers the whole request, so editing PROVIDER_OUTPUT_SCHEMA would
+# otherwise stop the migration window from recognising anything ever stored.
+# Frozen deliberately: never edit this to match a schema change.
+LEGACY_V1_PROVIDER_SCHEMA: dict[str, Any] = deepcopy(PROVIDER_OUTPUT_SCHEMA)
 
 
 MANUS_UNTRUSTED_REMINDER = (
@@ -110,7 +120,43 @@ def normalize_summary_result(result: Any) -> dict[str, Any]:
     for field in ("note_title", "summary"):
         if not normalized[field]:
             raise RuntimeError(f"LLM result is missing required field: {field}")
-    return normalized
+    return validate_canonical_summary(normalized)
+
+
+def validate_canonical_summary(result: dict[str, Any]) -> dict[str, Any]:
+    """Check a normalized result against CANONICAL_SUMMARY_SCHEMA.
+
+    Feedian validates every backend result itself rather than trusting a backend's
+    structured-output feature, so a result that fails here never becomes a note.
+    Normalization runs first and repairs what it is allowed to repair; anything
+    still invalid at this point is a defect in the adapter, not in the reply.
+    """
+    schema = CANONICAL_SUMMARY_SCHEMA
+    missing = [field for field in schema["required"] if field not in result]
+    if missing:
+        raise RuntimeError(f"Summary is missing required field(s): {', '.join(missing)}")
+    unexpected = sorted(set(result) - set(schema["properties"]))
+    if unexpected:
+        raise RuntimeError(f"Summary has unexpected field(s): {', '.join(unexpected)}")
+    for field, rules in schema["properties"].items():
+        _validate_canonical_field(f"Summary field {field}", result[field], rules)
+    return result
+
+
+def _validate_canonical_field(label: str, value: Any, rules: dict[str, Any]) -> None:
+    if rules["type"] == "array":
+        if not isinstance(value, list):
+            raise RuntimeError(f"{label} must be an array.")
+        if len(value) < rules.get("minItems", 0) or len(value) > rules["maxItems"]:
+            raise RuntimeError(f"{label} has {len(value)} item(s), outside the allowed range.")
+        for index, item in enumerate(value):
+            _validate_canonical_field(f"{label}[{index}]", item, rules["items"])
+        return
+    if not isinstance(value, str):
+        raise RuntimeError(f"{label} must be a string.")
+    limit = rules.get("maxLength")
+    if limit is not None and len(value) > limit:
+        raise RuntimeError(f"{label} is {len(value)} characters, over the {limit} limit.")
 
 
 def _text(value: Any) -> str:

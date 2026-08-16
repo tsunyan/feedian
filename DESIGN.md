@@ -10,6 +10,7 @@
 - Vault設定はformat version 2で`llm.backend`、`llm.model`、`llm.fallback`を持つ。version 1からは`feedian migrate`による明示移行が必要で、fallbackは既定で無効とする。
 - SQLite schema version 6の`llm_run`はbackend、canonical schema version、fingerprint version、auth/billing mode、実装メタデータ、所要時間を監査情報として保存する。
 - 再利用キーはbackend境界を越えない。旧fingerprintは移行期間中だけ検索し、再利用した記事の書き込み時にversion 2へ昇格する。計画は読み取りのみで、`--dry-run`は書き込まない。
-- 再利用キーはrequest全体のハッシュであるため、要約スキーマを変更すると移行期間中の旧キー検索が無言で一致しなくなる。`tests/test_ingest.py`が旧キーを実測値で固定している。
-- プロバイダーへ要求するスキーマはタグを1個以上とするが、保存前の正規化は長さと要素数を切り詰めて救済し、空の`tags`と`content_type`を許容する。必須の`note_title`と`summary`の欠落だけを失敗とする。
+- 再利用キーはrequest全体のハッシュである。旧キーは凍結した`LEGACY_V1_PROVIDER_SCHEMA`から組み立てるため、`PROVIDER_OUTPUT_SCHEMA`を変更しても移行期間中の検索は壊れない。`tests/test_ingest.py`が旧キーを実測値で固定し、この分離も検証する。
+- providerへ要求する`PROVIDER_OUTPUT_SCHEMA`とFeedianが受理する`CANONICAL_SUMMARY_SCHEMA`は別オブジェクトである。前者はタグを1個以上求めるが、後者は空の`tags`と`content_type`を許容する。既存結果の再利用を優先するためであり、厳格化する場合はcanonical schema versionを上げる。
+- 処理順序は「provider出力の解析 → 許容された正規化 → canonical schema検証」である。正規化は前後空白の除去、型強制、長さと要素数の切り詰めだけを救済し、検証に失敗した結果はsource noteにも成功runにもならない。
 - source noteのfrontmatterは互換性のため`model`のみを維持する。backendの識別は`llm_run`監査記録で行う。

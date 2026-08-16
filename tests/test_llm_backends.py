@@ -7,7 +7,12 @@ import subprocess
 import pytest
 
 from feedian.extract import PageFetchResult
-from feedian.llm import normalize_summary_result
+from feedian.llm import (
+    CANONICAL_SUMMARY_SCHEMA,
+    PROVIDER_OUTPUT_SCHEMA,
+    normalize_summary_result,
+    validate_canonical_summary,
+)
 from feedian.llm_backends import (
     ApiBackend,
     BackendPolicyError,
@@ -172,3 +177,34 @@ def test_error_redaction_removes_tokens_paths_and_applies_byte_limit(tmp_path) -
     assert "secret-token" not in sanitized
     assert str(tmp_path) not in sanitized
     assert len(sanitized.encode("utf-8")) <= 8 * 1024
+
+
+def test_provider_schema_asks_for_a_tag_that_the_canonical_schema_does_not_require() -> None:
+    """The two schemas express different contracts and must stay separate objects.
+
+    Asking a provider for at least one tag is worth doing; refusing to store a
+    reply that arrives without one would discard results earlier releases kept.
+    """
+
+    assert PROVIDER_OUTPUT_SCHEMA["properties"]["tags"]["minItems"] == 1
+    assert CANONICAL_SUMMARY_SCHEMA["properties"]["tags"]["minItems"] == 0
+    assert PROVIDER_OUTPUT_SCHEMA is not CANONICAL_SUMMARY_SCHEMA
+
+
+def test_canonical_validation_rejects_a_result_normalization_could_not_have_produced() -> None:
+    valid = {
+        "note_title": "Title", "summary": "Summary",
+        "key_points": [], "tags": [], "content_type": "",
+    }
+    assert validate_canonical_summary(dict(valid)) == valid
+
+    with pytest.raises(RuntimeError, match="over the 80 limit"):
+        validate_canonical_summary({**valid, "note_title": "x" * 81})
+    with pytest.raises(RuntimeError, match="must be an array"):
+        validate_canonical_summary({**valid, "tags": "one"})
+    with pytest.raises(RuntimeError, match="outside the allowed range"):
+        validate_canonical_summary({**valid, "tags": ["t"] * 7})
+    with pytest.raises(RuntimeError, match="missing required field"):
+        validate_canonical_summary({key: value for key, value in valid.items() if key != "summary"})
+    with pytest.raises(RuntimeError, match="unexpected field"):
+        validate_canonical_summary({**valid, "extra": "x"})

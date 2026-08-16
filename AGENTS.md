@@ -112,6 +112,9 @@ git history already records that.
 - **The document body must be in Japanese.** Only the file name is in English.
 - **Target (`対象`)** — Required. Name the reviewed commit by hash and summary. Because the document is
   committed together with its fixes, that commit is normally the parent of the commit carrying the document.
+- **Cite the finalized specification.** When one exists, quote `docs/specs/YYYYMMdd-*.ja.md` as the evidence
+  for what the implementation owes. Never argue from a pre-finalization draft: the draft is what was proposed,
+  not what was decided, and a finding built on it inverts the review.
 - **Findings (`指摘`)** — Number them. The number is the finding ID; refer to it from fix commits as
   `<文書の日付>-<番号>` (example: `20260816-2`). Every finding states its evidence as `file:line`, what actually
   happens, and what it costs. A finding nobody can reproduce is not a finding.
