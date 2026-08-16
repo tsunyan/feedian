@@ -676,10 +676,32 @@ Codexの補足レビューの推奨どおり、Feedian専用の`CODEX_HOME`と�
 
 実CLIで`--strict-config`を付けて実行し、`cli_auth_credentials_store`と`mcp_servers`がいずれも実在する設定キーであることを確認した。
 
-### 未完了
+### 専用homeでの実測（2026-08-17）
 
-利用者による専用homeへのログインが必要である。完了後に指摘28のプローブを再実行し、グローバル`AGENTS.md`とskillsカタログが届かないことを実測するまで、指摘28は解消としない。
+利用者が専用homeへログインした後、指摘28と同一のプローブを出荷構成で実行した。
 
 ```
-CODEX_HOME="<user home>/.feedian/codex-home" codex --config cli_auth_credentials_store="file" login
+System instructions — private; cannot quote.
+Developer instructions — private; cannot quote.
+Skills catalog — first entry: "imagegen"
+Environment context — "<environment_context>"
+AGENTS.md: none provided.
+Memories: none.
+MCP servers: none.
 ```
+
+指摘28で報告された`User-provided AGENTS.md — "# グローバル作業指示"`は消えた。skillsカタログの先頭も、既定homeにある利用者の14個（`cloudflare`、`wrangler`など）ではなくCLI内蔵の`imagegen`に変わっている。入力トークンは12,273から10,835へ減った。
+
+untrusted本文にファイル読み取りを注入したエンドツーエンド実行も、カナリアを漏らさずに正常な要約を返す。
+
+**利用者が管理する指示は、AGENTS.md、skills、plugins、rules、hooks、memoriesのすべてについて到達しなくなった。** 残るのはCLI内蔵のsystem instructionsと内蔵skillsカタログであり、これは`CODEX_HOME`では除去できない。CLI自身のsystem promptと同じ性質のものとして扱い、確定仕様が求める「user settingsとskillsを無視する」は達成したと判断する。
+
+### 実測で判明した実装の誤り
+
+初版の`_verify_home`は`skills`ディレクトリの存在だけで拒否していた。ところが**CLIは実行時に`skills/.system/`を自分で作り、内蔵skillを配置する**。このため初回実行の直後から`BackendPolicyError`で拒否され、2回目以降が動かなかった。`~/.codex`の一覧から書いた静的な検査が、実際の運用を1周させて初めて誤りと分かった例である。
+
+`skills/.system`はCLI管理領域として許容し、`skills/`直下のそれ以外を利用者由来として拒否するよう修正した。回帰テストで両方を固定している。
+
+### 指摘28・33の結論
+
+いずれも**採用・解消**とする。残るCLI内蔵分は`DESIGN.md`へ既知の制約として記載する。

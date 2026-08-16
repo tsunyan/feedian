@@ -423,3 +423,27 @@ def test_canonical_validation_rejects_a_result_normalization_could_not_have_prod
         validate_canonical_summary({key: value for key, value in valid.items() if key != "summary"})
     with pytest.raises(RuntimeError, match="unexpected field"):
         validate_canonical_summary({**valid, "extra": "x"})
+
+
+def test_codex_home_check_separates_cli_managed_skills_from_installed_ones(tmp_path) -> None:
+    """The CLI writes skills/.system itself, so its presence is not user content.
+
+    Rejecting the whole skills directory made the backend refuse to run a second
+    time, because the first run created it.
+    """
+
+    home = logged_in_home(tmp_path)
+    (home / "skills" / ".system" / "imagegen").mkdir(parents=True)
+    backend = CodexLocalBackend(
+        runner=FakeRunner(), executable="codex-test", version=CODEX_VERIFIED_VERSIONS[0],
+        control_runner=successful_control_runner, home=home,
+    )
+    backend.preflight()
+
+    (home / "skills" / "my-own-skill").mkdir()
+    backend = CodexLocalBackend(
+        runner=FakeRunner(), executable="codex-test", version=CODEX_VERIFIED_VERSIONS[0],
+        control_runner=successful_control_runner, home=home,
+    )
+    with pytest.raises(BackendPolicyError, match="skills/my-own-skill"):
+        backend.preflight()

@@ -255,8 +255,26 @@ CODEX_VERIFIED_VERSIONS = ("0.147.0",)
 # CODEX_HOME at a home Feedian owns is what actually keeps a personal instruction
 # file out of a turn that also carries untrusted article text.
 CODEX_HOME_ENTRIES_THAT_REACH_THE_MODEL = (
-    "AGENTS.md", "AGENTS.override.md", "skills", "plugins", "rules", "hooks", "memories",
+    "AGENTS.md", "AGENTS.override.md", "plugins", "rules", "hooks", "memories",
 )
+# The CLI creates skills/.system itself and ships its own skills there, so the
+# directory existing is not evidence of user content; anything beside .system is.
+CODEX_HOME_MANAGED_SKILL_ENTRIES = (".system",)
+
+
+def _user_authored_home_entries(home: Path) -> list[str]:
+    """Names under a Codex home that a person put there, not the CLI."""
+    present = [
+        name for name in CODEX_HOME_ENTRIES_THAT_REACH_THE_MODEL if (home / name).exists()
+    ]
+    skills = home / "skills"
+    if skills.is_dir():
+        present += [
+            f"skills/{entry.name}"
+            for entry in skills.iterdir()
+            if entry.name not in CODEX_HOME_MANAGED_SKILL_ENTRIES
+        ]
+    return present
 
 
 def codex_home() -> Path:
@@ -324,17 +342,18 @@ class CodexLocalBackend:
 
     def _verify_home(self) -> None:
         home = self.home
+        # The CLI refuses to start when CODEX_HOME does not exist, so create the
+        # empty directory here rather than making the login command fail first.
+        home.mkdir(parents=True, exist_ok=True)
         if not (home / "auth.json").is_file():
             raise BackendAuthError(
                 f"The Feedian Codex home is not logged in: {home}. "
                 f"Run: {codex_login_command(home)}"
             )
-        present = [
-            name for name in CODEX_HOME_ENTRIES_THAT_REACH_THE_MODEL if (home / name).exists()
-        ]
+        present = sorted(_user_authored_home_entries(home))
         if present:
             raise BackendPolicyError(
-                f"The Feedian Codex home must hold credentials only, but contains "
+                f"The Feedian Codex home must hold no instructions of its own, but contains "
                 f"{', '.join(present)}: {home}. These reach the model as instructions."
             )
 
