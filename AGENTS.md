@@ -75,6 +75,80 @@ Specifications are outside git before finalization, which creates two concerns.
 For a specification written after implementation as a historical record, **state clearly at the beginning that it was written retrospectively**.
 Otherwise, the dates in the review headings will not reflect the actual chronology.
 
+## Code reviews (`docs/reviews/`)
+
+Write a review document when the review covers the implementation of a specification, or when at least one
+finding is rejected or deferred. A review whose findings were all fixed on the spot needs no document —
+git history already records that.
+
+### File names
+
+`YYYYMMdd-title.ja.md`, following the specification rules above. The date is the review date.
+**Never rename a file once it has been named.**
+
+### Structure
+
+```markdown
+# <タイトル>のコードレビュー
+
+ステータス: 指摘中 | 対応中 | 完了
+対象: <レビュー対象のコミット>（このコミットの親）
+仕様: <関連する docs/specs/ へのリンク。無ければ省略>
+レビュー者: Claude Code (2026-08-16)
+
+## 結論
+
+## 指摘
+
+### 1. <一行の主張> — 重大度: 高 | 中 | 低
+
+## 採否
+
+## 検証
+
+## 規約化した項目
+```
+
+- **The document body must be in Japanese.** Only the file name is in English.
+- **Target (`対象`)** — Required. Name the reviewed commit by hash and summary. Because the document is
+  committed together with its fixes, that commit is normally the parent of the commit carrying the document.
+- **Findings (`指摘`)** — Number them. The number is the finding ID; refer to it from fix commits as
+  `<文書の日付>-<番号>` (example: `20260816-2`). Every finding states its evidence as `file:line`, what actually
+  happens, and what it costs. A finding nobody can reproduce is not a finding.
+- **Disposition (`採否`)** — Required, one row per finding, using 採用 / 修正して採用 / 不採用 / 保留 as the
+  specification review sections do. A fixed finding compresses to one line naming the commit.
+  **A rejected or deferred finding carries its reasoning** — that is what this document exists for.
+- **Promoted rules (`規約化した項目`)** — When the same finding appears in a second review, promote it to a rule
+  in this file and record the promotion here. A rule an agent reads is worth more than a finding repeated.
+
+### Lifecycle and commits
+
+1. **Write the findings** — Do not commit it.
+2. **Apply the fixes** — Squash them into one commit so that `対象` stays exactly one commit behind.
+3. **Complete it** — Fill in `採否` and `検証`, set the status to `完了`, and commit the document
+   **in the same commit as the fixes**.
+
+- Reviews are published. Never place `docs/reviews/` in `.gitignore`.
+- When a review changes no code, commit the document by itself with the `docs:` type.
+  A review that rejects every finding still belongs in the repository; its reasoning is the valuable part.
+- When the fixes will take more than a day, commit the document early with the status `対応中`
+  rather than leaving it outside git.
+- **Do not accidentally include an in-progress review with `git add -A`** — the same hazard specifications carry.
+- A finalized specification is never edited. When an implementation deviates from a finalized specification,
+  **the review document is where that deviation and its resolution are recorded.**
+
+## Branch names
+
+`<type>/<kebab-case-noun-phrase>` (examples: `feat/llm-backends`, `fix/manus-status`, `ci/security-hardening`)
+
+- The type comes from the same set the commit summary line uses.
+- **Use a noun phrase, not a verb phrase.** `feat/llm-backends`, not `feat/implement-llm-backends`.
+  The branch names what the work is about; its commits say what it does.
+- **Do not prefix a branch with the name of the agent or person who created it.** Git already records the
+  author, and a branch normally outlives whoever opened it — a review and its fixes often land on the branch
+  that first carried the implementation.
+- Branches Dependabot opens are outside this convention.
+
 <!-- graft:start -->
 ## Graft — repo context graph
 
