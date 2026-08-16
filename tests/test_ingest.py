@@ -2,13 +2,22 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from feedian.canonical import CanonicalItem
-from feedian.ingest import ingest_source_notes, plan_source_notes, render_source_notes
+from feedian.ingest import (
+    fallback_maximum_cost,
+    ingest_source_notes,
+    plan_source_notes,
+    render_source_notes,
+    resolve_fallback,
+)
 from feedian.llm import PROVIDER_OUTPUT_SCHEMA
 from feedian.llm_backends import (
     BackendAudit,
     BackendAuthError,
     BackendCapabilities,
+    BackendPolicyError,
     BackendRateLimitError,
 )
 from feedian.store import VaultStore
@@ -28,6 +37,7 @@ class FakeBackend:
     ) -> None:
         self.audit = audit
         self.error = error
+        self.temporary_parent = None
         self.summarize_kwargs = {}
         self.capabilities = BackendCapabilities(
             backend=backend,
@@ -655,5 +665,77 @@ def test_fallback_stays_off_unless_the_config_enables_it(tmp_path) -> None:
         )
 
         assert report.failed == 1
+    finally:
+        store.close()
+
+
+def test_a_local_fallback_runs_outside_the_vault_even_behind_an_http_primary(tmp_path) -> None:
+    """The primary picks no isolation root for the fallback; the fallback does.
+
+    An HTTP primary leaves temporary_parent inside the Vault, and Codex treats
+    its cwd as a project, so running there would reinstate project instructions.
+    """
+
+    root = tmp_path / "vault"
+    root.mkdir()
+    store = _vault_with_one_article(root)
+    try:
+        config = VaultConfig()
+        config.llm.fallback = LLMFallbackSettings(
+            enabled=True, backend="codex-local", model="gpt-test"
+        )
+        primary = FakeBackend(None, error=BackendRateLimitError("429"))
+        fallback = FakeBackend(
+            _Audit(), backend="codex-local", execution_kind="local-agent",
+            auth_mode="local-session", billing_mode="subscription",
+        )
+
+        ingest_source_notes(
+            store, root, config, model="gpt-test", backend_instance=primary,
+            fallback_instance=fallback,
+        )
+
+        used = fallback.summarize_kwargs["temporary_parent"].resolve()
+        assert root.resolve() not in used.parents
+        assert used != (root / ".feedian" / "tmp").resolve()
+    finally:
+        store.close()
+
+
+def test_a_fallback_model_the_destination_cannot_serve_is_refused(tmp_path) -> None:
+    """Recorded provenance would otherwise name a model that never ran."""
+
+    config = VaultConfig()
+    config.llm.fallback = LLMFallbackSettings(
+        enabled=True, backend="manus-api", model="gpt-5.6-terra"
+    )
+
+    with pytest.raises(BackendPolicyError, match="does not support model"):
+        resolve_fallback(config, "openai-responses")
+
+
+def test_the_plan_states_what_an_enabled_metered_fallback_could_cost(tmp_path) -> None:
+    """A subscription primary reports no cost, so the fallback states its own."""
+
+    root = tmp_path / "vault"
+    root.mkdir()
+    store = _vault_with_one_article(root)
+    try:
+        subscription = FakeBackend(
+            None, backend="codex-local", execution_kind="local-agent",
+            auth_mode="local-session", billing_mode="subscription",
+        )
+        plan = plan_source_notes(
+            store, model="gpt-5.6-terra", backend="codex-local", backend_instance=subscription,
+        )
+        metered = FakeBackend(_Audit())
+        config = VaultConfig()
+        config.llm.fallback = LLMFallbackSettings(
+            enabled=True, backend="openai-responses", model="gpt-5.6-terra"
+        )
+        fallback = resolve_fallback(config, "codex-local", backend_instance=metered)
+
+        assert plan.max_cost_usd is None
+        assert fallback_maximum_cost(plan, fallback) > 0
     finally:
         store.close()

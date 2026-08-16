@@ -118,6 +118,7 @@ def print_ingest_plan(
     model: str,
     backend: str = "openai-responses",
     fallback: str = "",
+    fallback_max_cost_usd: float | None = None,
     dry_run: bool,
     command: str,
     file: TextIO | None = None,
@@ -154,9 +155,15 @@ def print_ingest_plan(
     )
     # The specification requires the destination be named before the run starts,
     # so that no article can move to another backend unannounced.
+    # A subscription primary shows no cost of its own, so an enabled metered
+    # fallback states what it could add before anything runs.
+    fallback_cost = (
+        f"  max {_money(fallback_max_cost_usd)}" if fallback_max_cost_usd is not None else ""
+    )
     fallback_line = Text.assemble(
         ("Fallback  ", MUTED),
         (fallback or "disabled", f"bold {VIOLET}" if fallback else MUTED),
+        (fallback_cost, MUTED),
     )
     console.print(
         Panel(

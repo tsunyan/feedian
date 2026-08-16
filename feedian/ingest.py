@@ -194,12 +194,10 @@ def ingest_source_notes(
     if plan.new_requests and not selected_backend.supports_model(model):
         raise BackendPolicyError(f"Backend {backend_id} does not support model {model!r}.")
     preflight_metadata = selected_backend.preflight() if plan.new_requests else {}
-    temporary_parent = vault_paths(vault_root).state_dir / "tmp"
-    if plan.new_requests and selected_backend.capabilities.execution_kind == "local-agent":
-        try:
-            temporary_parent = isolated_local_agent_parent(vault_root)
-        except RuntimeError as exc:
-            raise BackendPolicyError(str(exc)) from exc
+    temporary_parent = (
+        _temporary_parent_for(selected_backend, vault_root) if plan.new_requests
+        else vault_paths(vault_root).state_dir / "tmp"
+    )
     fallback = (
         resolve_fallback(config, backend_id, backend_instance=fallback_instance)
         if plan.new_requests else None
@@ -271,7 +269,9 @@ def ingest_source_notes(
                     store, vault_root, row=row, metadata=metadata, candidate=fallback_candidate,
                     backend_id=fallback.backend_id, backend=fallback.backend,
                     model=fallback.model, language=language,
-                    temporary_parent=temporary_parent,
+                    # An HTTP primary leaves temporary_parent inside the Vault; a
+                    # local fallback must not run there.
+                    temporary_parent=_temporary_parent_for(fallback.backend, vault_root),
                     preflight_metadata=fallback.preflight(),
                 )
         run_id = attempt.run_id
@@ -329,6 +329,20 @@ class _Fallback:
     def preflight(self) -> dict[str, Any]:
         """Deferred: a fallback that never fires must not demand credentials."""
         return self.backend.preflight()
+
+
+def _temporary_parent_for(backend: LLMBackend, vault_root: str | Path) -> Path:
+    """Where this backend may create per-article working directories.
+
+    A local agent treats its cwd as a project, so it runs outside the Vault; an
+    HTTP backend never opens one and keeps the Vault's own temporary directory.
+    """
+    if backend.capabilities.execution_kind != "local-agent":
+        return vault_paths(vault_root).state_dir / "tmp"
+    try:
+        return isolated_local_agent_parent(vault_root)
+    except RuntimeError as exc:
+        raise BackendPolicyError(str(exc)) from exc
 
 
 def _attempt_candidate(
@@ -398,6 +412,16 @@ def _attempt_candidate(
     )
 
 
+def fallback_maximum_cost(plan: IngestPlan, fallback: "_Fallback | None") -> float | None:
+    """What the fallback could add if every new request failed over to it."""
+    if fallback is None or not plan.new_requests:
+        return None
+    return _maximum_cost(
+        plan.input_tokens, plan.new_requests * 800, fallback.model,
+        billing_mode=fallback.backend.capabilities.billing_mode,
+    )
+
+
 def resolve_fallback(
     config: VaultConfig, backend_id: str, *, backend_instance: LLMBackend | None = None,
 ) -> _Fallback | None:
@@ -408,7 +432,12 @@ def resolve_fallback(
     destination = canonical_backend_id(settings.backend)
     if destination == backend_id:
         return None
-    return _Fallback(destination, backend_instance or get_backend(destination), settings.model)
+    backend = backend_instance or get_backend(destination)
+    if not backend.supports_model(settings.model):
+        raise BackendPolicyError(
+            f"Fallback backend {destination} does not support model {settings.model!r}."
+        )
+    return _Fallback(destination, backend, settings.model)
 
 
 def _source_rows(store: VaultStore) -> list[Any]:

@@ -21,6 +21,7 @@ from .ingest import (
     ingest_source_notes,
     plan_source_notes,
     render_source_notes,
+    fallback_maximum_cost,
     resolve_fallback,
 )
 from .llm_backends import BACKEND_IDS, canonical_backend_id, get_backend
@@ -650,7 +651,7 @@ def _ingest(args: argparse.Namespace) -> int:
                 force=args.force, auto=args.auto, backend=backend_id, backend_instance=backend,
             )
             print_ingest_plan(
-                plan, backend=backend_id, fallback=fallback_label, model=model, dry_run=True, command=args._invocation,
+                plan, backend=backend_id, fallback=fallback_label, fallback_max_cost_usd=fallback_maximum_cost(plan, fallback), model=model, dry_run=True, command=args._invocation,
             )
             return 0
 
@@ -661,7 +662,7 @@ def _ingest(args: argparse.Namespace) -> int:
                 force=args.force, auto=args.auto, backend=backend_id, backend_instance=backend,
             )
             print_ingest_plan(
-                plan, backend=backend_id, fallback=fallback_label, model=model, dry_run=False, command=args._invocation,
+                plan, backend=backend_id, fallback=fallback_label, fallback_max_cost_usd=fallback_maximum_cost(plan, fallback), model=model, dry_run=False, command=args._invocation,
             )
 
             with reporter:

@@ -741,3 +741,50 @@ fallbackは宛先backendの`llm_run`を新しく開いて実行する。同じru
 - [x] 進捗テストが幅40・80・200で通る。
 
 これで本レビューの指摘1から33はすべて解消または明示的な不採用となった。ステータスを`完了`とする。
+
+## PR #11 でのCodexレビュー（2026-08-17）
+
+レビュー者: Codex (GitHub review bot)
+
+fallbackの実装に対する指摘3件。いずれも妥当であり、同一ブランチで修正した。
+
+### 34. HTTP primaryからlocal fallbackへ移ると隔離境界を失う — 重大度: 高
+
+**根拠:** `feedian/ingest.py`の`temporary_parent`
+
+**現象:** `temporary_parent`はprimary backendの`execution_kind`だけで一度決めていた。primaryがHTTPの場合はVault内の`.feedian/tmp`のままで、それをfallbackの`codex-local`へそのまま渡していた。
+
+**影響:** 指摘24で切り離したはずの境界が、fallback経路だけ元に戻る。Vault自体がGit projectである構成では、projectの`AGENTS.md`と`.codex/config.toml`が再び届く。
+
+**対応:** 採用。`_temporary_parent_for`を追加し、attemptごとに実行するbackendから選ぶ。回帰テストで、HTTP primaryの背後にあるlocal fallbackがVault外で動くことを固定した。
+
+### 35. fallbackのmodelが検証されない — 重大度: 中
+
+**現象:** `supports_model`はprimaryにしか適用していなかった。`manus-api`へ`gpt-*`をfallback modelに指定すると、`_summarize_with_manus`が黙って`manus-1.6`を実行する一方、`llm_run`、fingerprint、noteは`gpt-*`を記録する。
+
+**影響:** 監査上の実行モデルが事実と食い違い、再利用キーも実際とは違う組み合わせを指す。
+
+**対応:** 採用。`resolve_fallback`で検証し、`BackendPolicyError`にする。計画表示の時点で呼ばれるため、runを開く前に失敗する。
+
+### 36. 有効なfallbackの課金額が上限に含まれない — 重大度: 中
+
+**現象:** 上限コストはprimaryのbilling modeだけで計算していた。`codex-local`とmetered fallbackの組み合わせでは、課金され得るのに上限が`n/a`と表示される。
+
+**対応:** 採用。`fallback_maximum_cost`を追加し、全件がfallbackした場合の上限を計画画面のFallback行へ併記する。
+
+### 採否
+
+| # | 指摘 | 重大度 | 採否 | 対応 |
+| --- | --- | --- | --- | --- |
+| 34 | fallback時の隔離境界 | 高 | 採用 | attemptごとに一時親を選ぶ |
+| 35 | fallback modelの未検証 | 中 | 採用 | `resolve_fallback`で拒否する |
+| 36 | fallback課金額の非表示 | 中 | 採用 | 上限を計画画面へ併記する |
+
+3件とも、fallbackを「primaryと同じ条件で動く追加の実行」と暗黙に仮定していたことが原因である。fallbackは宛先backendの条件で動く別の実行であり、隔離、model検証、課金のすべてを宛先側から導く必要がある。
+
+### 検証
+
+- [x] テストスイートが緑である（252件）。`ruff check`も通る。
+- [x] HTTP primaryの背後のlocal fallbackが、Vault外の一時親を受け取る。
+- [x] 宛先が扱えないmodelは、runを開く前に`BackendPolicyError`になる。
+- [x] subscription primaryとmetered fallbackの組み合わせで、fallbackの上限額が表示される。
