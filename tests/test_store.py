@@ -28,7 +28,7 @@ def test_store_creates_schema_and_deduplicates_payload(tmp_path) -> None:
         second = store.put_payload(b"<html>same</html>", media_type="text/html")
 
         assert first == second
-        assert store.schema_version() == 5
+        assert store.schema_version() == 6
         assert store.quick_check() == "ok"
         assert store.integrity_check() == "ok"
     finally:
@@ -273,7 +273,7 @@ def test_v1_migration_prunes_history_images_and_inline_fts(tmp_path) -> None:
 
     migrated = VaultStore.open(path, allow_migration=True)
     try:
-        assert migrated.schema_version() == 5
+        assert migrated.schema_version() == 6
         assert migrated.status_counts()["source_item_revision"] == 1
         assert migrated.status_counts()["resource_revision"] == 1
         assert migrated.connection.execute("SELECT COUNT(*) FROM fetch_capture").fetchone()[0] == 1
@@ -399,7 +399,73 @@ def test_v4_migration_adds_fetch_validators_and_commits(tmp_path) -> None:
             str(row[1]) for row in migrated.connection.execute("PRAGMA table_info(fetch_capture)")
         }
         assert {"response_etag", "response_last_modified"} <= columns
-        assert migrated.schema_version() == 5
+        assert migrated.schema_version() == 6
+    finally:
+        migrated.close()
+
+
+def test_v5_migration_backfills_llm_backend_audit_columns(tmp_path) -> None:
+    path = tmp_path / "feedian.sqlite3"
+    store = VaultStore.open(path)
+    try:
+        item = store.upsert_canonical_item(_item())
+        revision, _ = store.record_resource_revision(
+            item.resource_id or "", content_markdown="Body"
+        )
+        run_id = store.start_llm_run(
+            resource_id=item.resource_id or "",
+            resource_revision_id=revision,
+            operation="source-note",
+            model="gpt-test",
+            prompt_version="v1",
+            input_fingerprint="legacy-fingerprint",
+            request={"provider": "openai", "input": [], "text": {}},
+        )
+        store.finish_llm_run(run_id, result={"summary": "one"})
+    finally:
+        store.close()
+
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("DROP INDEX IF EXISTS llm_run_reuse_idx")
+        for column in (
+            "backend",
+            "summary_schema_version",
+            "fingerprint_version",
+            "auth_mode",
+            "billing_mode",
+            "backend_metadata_json",
+            "duration_ms",
+        ):
+            connection.execute(f"ALTER TABLE llm_run DROP COLUMN {column}")
+        connection.execute(
+            "UPDATE schema_meta SET value = '5' WHERE key = 'schema_version'"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    migrated = VaultStore.open(path, allow_migration=True)
+    try:
+        row = migrated.connection.execute(
+            """
+            SELECT backend, summary_schema_version, fingerprint_version,
+                   auth_mode, billing_mode, backend_metadata_json, duration_ms
+            FROM llm_run
+            WHERE llm_run_id = ?
+            """,
+            (run_id,),
+        ).fetchone()
+        assert migrated.schema_version() == 6
+        assert tuple(row) == (
+            "openai-responses",
+            "1",
+            1,
+            "api-key",
+            "metered-api",
+            "{}",
+            None,
+        )
     finally:
         migrated.close()
 

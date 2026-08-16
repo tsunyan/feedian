@@ -9,6 +9,7 @@ from typing import Any
 
 VAULT_CONFIG_RELATIVE_PATH = Path(".feedian") / "config.json"
 VAULT_DATABASE_NAME = "feedian.sqlite3"
+VAULT_CONFIG_VERSION = 2
 
 
 @dataclass
@@ -33,8 +34,22 @@ class ProviderSettings:
 
 
 @dataclass
+class LLMFallbackSettings:
+    enabled: bool = False
+    backend: str = ""
+    model: str = ""
+
+
+@dataclass
+class LLMSettings:
+    backend: str = "openai-responses"
+    model: str = "gpt-5.6-terra"
+    fallback: LLMFallbackSettings = field(default_factory=LLMFallbackSettings)
+
+
+@dataclass
 class VaultConfig:
-    format_version: int = 1
+    format_version: int = VAULT_CONFIG_VERSION
     raw_folder: str = "raw"
     source_folder: str = "source"
     review_folder: str = "review"
@@ -55,6 +70,7 @@ class VaultConfig:
             "allow_private_hosts": [],
         }
     )
+    llm: LLMSettings = field(default_factory=LLMSettings)
 
     def provider_output_folder(self, provider: str) -> Path:
         settings = self.providers.get(provider)
@@ -191,7 +207,17 @@ def load_vault_config(root: str | Path) -> VaultConfig:
         raise ValueError(f"Could not read vault config: {exc}") from exc
     if not isinstance(raw, dict):
         raise ValueError("Vault config must be a JSON object.")
-    allowed = {"format_version", "raw_folder", "source_folder", "review_folder", "providers", "fetch"}
+    format_version = int(raw.get("format_version", 1))
+    if format_version != VAULT_CONFIG_VERSION:
+        if format_version < VAULT_CONFIG_VERSION:
+            raise RuntimeError("Vault config migration is required; run `feedian migrate --vault ...`.")
+        raise RuntimeError(
+            f"Vault config format {format_version} is newer than this Feedian version "
+            f"({VAULT_CONFIG_VERSION})."
+        )
+    allowed = {
+        "format_version", "raw_folder", "source_folder", "review_folder", "providers", "fetch", "llm"
+    }
     unknown = sorted(set(raw) - allowed)
     if unknown:
         raise ValueError(f"Unknown vault config field(s): {', '.join(unknown)}")
@@ -199,12 +225,13 @@ def load_vault_config(root: str | Path) -> VaultConfig:
     fetch = VaultConfig().fetch
     fetch.update(dict(raw.get("fetch") or {}))
     return VaultConfig(
-        format_version=int(raw.get("format_version", 1)),
+        format_version=format_version,
         raw_folder=_relative_folder(raw.get("raw_folder", "raw"), "raw_folder"),
         source_folder=_relative_folder(raw.get("source_folder", "source"), "source_folder"),
         review_folder=_relative_folder(raw.get("review_folder", "review"), "review_folder"),
         providers=providers,
         fetch=fetch,
+        llm=_parse_llm(raw.get("llm")),
     )
 
 
@@ -228,8 +255,104 @@ def render_vault_config(config: VaultConfig) -> str:
         "review_folder": config.review_folder,
         "providers": providers,
         "fetch": config.fetch,
+        "llm": {
+            "backend": config.llm.backend,
+            "model": config.llm.model,
+            "fallback": {
+                "enabled": config.llm.fallback.enabled,
+                "backend": config.llm.fallback.backend,
+                "model": config.llm.fallback.model,
+            },
+        },
     }
     return json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+
+
+def migrate_vault_config(root: str | Path) -> bool:
+    """Explicitly migrate a version-one Vault config to version two."""
+
+    path = vault_paths(root).config_path
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Could not read vault config: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise ValueError("Vault config must be a JSON object.")
+    version = int(raw.get("format_version", 1))
+    if version > VAULT_CONFIG_VERSION:
+        raise RuntimeError(
+            f"Vault config format {version} is newer than this Feedian version ({VAULT_CONFIG_VERSION})."
+        )
+    if version == VAULT_CONFIG_VERSION:
+        # Validate rather than silently accepting an invalid current config.
+        load_vault_config(root)
+        return False
+    if version != 1:
+        raise RuntimeError(f"No migration path from Vault config format {version}.")
+    allowed = {"format_version", "raw_folder", "source_folder", "review_folder", "providers", "fetch"}
+    unknown = sorted(set(raw) - allowed)
+    if unknown:
+        raise ValueError(f"Unknown vault config field(s): {', '.join(unknown)}")
+    providers = _parse_providers(raw.get("providers"))
+    fetch = VaultConfig().fetch
+    fetch.update(dict(raw.get("fetch") or {}))
+    migrated = VaultConfig(
+        raw_folder=_relative_folder(raw.get("raw_folder", "raw"), "raw_folder"),
+        source_folder=_relative_folder(raw.get("source_folder", "source"), "source_folder"),
+        review_folder=_relative_folder(raw.get("review_folder", "review"), "review_folder"),
+        providers=providers,
+        fetch=fetch,
+    )
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(render_vault_config(migrated), encoding="utf-8")
+    temporary.replace(path)
+    return True
+
+
+def _parse_llm(raw: object) -> LLMSettings:
+    if raw is None:
+        return LLMSettings()
+    if not isinstance(raw, dict):
+        raise ValueError("llm must be a JSON object.")
+    unknown = sorted(set(raw) - {"backend", "model", "fallback"})
+    if unknown:
+        raise ValueError(f"Unknown llm field(s): {', '.join(unknown)}")
+    backend_value = raw.get("backend", "openai-responses")
+    model_value = raw.get("model", "gpt-5.6-terra")
+    if not isinstance(backend_value, str) or not isinstance(model_value, str):
+        raise ValueError("llm.backend and llm.model must be strings.")
+    backend = backend_value.strip()
+    model = model_value.strip()
+    if not backend or not model:
+        raise ValueError("llm.backend and llm.model must be non-empty strings.")
+    allowed_backends = {"openai-responses", "manus-api", "codex-local", "claude-code-local"}
+    if backend not in allowed_backends:
+        raise ValueError(f"Unknown llm.backend: {backend}")
+    fallback_raw = raw.get("fallback") or {}
+    if not isinstance(fallback_raw, dict):
+        raise ValueError("llm.fallback must be a JSON object.")
+    fallback_unknown = sorted(set(fallback_raw) - {"enabled", "backend", "model"})
+    if fallback_unknown:
+        raise ValueError(f"Unknown llm.fallback field(s): {', '.join(fallback_unknown)}")
+    enabled = fallback_raw.get("enabled", False)
+    fallback_backend = fallback_raw.get("backend", "")
+    fallback_model = fallback_raw.get("model", "")
+    if not isinstance(enabled, bool):
+        raise ValueError("llm.fallback.enabled must be a boolean.")
+    if not isinstance(fallback_backend, str) or not isinstance(fallback_model, str):
+        raise ValueError("llm.fallback.backend and llm.fallback.model must be strings.")
+    fallback = LLMFallbackSettings(
+        enabled=enabled,
+        backend=fallback_backend.strip(),
+        model=fallback_model.strip(),
+    )
+    if fallback.enabled and (not fallback.backend or not fallback.model):
+        raise ValueError("Enabled llm.fallback requires both backend and model.")
+    if fallback.backend and fallback.backend not in allowed_backends:
+        raise ValueError(f"Unknown llm.fallback.backend: {fallback.backend}")
+    return LLMSettings(backend=backend, model=model, fallback=fallback)
 
 
 def _parse_providers(raw: object) -> dict[str, ProviderSettings]:

@@ -88,7 +88,7 @@ def test_init_migrate_and_status(tmp_path, capsys) -> None:
 
     output = capsys.readouterr().out
     assert "initialized:" in output
-    assert "migrated: schema_version=5" in output
+    assert "migrated: schema_version=6" in output
     assert "integrity: ok" in output
 
 
@@ -102,7 +102,7 @@ def test_migrate_does_not_copy_existing_raw_markdown_into_sqlite(tmp_path, capsy
 
     assert main(["migrate", "--vault", str(root)]) == 0
 
-    assert "migrated: schema_version=5" in capsys.readouterr().out
+    assert "migrated: schema_version=6" in capsys.readouterr().out
     store = VaultStore.open(root / ".feedian" / "feedian.sqlite3")
     try:
         assert not store.connection.execute(
@@ -117,6 +117,7 @@ def test_ingest_dry_run_prints_plan_without_writes(tmp_path, capsys, monkeypatch
     root = tmp_path / "vault"
     root.mkdir()
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OPENAI_MODEL", "gpt-5.6-sol")
     assert main(["init", "--vault", str(root)]) == 0
     assert main(["migrate", "--vault", str(root)]) == 0
     store = VaultStore.open(root / ".feedian" / "feedian.sqlite3")
@@ -143,6 +144,7 @@ def test_ingest_dry_run_prints_plan_without_writes(tmp_path, capsys, monkeypatch
     assert "Maximum" in output and "$" in output
     assert "python" in output and "New field" in output
     assert "Dry Run Article" in output
+    assert "gpt-5.6-sol" in output
     store = VaultStore.open(root / ".feedian" / "feedian.sqlite3")
     try:
         assert store.connection.execute("SELECT COUNT(*) FROM llm_run").fetchone()[0] == 0

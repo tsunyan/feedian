@@ -13,7 +13,7 @@ from .canonical import CanonicalItem, canonicalize_url
 from .ids import uuid7
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 def utc_now() -> str:
@@ -150,6 +150,10 @@ class VaultStore:
             if current == 4:
                 _migrate_v4_to_v5(self.connection)
                 current = 5
+                continue
+            if current == 5:
+                _migrate_v5_to_v6(self.connection)
+                current = 6
                 continue
             raise RuntimeError(f"No migration path from database schema {current}.")
 
@@ -746,17 +750,59 @@ class VaultStore:
         return self.connection.execute("SELECT * FROM snapshot ORDER BY created_at DESC LIMIT 1").fetchone()
 
     def successful_llm_result(
-        self, *, resource_revision_id: str, operation: str, model: str, prompt_version: str, input_fingerprint: str
+        self,
+        *,
+        resource_revision_id: str,
+        operation: str,
+        model: str,
+        prompt_version: str,
+        input_fingerprint: str,
+        backend: str = "openai-responses",
+        summary_schema_version: str = "1",
+        legacy_fingerprint: str | None = None,
     ) -> dict[str, Any] | None:
         row = self.connection.execute(
             """
-            SELECT result_json FROM llm_run
-            WHERE resource_revision_id = ? AND operation = ? AND model = ? AND prompt_version = ?
+            SELECT llm_run_id, result_json FROM llm_run
+            WHERE resource_revision_id = ? AND operation = ? AND backend = ? AND model = ?
+              AND prompt_version = ? AND summary_schema_version = ? AND fingerprint_version = 2
               AND input_fingerprint = ? AND status = 'completed'
             ORDER BY finished_at DESC LIMIT 1
             """,
-            (resource_revision_id, operation, model, prompt_version, input_fingerprint),
+            (
+                resource_revision_id, operation, backend, model, prompt_version,
+                summary_schema_version, input_fingerprint,
+            ),
         ).fetchone()
+        if row is None and legacy_fingerprint:
+            row = self.connection.execute(
+                """
+                SELECT llm_run_id, result_json FROM llm_run
+                WHERE resource_revision_id = ? AND operation = ? AND backend = ? AND model = ?
+                  AND prompt_version = ? AND summary_schema_version = ? AND fingerprint_version = 1
+                  AND input_fingerprint = ? AND status = 'completed'
+                ORDER BY finished_at DESC LIMIT 1
+                """,
+                (
+                    resource_revision_id, operation, backend, model, prompt_version,
+                    summary_schema_version, legacy_fingerprint,
+                ),
+            ).fetchone()
+            if row is not None:
+                with self.transaction() as connection:
+                    connection.execute(
+                        """
+                        UPDATE llm_run
+                        SET input_fingerprint = ?,
+                            fingerprint_version = 2,
+                            backend_metadata_json = json_set(
+                                COALESCE(backend_metadata_json, '{}'),
+                                '$.legacy_fingerprint_promoted', json('true')
+                            )
+                        WHERE llm_run_id = ?
+                        """,
+                        (input_fingerprint, str(row["llm_run_id"])),
+                    )
         return json.loads(str(row["result_json"])) if row is not None and row["result_json"] else None
 
     def start_llm_run(
@@ -769,17 +815,29 @@ class VaultStore:
         prompt_version: str,
         input_fingerprint: str,
         request: dict[str, Any],
+        backend: str = "openai-responses",
+        summary_schema_version: str = "1",
+        fingerprint_version: int = 2,
+        auth_mode: str = "unknown",
+        billing_mode: str = "unknown",
+        backend_metadata: dict[str, Any] | None = None,
     ) -> str:
         run_id = uuid7()
         with self.transaction() as connection:
             connection.execute(
                 """
-                INSERT INTO llm_run(llm_run_id, resource_id, resource_revision_id, operation, model, prompt_version,
-                                    input_fingerprint, request_json, status, started_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'running', ?)
+                INSERT INTO llm_run(
+                    llm_run_id, resource_id, resource_revision_id, operation, backend, model, prompt_version,
+                    summary_schema_version, fingerprint_version, input_fingerprint, request_json,
+                    auth_mode, billing_mode, backend_metadata_json, status, started_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?)
                 """,
-                (run_id, resource_id, resource_revision_id, operation, model, prompt_version, input_fingerprint,
-                 stable_json(request), utc_now()),
+                (
+                    run_id, resource_id, resource_revision_id, operation, backend, model, prompt_version,
+                    summary_schema_version, fingerprint_version, input_fingerprint, stable_json(request),
+                    auth_mode, billing_mode, stable_json(backend_metadata or {}), utc_now(),
+                ),
             )
         return run_id
 
@@ -793,6 +851,10 @@ class VaultStore:
         usage: dict[str, Any] | None = None,
         price: dict[str, Any] | None = None,
         error: str | None = None,
+        auth_mode: str | None = None,
+        billing_mode: str | None = None,
+        backend_metadata: dict[str, Any] | None = None,
+        duration_ms: int | None = None,
     ) -> None:
         """Close a run. `request` records what was actually sent, which can differ
         in shape from the planned request the run started with (see llm providers)."""
@@ -802,12 +864,18 @@ class VaultStore:
                 """
                 UPDATE llm_run SET request_json = COALESCE(?, request_json), response_json = ?, result_json = ?,
                                    usage_json = ?, price_json = ?, status = ?, error = ?, finished_at = ?
+                                   , auth_mode = COALESCE(?, auth_mode)
+                                   , billing_mode = COALESCE(?, billing_mode)
+                                   , backend_metadata_json = COALESCE(?, backend_metadata_json)
+                                   , duration_ms = ?
                 WHERE llm_run_id = ?
                 """,
                 (stable_json(request) if request is not None else None,
                  stable_json(response) if response is not None else None, stable_json(result) if result is not None else None,
                  stable_json(usage) if usage is not None else None, stable_json(price) if price is not None else None,
-                 status, error, utc_now(), run_id),
+                 status, error, utc_now(), auth_mode, billing_mode,
+                 stable_json(backend_metadata) if backend_metadata is not None else None,
+                 duration_ms, run_id),
             )
 
     def put_source_note(self, *, resource_id: str, llm_run_id: str | None, markdown: str) -> str:
@@ -1161,8 +1229,11 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             resource_id TEXT REFERENCES resource(resource_id),
             resource_revision_id TEXT REFERENCES resource_revision(resource_revision_id),
             operation TEXT NOT NULL,
+            backend TEXT NOT NULL,
             model TEXT NOT NULL,
             prompt_version TEXT NOT NULL,
+            summary_schema_version TEXT NOT NULL,
+            fingerprint_version INTEGER NOT NULL,
             input_fingerprint TEXT NOT NULL,
             request_json TEXT NOT NULL,
             response_json TEXT,
@@ -1171,6 +1242,10 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             price_json TEXT,
             status TEXT NOT NULL,
             error TEXT,
+            auth_mode TEXT NOT NULL,
+            billing_mode TEXT NOT NULL,
+            backend_metadata_json TEXT NOT NULL DEFAULT '{}',
+            duration_ms INTEGER,
             retry_of_llm_run_id TEXT REFERENCES llm_run(llm_run_id),
             started_at TEXT NOT NULL,
             finished_at TEXT
@@ -1208,6 +1283,10 @@ def _create_schema(connection: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS comment_revision_comment_idx ON comment_revision(comment_id);
         CREATE INDEX IF NOT EXISTS resource_image_resource_idx ON resource_image(resource_id, position);
         CREATE INDEX IF NOT EXISTS sync_run_status_idx ON sync_run(status, started_at);
+        CREATE INDEX IF NOT EXISTS llm_run_reuse_idx ON llm_run(
+            resource_revision_id, operation, backend, model, prompt_version,
+            summary_schema_version, fingerprint_version, input_fingerprint, status
+        );
         """
     )
 
@@ -1510,3 +1589,74 @@ def _migrate_v4_to_v5(connection: sqlite3.Connection) -> None:
                 "ALTER TABLE fetch_capture ADD COLUMN response_last_modified TEXT NOT NULL DEFAULT ''"
             )
         connection.execute("UPDATE schema_meta SET value = '5' WHERE key = 'schema_version'")
+
+
+def _migrate_v5_to_v6(connection: sqlite3.Connection) -> None:
+    """Add explicit backend identity, schema/fingerprint versions, and billing audit data."""
+
+    with _transaction(connection):
+        additions = (
+            ("backend", "TEXT NOT NULL DEFAULT 'unknown'"),
+            ("summary_schema_version", "TEXT NOT NULL DEFAULT 'unknown'"),
+            ("fingerprint_version", "INTEGER NOT NULL DEFAULT 1"),
+            ("auth_mode", "TEXT NOT NULL DEFAULT 'unknown'"),
+            ("billing_mode", "TEXT NOT NULL DEFAULT 'unknown'"),
+            ("backend_metadata_json", "TEXT NOT NULL DEFAULT '{}'"),
+            ("duration_ms", "INTEGER"),
+        )
+        for column, definition in additions:
+            if not _column_exists(connection, "llm_run", column):
+                connection.execute(f"ALTER TABLE llm_run ADD COLUMN {column} {definition}")
+        connection.execute(
+            """
+            UPDATE llm_run
+            SET backend = CASE
+                    WHEN json_valid(request_json) AND json_extract(request_json, '$.provider') = 'openai'
+                        THEN 'openai-responses'
+                    WHEN json_valid(request_json) AND json_extract(request_json, '$.provider') = 'manus'
+                        THEN 'manus-api'
+                    WHEN json_valid(request_json) AND json_type(request_json, '$.agent_profile') IS NOT NULL
+                        THEN 'manus-api'
+                    WHEN json_valid(request_json) AND json_type(request_json, '$.input') IS NOT NULL
+                         AND json_type(request_json, '$.text') IS NOT NULL
+                        THEN 'openai-responses'
+                    ELSE 'unknown'
+                END,
+                summary_schema_version = CASE
+                    WHEN json_valid(request_json) AND (
+                        json_extract(request_json, '$.provider') IN ('openai', 'manus')
+                        OR json_type(request_json, '$.agent_profile') IS NOT NULL
+                        OR (json_type(request_json, '$.input') IS NOT NULL
+                            AND json_type(request_json, '$.text') IS NOT NULL)
+                    ) THEN '1'
+                    ELSE 'unknown'
+                END,
+                auth_mode = CASE
+                    WHEN json_valid(request_json) AND (
+                        json_extract(request_json, '$.provider') IN ('openai', 'manus')
+                        OR json_type(request_json, '$.agent_profile') IS NOT NULL
+                        OR (json_type(request_json, '$.input') IS NOT NULL
+                            AND json_type(request_json, '$.text') IS NOT NULL)
+                    ) THEN 'api-key'
+                    ELSE 'unknown'
+                END,
+                billing_mode = CASE
+                    WHEN json_valid(request_json) AND (
+                        json_extract(request_json, '$.provider') IN ('openai', 'manus')
+                        OR json_type(request_json, '$.agent_profile') IS NOT NULL
+                        OR (json_type(request_json, '$.input') IS NOT NULL
+                            AND json_type(request_json, '$.text') IS NOT NULL)
+                    ) THEN 'metered-api'
+                    ELSE 'unknown'
+                END
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS llm_run_reuse_idx ON llm_run(
+                resource_revision_id, operation, backend, model, prompt_version,
+                summary_schema_version, fingerprint_version, input_fingerprint, status
+            )
+            """
+        )
+        connection.execute("UPDATE schema_meta SET value = '6' WHERE key = 'schema_version'")
