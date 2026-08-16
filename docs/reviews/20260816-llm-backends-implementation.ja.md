@@ -1,15 +1,23 @@
 # LLMバックエンド実装のコードレビュー
 
-ステータス: 完了
+ステータス: 対応中
 対象: `7e9d09e` feat: add LLM execution backends
 仕様: [LLM実行バックエンド](../specs/20260816-llm-backends.ja.md)
-レビュー者: Claude Code (2026-08-16)
+レビュー者: Claude Code (2026-08-16)、Codex (2026-08-17)
 
 ## 結論
+
+### Codex (2026-08-17)
 
 再レビューの指摘24から27はすべて採用し、同一の修正commitで解消した。legacy fingerprint、canonical schema検証、Rich進捗テスト、Codex CLIのバージョン固定とtool denylistに加え、projectからのcwd隔離、CLI login preflight、共通エラー分類、監査requestの固定形式まで実装され、テストスイートは緑である。マージ可能である。
 
 `codex-local`の一時cwdはVaultおよび既存Git projectの外へ移し、MCP設定も空で上書きする。安全な一時領域を確保できない環境では、記事本文を送る前に`BackendPolicyError`で拒否する。
+
+### Claude Code (2026-08-16、2026-08-17更新)
+
+当初の指摘1から3を解消するまでマージ不可とした。以降のやり取りで指摘1から27は解消済みである。
+
+ただし実CLIでの再検証により、確定仕様の安全ポリシーのうち「user settingsとskillsを無視する」が未達であることが判明した（指摘28）。`codex-local`をどう扱うかを決めるまでステータスは`対応中`とする。`openai-responses`と`manus-api`だけを使う限りでは、この制約は関係しない。
 
 ## 指摘
 
@@ -494,3 +502,103 @@ Claude Codeの再対応で、指摘18から23に直接対応する修正とRich�
 - [x] 未ログイン、API 401/403、API 429、network・5xx、protocol不正、Codex利用枠到達の分類を回帰テストで確認する。
 - [x] 成功runと失敗runの両方で、監査requestが`logical`と`actual`の固定shapeになる。
 - [ ] タイムアウト時の実プロセスツリー終了テストは未実施のままである。実装はfake runnerの契約テストで検証し、既存の保留事項として維持する。
+
+## Claude Codeによる再レビュー（2026-08-17）
+
+レビュー者: Claude Code
+
+指摘24から27の修正を、実物のCodex CLI 0.147.0で検証した。24のMCP隔離、25のlogin確認、26の分類接続、27の監査envelopeはいずれも意図どおり動作する。ただし**24の「user設定を無視する」は達成できていない**ことを実測で確認したため、指摘28として記録する。
+
+### 検証できたこと
+
+- `codex login status`は存在し、ログイン済みで終了コード0を返す。`_verify_login`の前提は正しい。
+- `--config mcp_servers={}`は実CLIに受理される。出荷フラグでの実行で、エージェントは「MCP servers — none」と報告した。**指摘24のMCP部分は解消している。**
+- 一時cwdの親（`%TEMP%`）に`AGENTS.md`カナリアを置いて出荷経路で実行したところ、`content_type`は`note`であり、カナリアの指示は反映されなかった。**projectのAGENTS.md chainからは切り離せている。**
+- `ruff check`は通る。テストは239件成功。
+- `request_json`を読む箇所はv5→v6マイグレーション（既存行のみ対象）とテストだけであり、`logical`/`actual` envelopeの導入で壊れる読み手はいない。
+
+### 28. グローバルの`AGENTS.md`とskillsカタログがエージェントへ届く — 重大度: 高
+
+**根拠:** 実CLI 0.147.0を出荷フラグで実行した結果、`~/.codex/AGENTS.md`、`docs/specs/20260816-llm-backends.ja.md`の安全ポリシー
+
+**現象:** 出荷される全フラグ（`--ephemeral --ignore-user-config --ignore-rules --config mcp_servers={}` と22機能の`--disable`）を付けた上で、受け取った指示の出所を列挙させたところ、次を報告した。
+
+```
+User-provided AGENTS.md — "# グローバル作業指示"
+Skills catalog — "## Skills"
+MCP servers — none.
+Memories — none.
+```
+
+`--ignore-user-config`が対象とするのは`$CODEX_HOME/config.toml`だけであり、**同じディレクトリの`AGENTS.md`は読み込まれ続ける**。`--disable skill_search`は検索ツールを落とすが、skillsカタログ自体は文脈に残る。入力が記事1件あたり約12,000トークンある理由もこれである。
+
+**影響:** 確定仕様の安全ポリシーは「user settings、project rules、skills、plugins、hooks、automatic memoryを無視する」と定める。MCPとproject rulesは解消したが、**userのグローバル指示とskillsカタログは残っている**。結果として二つの問題がある。
+
+1. Feedianの固定promptだけが要約を決めるわけではなくなり、利用者個人の作業指示が要約の内容や文体に影響し得る。同じ記事でも環境によって結果が変わる。
+2. グローバル指示の中身が要約へ混入する経路が残る。untrustedな記事本文と同じ文脈に個人の指示が同居しており、prompt injectionがそれを引き出す標的になり得る。
+
+**提案:** 三択であり、いずれも利用者の判断を要する。
+
+- `CODEX_HOME`をFeedian専用ディレクトリへ向ける。`--ignore-user-config`のヘルプが「auth still uses `CODEX_HOME`」と述べるとおり認証もそこを見るため、認証情報の配置設計が必要になる。**認証情報の複製を伴うため、仕様として決めるべきである。**
+- 抑止する設定項目の追加をCodex CLIへ要望し、追加されるまでは現状を許容する。`--strict-config`は未知フィールドを拒否するため、`experimental_instructions_file`のような回避策は使えないことを確認済みである。
+- 現状を既知の制約として`DESIGN.md`へ明記し、`codex-local`はグローバル指示が要約に混ざってよい利用者だけが選ぶopt-inとする。
+
+### 29. untrustedなエージェント出力がエラー分類と監査へ入る — 重大度: 低
+
+**根拠:** `feedian/local_agent.py`の`LocalAgentProcessError`、`feedian/llm_backends.py`の`_classify_codex_process_error`
+
+**現象:** `LocalAgentProcessError`は`stderr`が空なら`stdout`の末尾2048文字をメッセージへ含める。Codexの`stdout`はJSONLイベント列であり、記事本文から生成されたagent messageを含む。`_classify_codex_process_error`は`stderr`と`stdout`を連結して小文字化し、`rate limit`や`429`などの部分一致で分類する。
+
+**影響:** 記事本文由来の文字列がエラーメッセージに入り、`sanitize_error`は完全一致置換しか行わないため`llm_run.error`と端末表示へ残る。また記事に`rate limit`という語が含まれるだけで`BackendRateLimitError`へ誤分類され得る。現在はretryもfallbackも分類で分岐しないため実害は小さいが、指摘26の目的である「分類を後続判断の根拠にする」を実装した時点で、untrustedな入力が制御フローへ影響することになる。
+
+**提案:** 分類は`stderr`のみを対象にする。`stdout`をメッセージへ含めるのは、JSONとして解釈できなかった場合に限る。
+
+### 30. 監査のargvは実行したargvではなく再構築値である — 重大度: 低
+
+**根拠:** `feedian/llm_backends.py`の`audit_argv`
+
+**現象:** `command(Path("<temporary>") / "output-schema.json")`をもう一度呼んで監査用argvを組み立てており、実際に実行された`local.argv`は破棄される。schema pathは`<temporary>`という実在しない値に置き換わる。
+
+**影響:** machine固有pathを監査へ残さない意図は妥当だが、記録が「実行した引数」ではなく「同じ関数を再度呼んだ結果」になっている。`command()`が将来入力に依存するようになれば、監査と実行が無言で食い違う。
+
+**提案:** `local.argv`をサニタイズして保存する。再構築ではなく実値の加工にする。
+
+### 31. local-agentの判別を`auth_mode`で行っている — 重大度: 低
+
+**根拠:** `feedian/ingest.py`の`selected_backend.capabilities.auth_mode == "local-session"`
+
+**現象:** 隔離した一時親を使うかどうかを`auth_mode`で判定している。確定仕様はcapabilityとして「execution kind: `http`または`local-agent`」を定めているが、実装していない。
+
+**影響:** 認証方式と実行方式が偶然一致しているだけである。CLIでAPI keyを使うbackendや、local-sessionで認証するHTTP backendが加わると誤判定する。
+
+**提案:** `BackendCapabilities`へ`execution_kind`を追加し、そちらで判定する。
+
+### 32. 結論節が別のレビュー者によって書き換えられている — 重大度: 低
+
+**根拠:** 本書の`レビュー者`行と`結論`節
+
+**現象:** 本書の見出しは`レビュー者: Claude Code (2026-08-16)`だが、`結論`節は指摘24から27への対応結果を述べる内容へ書き換えられている。`AGENTS.md`のレビュー規約は追記を原則とし、書き換えてよいのはステータス行だけである。
+
+**影響:** 誰の判断なのかが文書から読み取れない。却下理由の帰属が曖昧になると、この文書の主目的が損なわれる。
+
+**提案:** 結論は書き換えず、レビュー者ごとに節を分ける。
+
+## Claude Code再レビューの採否
+
+| # | 指摘 | 重大度 | 採否 | 理由 |
+| --- | --- | --- | --- | --- |
+| 28 | グローバル`AGENTS.md`とskillsの混入 | 高 | 保留 | 三案のいずれも利用者の判断を要する。`CODEX_HOME`案は認証情報の配置を伴うため仕様として決める |
+| 29 | untrusted出力の分類と監査への混入 | 低 | 保留 | 指摘26の分類を実際に分岐へ使う作業と同時に直す |
+| 30 | 監査argvの再構築 | 低 | 保留 | 同上 |
+| 31 | `auth_mode`によるlocal-agent判別 | 低 | 保留 | `execution_kind`の追加は`claude-code-local`を実装する時点でまとめて行う |
+| 32 | 結論節の書き換え | 低 | 採用 | 本節を独立させ、結論は各レビュー者の節に置く |
+
+## Claude Code再レビューの検証
+
+- [x] `codex login status`が存在し、ログイン済みで終了コード0を返す。
+- [x] 実CLIが`--config mcp_servers={}`を受理し、エージェントがMCP serverを一つも認識しない。
+- [x] 一時cwdの親に置いた`AGENTS.md`カナリアが要約へ影響しない。
+- [x] `ruff check`が通り、テストが239件成功する。
+- [x] `logical`/`actual` envelopeで壊れる`request_json`の読み手が無い。
+- [ ] **グローバル`~/.codex/AGENTS.md`とskillsカタログはエージェントへ届いている（指摘28）。確定仕様の安全ポリシーは未達である。**
+- [ ] タイムアウト時の実プロセスツリー終了テストは未実施のままである。

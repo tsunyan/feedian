@@ -8,6 +8,7 @@
 - `codex-local` は実験的なopt-inバックエンドである。Vaultや既存Git projectの外に記事ごとの一時cwdを作り、projectの`AGENTS.md`と`.codex/config.toml`から切り離す。さらにMCP設定を空で上書きし、既定で有効な全ツールを`--disable`で名指しで落とす。Codex CLIには一括の無効化スイッチがなく、`--sandbox read-only`は書き込みを禁じるだけで読み取りは許すため、隔離はこのdenylistが成立していることに依存する。
 - denylistは測定したCLIバージョンでしか成立しない。`preflight`が`codex --version`と`codex login status`をingest runごとに1回確認し、未検証versionと未ログインは記事を送信する前に拒否する。検出したバージョンと無効化した機能名は`llm_run`の監査へ残す。
 - local-agentのargvには制御情報だけを置き、記事本文は標準入力で渡す。監査用argvは実行ファイルとSchemaのローカルpathを除去して保存する。タイムアウト時はプロセスツリー全体を終了する。
+- **既知の制約:** `--ignore-user-config`は`$CODEX_HOME/config.toml`だけを対象とするため、同じディレクトリの`AGENTS.md`は読み込まれ続ける。skillsカタログも文脈に残る。したがって`codex-local`では、利用者のグローバル作業指示が要約へ影響し得る。MCPとprojectのルールは隔離済みだが、この点は確定仕様の安全ポリシーに未達である。詳細と対応案は [実装レビューの指摘28](docs/reviews/20260816-llm-backends-implementation.ja.md) を参照する。
 - `claude-code-local` は将来用に予約するが、CLI契約と隔離ポリシーが定義されるまで利用不可とする。
 - Vault設定はformat version 2で`llm.backend`、`llm.model`、`llm.fallback`を持つ。version 1からは`feedian migrate`による明示移行が必要で、fallbackは既定で無効とする。
 - SQLite schema version 6の`llm_run`はbackend、canonical schema version、fingerprint version、auth/billing mode、実装メタデータ、所要時間を監査情報として保存する。新規runの`request_json`は成否にかかわらず`logical`と`actual`の固定envelopeを使う。
