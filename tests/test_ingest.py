@@ -32,6 +32,10 @@ class FakeBackend:
     def default_model(self) -> str:
         return "model"
 
+    def supports_model(self, model: str) -> bool:
+        del model
+        return True
+
     def preflight(self):
         return {"implementation_revision": "test"}
 

@@ -5,7 +5,9 @@
 `ingest` のLLM実行は、安定したバックエンドID、モデル、認証方式、課金方式を別々の値として扱う。詳細な判断理由と受け入れ基準は [LLMバックエンド抽象化](docs/specs/20260816-llm-backends.ja.md) を参照する。
 
 - `openai-responses` を既定、`manus-api` を既存の安定バックエンドとして登録する。
-- `codex-local` は実験的なopt-inバックエンドである。記事ごとの一時ディレクトリ、標準入力、無効化したユーザー設定とルール、ネットワーク・ツール・シェル・一時ディレクトリ外の読み取り禁止を証明できる場合だけ実行する。現在のCLI構成では必要な隔離を証明できないため、実プロセスを起動する前にポリシーエラーとなる。
+- `codex-local` は実験的なopt-inバックエンドである。記事ごとの一時ディレクトリ、標準入力、無効化したユーザー設定とルールに加え、既定で有効な全ツールを`--disable`で名指しで落とす。Codex CLIには一括の無効化スイッチがなく、`--sandbox read-only`は書き込みを禁じるだけで読み取りは許すため、隔離はこのdenylistが成立していることに依存する。
+- denylistは測定したCLIバージョンでしか成立しない。`preflight`が`codex --version`を1回検出し、`CODEX_VERIFIED_VERSIONS`に無いバージョンは記事を送信する前に拒否する。検出したバージョンと無効化した機能名は`llm_run`の監査へ残す。
+- local-agentのargvには制御情報だけを置き、記事本文は標準入力で渡す。argvはそのまま監査へ保存する。タイムアウト時はプロセスツリー全体を終了する。
 - `claude-code-local` は将来用に予約するが、CLI契約と隔離ポリシーが定義されるまで利用不可とする。
 - Vault設定はformat version 2で`llm.backend`、`llm.model`、`llm.fallback`を持つ。version 1からは`feedian migrate`による明示移行が必要で、fallbackは既定で無効とする。
 - SQLite schema version 6の`llm_run`はbackend、canonical schema version、fingerprint version、auth/billing mode、実装メタデータ、所要時間を監査情報として保存する。

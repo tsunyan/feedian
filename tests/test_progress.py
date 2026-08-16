@@ -8,6 +8,13 @@ from feedian.progress import ProgressReporter
 
 
 class ProgressReporterTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # Rich renders to the host terminal's width, and a narrow one drops whole
+        # columns from the output these tests read back.
+        width = mock.patch.dict(os.environ, {"COLUMNS": "120"})
+        width.start()
+        self.addCleanup(width.stop)
+
     def test_auto_mode_uses_plain_output_for_a_non_terminal_stream(self) -> None:
         stream = Mock(spec=io.StringIO)
         stream.isatty.return_value = False

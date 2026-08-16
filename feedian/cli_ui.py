@@ -116,7 +116,7 @@ def print_ingest_plan(
     plan: Any,
     *,
     model: str,
-    provider: str = "openai",
+    backend: str = "openai-responses",
     dry_run: bool,
     command: str,
     file: TextIO | None = None,
@@ -143,7 +143,7 @@ def print_ingest_plan(
     identity.add_column(ratio=1)
     identity.add_row(
         Text.assemble(("Mode  ", MUTED), (mode, "bold")),
-        Text.assemble(("Provider  ", MUTED), (provider, f"bold {CYAN}")),
+        Text.assemble(("Backend  ", MUTED), (backend, f"bold {CYAN}")),
         Text.assemble(("Model  ", MUTED), (model, f"bold {BLUE}")),
         Text.assemble(("Cached  ", MUTED), (f"{plan.reusable:,}", "bold")),
     )

@@ -1,21 +1,29 @@
 from __future__ import annotations
 
+import json
 import os
+import re
 import shutil
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
 from .extract import PageFetchResult
 from .llm import (
-    CANONICAL_SUMMARY_SCHEMA,
+    PROVIDER_OUTPUT_SCHEMA,
     SummaryAudit,
     build_summary_request,
     build_untrusted_message,
     normalize_summary_result,
     summarize_bookmark_with_audit,
 )
-from .local_agent import ProcessRunner, SubprocessRunner, run_isolated_local_agent
+from .local_agent import (
+    LocalAgentResult,
+    ProcessRunner,
+    SubprocessRunner,
+    run_isolated_local_agent,
+)
 
 
 BACKEND_IDS = ("openai-responses", "manus-api", "codex-local", "claude-code-local")
@@ -40,6 +48,18 @@ class BackendUnavailableError(BackendError):
 
 
 class BackendExecutionError(BackendError):
+    pass
+
+
+class BackendTimeoutError(BackendError):
+    pass
+
+
+class BackendRateLimitError(BackendError):
+    pass
+
+
+class BackendProtocolError(BackendError):
     pass
 
 
@@ -69,6 +89,8 @@ class LLMBackend(Protocol):
     capabilities: BackendCapabilities
 
     def default_model(self) -> str: ...
+
+    def supports_model(self, model: str) -> bool: ...
 
     def preflight(self) -> dict[str, Any]: ...
 
@@ -116,6 +138,9 @@ class ApiBackend:
     def default_model(self) -> str:
         return self.model_name
 
+    def supports_model(self, model: str) -> bool:
+        return model.startswith("manus-") == (self.provider == "manus")
+
     def preflight(self) -> dict[str, Any]:
         api_key = os.environ.get(self.api_key_name, "").strip()
         if not api_key:
@@ -138,14 +163,6 @@ class ApiBackend:
         temporary_parent: Path,
     ) -> BackendAudit:
         del temporary_parent
-        if self.provider == "manus" and not model.startswith("manus-"):
-            raise BackendUnavailableError(
-                f"Model {model!r} is not supported by backend {self.capabilities.backend}."
-            )
-        if self.provider == "openai" and model.startswith("manus-"):
-            raise BackendUnavailableError(
-                f"Model {model!r} is not supported by backend {self.capabilities.backend}."
-            )
         if self._api_key is None:
             self.preflight()
         try:
@@ -178,6 +195,42 @@ class ApiBackend:
         )
 
 
+# Codex enables its tools by default and offers no single switch to turn them all
+# off, so isolation rests on naming every one. Measured against codex-cli 0.147.0
+# on 2026-08-17: with only --sandbox read-only, a direct instruction to read a file
+# outside the working directory succeeded (the agent ran pwsh and returned the
+# contents). With this list, the same instruction answers that it cannot read
+# files. See docs/reviews/20260816-llm-backends-implementation.ja.md.
+CODEX_DISABLED_FEATURES = (
+    "shell_tool",
+    "browser_use",
+    "browser_use_external",
+    "browser_use_full_cdp_access",
+    "computer_use",
+    "in_app_browser",
+    "plugins",
+    "remote_plugin",
+    "plugin_sharing",
+    "skill_search",
+    "skill_mcp_dependency_install",
+    "multi_agent",
+    "view_image",
+    "image_generation",
+    "apps",
+    "hooks",
+    "tool_suggest",
+    "tool_call_mcp_elicitation",
+    "code_mode_host",
+    "workspace_dependencies",
+    "goals",
+    "memories",
+)
+# A denylist only holds for versions it was measured against: a release that adds
+# another default-on tool would reopen the surface silently. Re-run the check in
+# the review document before adding a version here.
+CODEX_VERIFIED_VERSIONS = ("0.147.0",)
+
+
 class CodexLocalBackend:
     capabilities = BackendCapabilities(
         backend="codex-local",
@@ -192,30 +245,65 @@ class CodexLocalBackend:
         *,
         runner: ProcessRunner | None = None,
         executable: str = "codex",
-        policy_verified: bool = False,
         version: str = "",
     ) -> None:
         self.runner = runner or SubprocessRunner()
         self.executable = executable
-        self.policy_verified = policy_verified
         self.version = version
+        self._resolved_executable = ""
+
+    def _resolve_executable(self) -> str:
+        """Resolve the name on PATH once and use the result everywhere after.
+
+        On Windows the CLI is an npm shim, so PATH holds `codex.CMD`; launching the
+        bare name fails because CreateProcess does not apply PATHEXT itself.
+        """
+        if self._resolved_executable:
+            return self._resolved_executable
+        resolved = shutil.which(self.executable)
+        if resolved is None:
+            raise BackendUnavailableError(f"Codex CLI was not found: {self.executable}")
+        self._resolved_executable = resolved
+        return resolved
 
     def default_model(self) -> str:
         return "gpt-5.6-terra"
 
+    def supports_model(self, model: str) -> bool:
+        return not model.startswith("manus-")
+
     def preflight(self) -> dict[str, Any]:
-        if not self.policy_verified:
+        version = self.version or self._detect_version()
+        if version not in CODEX_VERIFIED_VERSIONS:
             raise BackendPolicyError(
-                "codex-local is unavailable: the Codex CLI read-only sandbox does not prove that "
-                "shell and reads outside the temporary directory are disabled."
+                f"codex-local requires a Codex CLI version whose tool isolation has been "
+                f"measured; {version!r} has not been. Verified: "
+                f"{', '.join(CODEX_VERIFIED_VERSIONS)}."
             )
-        if shutil.which(self.executable) is None and isinstance(self.runner, SubprocessRunner):
-            raise BackendUnavailableError(f"Codex CLI was not found: {self.executable}")
+        self.version = version
         return {
             "implementation_revision": BACKEND_IMPLEMENTATION_REVISION,
-            "cli_version": self.version or "unknown",
-            "policy": "verified-test-runner",
+            "cli_version": version,
+            "disabled_features": list(CODEX_DISABLED_FEATURES),
         }
+
+    def _detect_version(self) -> str:
+        """Detect the CLI version once per run; callers cache it on the instance."""
+        try:
+            completed = subprocess.run(
+                [self._resolve_executable(), "--version"],
+                capture_output=True, text=True, timeout=30, check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise BackendUnavailableError(f"Could not run the Codex CLI: {exc}") from exc
+        if completed.returncode != 0:
+            raise BackendUnavailableError(
+                f"Codex CLI version check exited with status {completed.returncode}."
+            )
+        match = re.search(r"(\d+\.\d+\.\d+)", completed.stdout)
+        if match is None:
+            raise BackendUnavailableError("Could not read a version from the Codex CLI.")
+        return match.group(1)
 
     def summarize(
         self,
@@ -232,8 +320,6 @@ class CodexLocalBackend:
         temporary_parent: Path,
     ) -> BackendAudit:
         del max_retries, retry_base_seconds
-        if model.startswith("manus-"):
-            raise BackendUnavailableError(f"Model {model!r} is not supported by codex-local.")
         metadata = self.preflight()
         planned = build_summary_request(
             model=model,
@@ -246,9 +332,13 @@ class CodexLocalBackend:
         )
         prompt = build_untrusted_message(str(planned["input"][0]["content"][0]["text"]))
 
-        def command(schema_path: Path, _final_path: Path) -> tuple[str, ...]:
+        def command(schema_path: Path) -> tuple[str, ...]:
+            disables: tuple[str, ...] = ()
+            for feature in CODEX_DISABLED_FEATURES:
+                disables += ("--disable", feature)
             return (
-                self.executable,
+                self._resolve_executable() if isinstance(self.runner, SubprocessRunner)
+                else self.executable,
                 "exec",
                 "--ephemeral",
                 "--ignore-user-config",
@@ -257,6 +347,7 @@ class CodexLocalBackend:
                 "--sandbox",
                 "read-only",
                 "--skip-git-repo-check",
+                *disables,
                 "--model",
                 model,
                 "--output-schema",
@@ -268,17 +359,23 @@ class CodexLocalBackend:
             local = run_isolated_local_agent(
                 runner=self.runner,
                 command=command,
+                parse=parse_codex_events,
                 stdin_text=prompt,
-                output_schema=CANONICAL_SUMMARY_SCHEMA,
+                output_schema=PROVIDER_OUTPUT_SCHEMA,
                 temporary_parent=temporary_parent,
                 timeout_seconds=timeout_seconds,
             )
             result = normalize_summary_result(local.result)
+        except subprocess.TimeoutExpired as exc:
+            raise BackendTimeoutError(f"codex-local exceeded {timeout_seconds}s.") from exc
+        except BackendError:
+            raise
         except Exception as exc:
             raise BackendExecutionError(str(exc)) from exc
         return BackendAudit(
             result=result,
-            request={"mode": "stdin", "schema": "canonical-summary-v1"},
+            # argv carries only control information; the article goes over stdin.
+            request={"mode": "stdin", "argv": list(local.argv)},
             response={"final_response": result},
             usage=local.usage,
             auth_mode=self.capabilities.auth_mode,
@@ -298,6 +395,10 @@ class ClaudeCodeLocalBackend:
 
     def default_model(self) -> str:
         return ""
+
+    def supports_model(self, model: str) -> bool:
+        del model
+        return True
 
     def preflight(self) -> dict[str, Any]:
         raise BackendPolicyError(
@@ -335,8 +436,45 @@ def get_backend(value: str) -> LLMBackend:
             model_name=os.environ.get("MANUS_MODEL", "manus-1.6"),
             max_article_chars=3_000,
             usage_available=False,
-            min_start_interval_seconds=6.1,
+            # Manus pacing lives in llm.py because the legacy export path shares
+            # that call; declaring it here too would make each create wait twice.
+            min_start_interval_seconds=0.0,
         )
     if backend == "codex-local":
         return CodexLocalBackend()
     return ClaudeCodeLocalBackend()
+
+
+def parse_codex_events(stdout: str) -> LocalAgentResult:
+    """Read Codex's JSONL event stream. The format belongs to this adapter."""
+    final_text = ""
+    usage: dict[str, int] = {}
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        if event.get("type") == "item.completed":
+            item = event.get("item")
+            if isinstance(item, dict) and item.get("type") == "agent_message":
+                text = item.get("text")
+                if isinstance(text, str):
+                    final_text = text
+        if event.get("type") == "turn.completed":
+            raw_usage = event.get("usage")
+            if isinstance(raw_usage, dict):
+                for key in ("input_tokens", "cached_input_tokens", "output_tokens"):
+                    value = raw_usage.get(key)
+                    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                        usage[key] = value
+    if not final_text:
+        raise BackendProtocolError("Codex did not return a final structured response.")
+    try:
+        result = json.loads(final_text)
+    except json.JSONDecodeError as exc:
+        raise BackendProtocolError("Codex final response was not valid JSON.") from exc
+    if not isinstance(result, dict):
+        raise BackendProtocolError("Codex final response was not a JSON object.")
+    return LocalAgentResult(result=result, usage=usage)

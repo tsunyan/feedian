@@ -4,9 +4,10 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Protocol, Sequence
 
@@ -41,30 +42,70 @@ class SubprocessRunner:
         cwd: Path,
         timeout_seconds: float,
     ) -> ProcessResult:
-        completed = subprocess.run(
+        """Run one agent process, terminating its whole tree on timeout.
+
+        `subprocess.run` kills only the process it started, which would leave a
+        local agent's own children running and still spending model tokens after
+        Feedian gave up on them.
+        """
+        popen_kwargs: dict[str, object] = {}
+        if os.name == "nt":
+            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            popen_kwargs["start_new_session"] = True
+        process = subprocess.Popen(
             list(argv),
-            input=stdin_text,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
             errors="replace",
-            capture_output=True,
             cwd=cwd,
-            timeout=timeout_seconds,
+            **popen_kwargs,  # type: ignore[arg-type]
+        )
+        try:
+            stdout, stderr = process.communicate(stdin_text, timeout=timeout_seconds)
+        except subprocess.TimeoutExpired:
+            terminate_process_tree(process)
+            process.communicate()
+            raise
+        return ProcessResult(process.returncode, stdout, stderr)
+
+
+def terminate_process_tree(process: subprocess.Popen[str]) -> None:
+    """Kill a process and everything it started."""
+    if process.poll() is not None:
+        return
+    if os.name == "nt":
+        # Windows has no process groups that survive an intermediate exit, so ask
+        # the OS to walk the tree by PID.
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(process.pid)],
+            capture_output=True,
             check=False,
         )
-        return ProcessResult(completed.returncode, completed.stdout, completed.stderr)
+        if process.poll() is None:
+            process.kill()
+        return
+    try:
+        os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        process.kill()
 
 
 @dataclass(frozen=True)
 class LocalAgentResult:
     result: dict[str, object]
     usage: dict[str, int]
+    argv: tuple[str, ...] = ()
 
 
 def run_isolated_local_agent(
     *,
     runner: ProcessRunner,
-    command: Callable[[Path, Path], Sequence[str]],
+    command: Callable[[Path], Sequence[str]],
+    parse: Callable[[str], LocalAgentResult],
     stdin_text: str,
     output_schema: dict[str, object],
     temporary_parent: Path,
@@ -72,9 +113,10 @@ def run_isolated_local_agent(
 ) -> LocalAgentResult:
     """Run one local-agent process without placing untrusted input in argv.
 
-    The caller supplies a command builder so contract tests can verify every
-    argument. Only the schema and final-message paths are exposed to the child;
-    the article and prompt are delivered exclusively through stdin.
+    The caller supplies the command builder and the event parser, because flags
+    and event formats belong to each CLI rather than to this runner. Only the
+    schema path is exposed to the child; the article and prompt are delivered
+    exclusively through stdin.
     """
 
     temporary_parent = temporary_parent.resolve()
@@ -86,14 +128,13 @@ def run_isolated_local_agent(
         if os.name != "nt":
             temporary_path.chmod(0o700)
         schema_path = temporary_path / "output-schema.json"
-        final_path = temporary_path / "final-response.json"
         schema_path.write_text(
             json.dumps(output_schema, ensure_ascii=False, separators=(",", ":")),
             encoding="utf-8",
         )
         if os.name != "nt":
             schema_path.chmod(0o600)
-        argv = tuple(str(value) for value in command(schema_path, final_path))
+        argv = tuple(str(value) for value in command(schema_path))
         if stdin_text and any(stdin_text in argument for argument in argv):
             raise RuntimeError("Untrusted local-agent input must not appear in argv.")
         completed = runner.run(
@@ -104,7 +145,8 @@ def run_isolated_local_agent(
         )
         if completed.returncode != 0:
             raise RuntimeError(f"Local agent exited with status {completed.returncode}.")
-        return _parse_codex_jsonl(completed.stdout)
+        parsed = parse(completed.stdout)
+        return replace(parsed, argv=argv)
     finally:
         shutil.rmtree(temporary_path, ignore_errors=True)
 
@@ -127,37 +169,3 @@ def sanitize_error(
     )
     encoded = sanitized.strip().encode("utf-8")[:MAX_ERROR_BYTES]
     return encoded.decode("utf-8", errors="ignore")
-
-
-def _parse_codex_jsonl(stdout: str) -> LocalAgentResult:
-    final_text = ""
-    usage: dict[str, int] = {}
-    for line in stdout.splitlines():
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(event, dict):
-            continue
-        if event.get("type") == "item.completed":
-            item = event.get("item")
-            if isinstance(item, dict) and item.get("type") == "agent_message":
-                text = item.get("text")
-                if isinstance(text, str):
-                    final_text = text
-        if event.get("type") == "turn.completed":
-            raw_usage = event.get("usage")
-            if isinstance(raw_usage, dict):
-                for key in ("input_tokens", "cached_input_tokens", "output_tokens"):
-                    value = raw_usage.get(key)
-                    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
-                        usage[key] = value
-    if not final_text:
-        raise RuntimeError("Local agent did not return a final structured response.")
-    try:
-        result = json.loads(final_text)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError("Local agent final response was not valid JSON.") from exc
-    if not isinstance(result, dict):
-        raise RuntimeError("Local agent final response was not a JSON object.")
-    return LocalAgentResult(result=result, usage=usage)

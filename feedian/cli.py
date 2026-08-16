@@ -641,7 +641,7 @@ def _ingest(args: argparse.Namespace) -> int:
                 force=args.force, auto=args.auto, backend=backend_id, backend_instance=backend,
             )
             print_ingest_plan(
-                plan, provider=backend_id, model=model, dry_run=True, command=args._invocation,
+                plan, backend=backend_id, model=model, dry_run=True, command=args._invocation,
             )
             return 0
 
@@ -652,7 +652,7 @@ def _ingest(args: argparse.Namespace) -> int:
                 force=args.force, auto=args.auto, backend=backend_id, backend_instance=backend,
             )
             print_ingest_plan(
-                plan, provider=backend_id, model=model, dry_run=False, command=args._invocation,
+                plan, backend=backend_id, model=model, dry_run=False, command=args._invocation,
             )
 
             with reporter:

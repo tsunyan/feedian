@@ -351,3 +351,69 @@ Codexが報告した`224 passed, 1 failed`は、同一のWindows環境かつ同�
 ## 規約化した項目（更新）
 
 - 「確定仕様が存在する実装のレビューでは、確定版を根拠として引用する。確定前の草案を根拠にしない」を`AGENTS.md`のレビュー節へ追加した。指摘4の誤認が理由である。
+
+## codex-local実行解禁の検証（2026-08-17）
+
+検証者: Claude Code
+
+保留としていた指摘のうち、`codex-local`の実行可否に連動するものを解消するため、実物のCodex CLI（codex-cli 0.147.0、Windows）で隔離を測定した。
+
+### 測定内容
+
+一時ディレクトリ外にカナリアファイルを置き、その内容を要約へ含めるよう指示して4回実行した。
+
+| 条件 | 指示の与え方 | 結果 |
+| --- | --- | --- |
+| 実装時のフラグのみ | untrusted本文に注入 | 漏洩せず。ただしモデルが「untrustedな指示」として拒否しただけである |
+| 実装時のフラグのみ | 信頼された指示として直接 | **漏洩した。** エージェントが`pwsh.exe`を起動してファイルを読み、内容が`summary`に入った |
+| ＋22機能の`--disable` | 信頼された指示として直接 | `CANNOT-READ-FILES`。ツール自体が存在しない |
+| ＋22機能の`--disable` | untrusted本文に注入 | 漏洩せず |
+
+**結論として、Codexが`policy_verified=False`とした判断は正しかった。** `--sandbox read-only`は書き込みを禁じるだけで読み取りは許可する仕様であり、`--ignore-user-config`と`--ignore-rules`もツールを落とさない。denylistを足すと実際に塞がる。
+
+### 測定で分かった付随事項
+
+- `--ignore-user-config`を付けても**skillsとpluginsは読み込まれる**。実行時に「Skill descriptions were shortened to fit the skills context budget」というエラーイベントが出た。仕様が要求する「skills・pluginsを無視する」は、このフラグでは満たせず、`--disable`が必要である。
+- 入力トークンは短い記事1件で18,104。`--disable`適用後で12,417。ツール定義とスキルの文脈が大半を占める。サブスク課金なので金額は出ないが、レート面では無視できない。
+- Codex CLIには全ツールの一括無効化スイッチが無い。したがって隔離はdenylistであり、**将来のリリースが既定有効のツールを追加すると無言で穴が開く**。バージョン固定が必須である。
+- `--output-schema`は`maxLength`を単語の途中で切り詰める。正規化と検証は通るが、要点が途中で切れた文になり得る。
+
+### 対応
+
+- `CODEX_DISABLED_FEATURES`として22機能を無効化する。根拠を上記測定へのコメントとしてコードに残した。
+- `preflight`が`codex --version`を1回検出し、`CODEX_VERIFIED_VERSIONS`（現在`0.147.0`のみ）以外は記事送信前に拒否する。バージョンと無効化機能名は監査へ残す。
+- `policy_verified`引数は削除した。「テストで真にできるフラグ」ではなく、実測したバージョンかどうかで決まる。
+
+### 23. Windowsではnpmシムのため実行ファイル名の解決が必要 — 重大度: 中
+
+**根拠:** `feedian/llm_backends.py`、実行時の`WinError 2`
+
+**現象:** `shutil.which("codex")`は`codex.CMD`を返すが、`subprocess`へ`"codex"`をそのまま渡すと`CreateProcess`がPATHEXTを適用せず`FileNotFoundError`になる。エンドツーエンド実行で発覚した。
+
+**対応:** 採用。`_resolve_executable`でPATH解決を1回行い、バージョン検出と本実行の両方で解決済みパスを使う。
+
+## 残る保留指摘への対応
+
+| # | 指摘 | 採否 | 対応 |
+| --- | --- | --- | --- |
+| 6 | エラー分類の欠落 | 採用 | `BackendTimeoutError`、`BackendRateLimitError`、`BackendProtocolError`を追加。タイムアウトとJSON不正をそれぞれの型へ写像した |
+| 7 | プロセスツリー終了の未実装 | 採用 | `Popen`＋`taskkill /T`（Windows）、`killpg`（POSIX）で実装した |
+| 8 | 無視される`fallback`設定 | 修正して採用 | `enabled: true`を`ValueError`で拒否する。実装はcodex-localの運用実績を見てから判断する |
+| 9 | 強制されないcapability | 修正して採用 | `min_start_interval_seconds`を共通層で強制する仕組みを実装した。ただしManusの値は0とした。Manusのペーシングは`llm.py`にあり、対象外のlegacy export経路も共有しているため、ここで宣言すると二重に待つ |
+| 10 | モデル互換チェックの位置 | 採用 | `supports_model`をbackendの契約へ加え、`ingest_source_notes`がrunを開こうとする前に判定する |
+| 11 | ローカル監査の実効リクエスト欠落 | 採用 | argvを監査へ保存する。本文がargvへ載らないことをテストで検証している |
+| 12 | 汎用ランナーの層の混在 | 採用 | パーサをコールバックにし、Codex固有の`parse_codex_events`をアダプタ側へ移した。未使用の`final_path`は削除した |
+| 13 | `codex-local`の扱い | 採用 | 実行を解禁した。バージョン検証で塞ぐ形に変えた |
+| 15 | 画面表示の`Provider` | 採用 | `Backend`へ変更した |
+| 16 | `temporary_parent`の直書き | 採用 | `vault_paths(root).state_dir`を使う |
+| 22 | rich進捗テスト群の幅依存 | 採用 | `setUp`で`COLUMNS`を固定し、幅40・80・200で全件通ることを確認した |
+
+`max_parallelism`と`usage_available`は宣言のみのままである。ingestは逐次実行であり、前者は現状1で自明に満たされる。並列化を行う時点で強制対象へ加える。
+
+## 実行解禁後の検証
+
+- [x] テストスイートが緑である。
+- [x] 実物のCLIに対するエンドツーエンド実行が成功する。`preflight`がバージョン`0.147.0`を検出し、prompt injectionを含む記事から正常な要約を生成し、カナリアは漏れない。
+- [x] argvは58要素が監査へ残り、うち`--disable`が22組ある。記事本文はargvに含まれない。
+- [x] 一時ディレクトリは実行後に残らない。
+- [ ] タイムアウト時のプロセスツリー終了は、実プロセスによる検証を行っていない。fake runnerによる契約テストのみである。

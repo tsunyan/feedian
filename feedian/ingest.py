@@ -18,11 +18,11 @@ from .llm import (
     SUMMARY_INSTRUCTIONS,
     build_summary_request,
 )
-from .llm_backends import LLMBackend, canonical_backend_id, get_backend
+from .llm_backends import BackendPolicyError, LLMBackend, canonical_backend_id, get_backend
 from .local_agent import sanitize_error
 from .markdown import escape_markdown_heading, sanitize_filename, yaml_frontmatter
 from .store import VaultStore, stable_json
-from .vault import VaultConfig
+from .vault import VaultConfig, vault_paths
 
 
 PROMPT_VERSION = "source-note-v1"
@@ -190,7 +190,11 @@ def ingest_source_notes(
     )
     if dry_run:
         return IngestReport(processed=len(plan.candidates), reused=plan.reusable)
+    if plan.new_requests and not selected_backend.supports_model(model):
+        raise BackendPolicyError(f"Backend {backend_id} does not support model {model!r}.")
     preflight_metadata = selected_backend.preflight() if plan.new_requests else {}
+    start_interval = selected_backend.capabilities.min_start_interval_seconds
+    last_start = 0.0
     processed = created = reused = failed = input_tokens = output_tokens = 0
     unpriced = unmetered = 0
     cost_usd = 0.0
@@ -222,15 +226,10 @@ def ingest_source_notes(
                     ),
                 )
             continue
-        stored_request = (
-            {"mode": "stdin", "schema": "canonical-summary-v1"}
-            if backend_id.endswith("-local")
-            else candidate.request
-        )
         run_id = store.start_llm_run(
             resource_id=candidate.resource_id, resource_revision_id=str(row["resource_revision_id"]),
             operation="source-note", model=model, prompt_version=PROMPT_VERSION,
-            input_fingerprint=candidate.fingerprint, request=stored_request,
+            input_fingerprint=candidate.fingerprint, request=candidate.request,
             backend=backend_id,
             summary_schema_version=CANONICAL_SUMMARY_SCHEMA_VERSION,
             fingerprint_version=2,
@@ -243,6 +242,11 @@ def ingest_source_notes(
         started_at = time.monotonic()
         try:
             page = _page(row, metadata)
+            if start_interval > 0:
+                delay = start_interval - (time.monotonic() - last_start)
+                if delay > 0:
+                    time.sleep(delay)
+            last_start = time.monotonic()
             audit = selected_backend.summarize(
                 model=model,
                 item=metadata,
@@ -253,7 +257,7 @@ def ingest_source_notes(
                 reasoning_effort="low",
                 max_retries=3,
                 retry_base_seconds=1.0,
-                temporary_parent=Path(vault_root).resolve() / ".feedian" / "tmp",
+                temporary_parent=vault_paths(vault_root).state_dir / "tmp",
             )
             price = _price_record(
                 audit.usage, model, billing_mode=audit.billing_mode,
