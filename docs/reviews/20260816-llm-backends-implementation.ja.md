@@ -602,3 +602,58 @@ Memories — none.
 - [x] `logical`/`actual` envelopeで壊れる`request_json`の読み手が無い。
 - [ ] **グローバル`~/.codex/AGENTS.md`とskillsカタログはエージェントへ届いている（指摘28）。確定仕様の安全ポリシーは未達である。**
 - [ ] タイムアウト時の実プロセスツリー終了テストは未実施のままである。
+
+## Codexによる指摘28の補足レビュー（2026-08-17）
+
+レビュー者: Codex
+
+### 結論
+
+指摘28は妥当であり、Claude Codeが挙げた三案のうち、**Feedian専用の`CODEX_HOME`を使う案を推奨する**。ただし、既存の`~/.codex`を複製して不要なファイルを削る方式にはしない。`~/.feedian/codex-home`のような空の安定ディレクトリを新設し、その環境で利用者が一度だけ`codex login`を実行する。
+
+Feedianは`CODEX_HOME`を自身が起動する子processの`env`だけに設定する。親processの`os.environ`やuser・machine scopeの環境変数は変更しない。この実装なら、通常のCodexは引き続き`~/.codex`を使うため、グローバルの設定、skills、plugins、rules、hooks、ログイン状態にはfilesystem上の変更を加えない。`CODEX_HOME`を設定したshellで手作業する場合は、そのshellと子processには値が見えるため、login後に元へ戻す必要がある。
+
+専用homeはsystem tempやVaultの中ではなく、利用者ごとの永続領域へ置く。起動前に専用home直下の`AGENTS.md`、`AGENTS.override.md`、`skills/`、`plugins/`、`rules/`、`hooks/`が存在しないことも検証し、見つけた場合は黙って読み込まずpreflight errorにする。
+
+### 認証情報配置の補足
+
+「複製せずに新規loginする」という方向は正しいが、**認証情報が二箇所に存在しなくなるわけではない**。既定homeとFeedian専用homeは、それぞれ有効な認証cacheを持つ。利点は、同じ`auth.json`をcopyしてrefresh stateを分岐させるのではなく、それぞれが正規のloginで作られ、独立して更新されることである。
+
+Codexは認証情報を`CODEX_HOME/auth.json`だけでなくOS keyringへ保存できる。専用homeによる分離を決定的にするため、setup時と実行時の双方で`cli_auth_credentials_store="file"`を明示する。実行時は`--ignore-user-config`を使うため、専用homeの`config.toml`だけにこの値を書いても足りない。CLI overrideとして毎回渡す。
+
+概念上のsetupは次のとおりである。実装時には、Feedian側にplatform差を吸収するlogin補助commandを設けるか、同等の手順を利用者向け文書へ記載する。
+
+```text
+CODEX_HOME=<user data>/.feedian/codex-home
+codex --config cli_auth_credentials_store="file" login
+```
+
+公式文書は、file保存時の認証情報が`CODEX_HOME`配下に置かれること、ChatGPT session tokenが利用中に自動更新されること、globalな`AGENTS.md`が`CODEX_HOME`から探索されることを説明している。また`--ignore-user-config`は`CODEX_HOME/config.toml`を無視する一方で、認証には引き続き`CODEX_HOME`を使う。([Authentication](https://developers.openai.com/codex/auth)、[AGENTS.md](https://developers.openai.com/codex/guides/agents-md)、[CLI reference](https://developers.openai.com/codex/cli/reference)、[Configuration reference](https://developers.openai.com/codex/config-reference))
+
+一方、同一ChatGPT accountで二つのlogin cacheを長期間併用した場合のaccount側の独立性や同時session数は、公式文書で保証を確認できていない。Claude Codeの実測は「別`CODEX_HOME`で操作しても既定homeのlogin状態が直ちに壊れない」ことの確認としては有効だが、長期運用の保証とは扱わない。
+
+### 33. local-agent子processが親環境を丸ごと継承する — 重大度: 中
+
+**根拠:** `feedian/local_agent.py:82`、`feedian/llm_backends.py:274,324,336`、`docs/specs/20260816-llm-backends.ja.md:456,519`
+
+**現象:** `SubprocessRunner`の`subprocess.Popen`、version検出、`codex login status`はいずれも`env`を明示していないため、親processの環境変数をそのまま継承する。これは、確定仕様の「CLI processへ継承する環境変数はallowlist方式とする」という要件、およびfake runnerで環境変数allowlistを検証する要件を満たさない。
+
+**影響:** `OPENAI_API_KEY`、`CODEX_ACCESS_TOKEN`、cloud providerのtokenなど、Codex実行に不要なsecretが子processへ到達し得る。`NODE_OPTIONS`、`PYTHONPATH`、任意の`GIT_*`など、子processの挙動を変える環境変数も同様である。継承した`OPENAI_API_KEY`が自動的に認証方式や課金区分を切り替えることまでは確認できていないため、その点は確定事実としない。ただし、不要なsecretの露出と実行再現性の低下だけで修正理由として十分である。
+
+**提案:** 指摘28と同時に修正する。`ProcessRunner`の契約へ明示的な`env` mappingを追加し、platformごとの最小allowlistから子環境を組み立てる。その同じ環境をversion検出、login確認、`codex exec`のすべてへ渡し、`CODEX_HOME=<Feedian専用home>`と`cli_auth_credentials_store="file"`を一貫して適用する。必要なOS変数、locale、TLS certificate、proxyの採否は明示的に決め、secretやprocess挙動を変更する変数を既定では渡さない。fake runnerの契約テストで三経路のenvが一致することと、禁止した変数が除外されることを検証する。
+
+## Codex補足レビューの採否
+
+| # | 指摘 | 採否 | 理由 |
+| --- | --- | --- | --- |
+| 28 | 保留 | Feedian専用`CODEX_HOME`案をCodexの推奨とする。実装指示と利用者による専用homeへのloginが完了するまでは未解消であり、正式な完了判定を行わない |
+| 33 | 採用 | 確定仕様のallowlist要件に対する実装漏れである。指摘28の`CODEX_HOME`配線と同じ変更で対応する |
+
+## Codex補足レビューの検証計画
+
+- [ ] 専用`CODEX_HOME`でloginした実CLIに、既定homeの`AGENTS.md`とskillsカタログが届かない。
+- [ ] 専用homeに禁止対象の指示・拡張directoryがある場合、preflightで拒否する。
+- [ ] 通常のCodexが引き続き既定の`~/.codex`を使用し、既存のlogin状態と設定が変化しない。
+- [ ] version検出、login確認、`codex exec`が同一のallowlist環境を受け取る。
+- [ ] 親環境のsecretとprocess挙動を変更する禁止変数が子processへ渡らない。
+- [ ] 認証保存方式がsetup時と実行時の双方でfileに固定され、専用homeの`auth.json`を使う。
