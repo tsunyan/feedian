@@ -1,0 +1,229 @@
+# LLMバックエンド実装のコードレビュー
+
+ステータス: 完了
+対象: `7e9d09e` feat: add LLM execution backends
+仕様: [LLM実行バックエンド](../specs/20260816-llm-backends.ja.md)
+レビュー者: Claude Code (2026-08-16)
+
+## 結論
+
+マージ不可。テストが赤であり、仕様の中心である再利用キーの互換パスが原理的に機能しない。
+
+指摘1から3を解消するまで先へ進めない。1は無関係なテストの破壊、2は互換パスの不成立、3は2を直した瞬間に顕在化する読み取り経路からの書き込みである。4以降は同一ブランチで直す必要はない。
+
+方向性そのものは妥当である。backendとmodelとauth modeの分離、Vault config format version 2による明示移行、untrusted wrappingの共通化は、いずれも仕様のレビューで合意した内容を正しく実装している。
+
+## 指摘
+
+### 1. 無関係なテストのアサーションを書き換えて壊している — 重大度: 高
+
+**根拠:** `tests/test_progress.py:116`
+
+**現象:** rich progressの最終表示を検証するテストのアサーションが、`assertGreaterEqual(output.count(...), 2)` から `assertEqual(output.count(...), 1)` へ書き換えられている。実際の出現回数は3であり、`AssertionError: 3 != 1` で失敗する。変更前のアサーションは対象コミットの親で通っていた。
+
+**影響:** テストスイート全体が赤になる。またLLMバックエンドと無関係な領域の検証が、根拠なく弱い条件へ置き換わっている。
+
+**提案:** 変更を元に戻す。
+
+### 2. legacy fingerprintの互換パスが原理的に一致しない — 重大度: 高
+
+**根拠:** `feedian/ingest.py:335`、`feedian/llm.py:47`、`feedian/store.py:770`
+
+**現象:** 同じ変更の中で`tags.minItems`が`1`から`0`へ変更されている。このスキーマは`build_summary_request`を通じてrequestへ埋め込まれ、request全体がfingerprintのハッシュ対象である。したがって`_candidate`が算出する`legacy_fingerprint`は、新スキーマにlegacyな`provider`キーを足したものになり、実際にデータベースへ保存されている歴史的fingerprint（旧スキーマ＋`provider`キー）と一致しない。
+
+```
+minItems now  : 0
+legacy_fp(new): 240dfa32d1a36c9c
+historical_fp : cf51fa03ad33a525
+MATCH: False
+```
+
+**影響:** `successful_llm_result`のfingerprint version 1検索とversion 2への昇格処理が到達不能な死にコードになる。移行後の初回ingestで既存の再利用可能な結果が一件も見つからず、全記事がAPIへ再送出されて再課金される。仕様がAを最優先事項とした目的が失われる。
+
+**提案:** legacy fingerprintを旧スキーマの凍結スナップショットから算出する。凍結スキーマを定数として明示すれば、以後スキーマを変更しても互換検索が壊れないことがコード上で読み取れる。あるいは`minItems`の変更自体を取りやめる（指摘4を参照）。
+
+### 3. dry-runがデータベースへ書き込む — 重大度: 高
+
+**根拠:** `feedian/store.py:773`、`feedian/cli.py:625`
+
+**現象:** `successful_llm_result`はlegacy fingerprintがヒットした場合に`UPDATE llm_run`を発行する。この関数は`plan_source_notes`から`_candidate`経由で呼ばれ、`_ingest`のdry-run分岐は`vault_write_lock`を取得していない。画面表示は「Preview only | no API calls | no writes」である。
+
+**影響:** 読み取りを名乗る関数が副作用を持ち、書き込みロックの外でデータベースを変更する。現状は指摘2の不具合により発火しないが、**指摘2を修正した瞬間に顕在化する**。
+
+**提案:** 昇格処理を書き込み経路（`ingest_source_notes`側、ロック内）へ移す。あるいは`successful_llm_result`へ昇格の可否を渡す引数を設け、計画時は読み取りのみとする。
+
+### 4. `minItems`の緩和に根拠がない — 重大度: 中
+
+**根拠:** `feedian/llm.py:47`
+
+**現象:** `tags.minItems`を`1`から`0`へ変更している。仕様にも仕様のレビューにも、タグ0個を許容する判断は記録されていない。`DESIGN.md`は「空の`tags`と`content_type`は許容する」と既成事実として記述している。
+
+**影響:** 合意のない出力契約の緩和である。さらに副作用として指摘2を引き起こしている。
+
+**提案:** 緩和が必要ならその理由を仕様側へ記録してから行う。不要なら元に戻す。
+
+### 5. canonical schemaによる検証が実装されていない — 重大度: 中
+
+**根拠:** `feedian/llm.py:33`、`feedian/llm.py:57`
+
+**現象:** `CANONICAL_SUMMARY_SCHEMA`は`deepcopy`して`PROVIDER_OUTPUT_SCHEMA`という別名を作っただけで、検証を行うコードが存在しない。JSON Schema検証ライブラリへの依存も追加されていない。実際のゲートは従来どおり`normalize_summary_result`による切り詰めと型強制である。
+
+**影響:** `DESIGN.md`の「プロバイダー出力は正規化後にcanonical summary schema version 1で検証する」が事実と異なる。仕様のレビューで合意した「providerへ要求するSchemaと保存可能なSchemaを分ける」うち、後者の検証側が実装されていない。
+
+**提案:** 正規化後の検証を実装するか、実装しない判断であれば`DESIGN.md`の記述を実態へ合わせる。二つのスキーマが常に同一内容であるなら、分離した意味も併せて記述する。
+
+### 6. エラー分類が仕様の6分類のうち3つ欠けている — 重大度: 中
+
+**根拠:** `feedian/llm_backends.py:26-43`、`feedian/llm_backends.py:277`
+
+**現象:** `BackendTimeoutError`、`BackendRateLimitError`、`BackendProtocolError`が定義されていない。ローカルバックエンドの`summarize`は`except Exception`で一括捕捉し、タイムアウトもJSON不正もレート制限も`BackendExecutionError`へ潰している。
+
+**影響:** 呼び出し側が失敗の種類を区別できない。再試行の可否も、利用者への説明も分岐できない。
+
+**提案:** 仕様の分類どおり例外クラスを追加し、`local_agent`側で`TimeoutExpired`とJSON解析失敗をそれぞれの型へ写像する。
+
+### 7. プロセスツリー終了が未実装 — 重大度: 中
+
+**根拠:** `feedian/local_agent.py:44`、`tests/test_llm_backends.py:132`
+
+**現象:** `SubprocessRunner`は`subprocess.run(timeout=)`のみを使う。これは直接の子プロセスだけをkillし、孫プロセスは残る。タイムアウトのテストは例外を送出するだけのfake runnerを使っており、一時ディレクトリの削除しか検証していない。
+
+**影響:** 仕様の「タイムアウトまたはキャンセル時に完全なプロセスツリーを終了する」を満たさない。ローカルエージェントは子プロセスを起こし得るため、放置されたプロセスがモデル推論を続ける可能性がある。
+
+**提案:** POSIXでは`start_new_session=True`とプロセスグループへのシグナル、Windowsではjob objectまたは`taskkill /T`でツリーを終了する。契約テストは実プロセスを起こす必要があるため、fake runnerとは別のテストとして分ける。
+
+### 8. `fallback`設定が受理されるだけで完全に無視される — 重大度: 中
+
+**根拠:** `feedian/vault.py:296-350`、`feedian/llm_backends.py:27`
+
+**現象:** `_parse_llm`は`llm.fallback.enabled`を検証し、有効ならbackendとmodelの両方を必須とするところまで実装している。しかし実行側にfallbackの配線が一切なく、`BackendError.fallback_eligible`もどこからも読まれない。
+
+**影響:** 利用者が設定してもfallbackは起きない。「設定したのに何も起きない」状態は、未実装として拒否するより危険である。仕様がfallbackを課金事故の防止対象として扱っていることを踏まえると、無視される設定を受理すべきではない。
+
+**提案:** 実装しない範囲であれば`enabled: true`を`ValueError`で拒否する。
+
+### 9. 宣言されているが強制されていないcapability — 重大度: 中
+
+**根拠:** `feedian/llm_backends.py:46-54`、`feedian/llm.py:371`
+
+**現象:** `min_start_interval_seconds`（manus-apiで6.1）、`max_parallelism`、`usage_available`のいずれも、宣言されるだけでどこからも読まれない。manusの実際のレート制御は依然として`llm.py`の`_wait_for_manus_create_slot`が持っている。
+
+**影響:** 仕様の「capabilityは表示や非公式な助言ではなく、実行前に強制する」に反する。実際の制御と宣言が二重管理になり、片方だけ変更される余地が生まれる。
+
+**提案:** 少なくとも`min_start_interval_seconds`は共通層で強制し、`llm.py`側の間隔制御を置き換える。強制しない値は当面capabilityから外す。
+
+### 10. モデル互換チェックが実行前ではなく記事ごとに走る — 重大度: 中
+
+**根拠:** `feedian/llm_backends.py:141-148`
+
+**現象:** backendとmodelの組み合わせ検証が`summarize`の内部にある。`preflight`にもCLIにも検証がない。
+
+**影響:** `--backend manus-api --model gpt-5.6-terra`のような組み合わせは、プラン表示を経て実行へ入り、記事ごとに失敗して失敗した`llm_run`行を量産する。仕様の受け入れ基準「不正な組み合わせは実行前に失敗する」を満たさない。また設定エラーに対して`BackendUnavailableError`（CLI不在またはサービス到達不可を表す分類）を使っており、分類として不適切である。
+
+**提案:** 検証を`preflight`へ移し、分類を設定エラー相当のものへ改める。
+
+### 11. ローカルバックエンドの監査に実効リクエストが残らない — 重大度: 中
+
+**根拠:** `feedian/ingest.py:210`、`feedian/llm_backends.py:281`
+
+**現象:** 計画時に保存するrequestも、実行後に保存するrequestも`{"mode": "stdin", "schema": "canonical-summary-v1"}`の固定値である。実際に渡したargvが記録されない。
+
+**影響:** 仕様が要求する「秘密を除いた実効リクエストまたはプロセス引数」を満たさない。どのCLIフラグで実行されたかを後から監査できない。
+
+**提案:** argvを監査へ保存する。本文をargvへ載せない設計になっているため、argvはそのまま記録して差し支えない。
+
+### 12. 汎用ランナーがCodex固有のパーサを直接呼ぶ — 重大度: 低
+
+**根拠:** `feedian/local_agent.py:107`、`feedian/local_agent.py:132`
+
+**現象:** `run_isolated_local_agent`が`_parse_codex_jsonl`を直接呼んでいる。また`command`コールバックへ渡す`final_path`は、どのコマンド構築でも使われず、ファイルも読まれない。
+
+**影響:** 仕様の「コマンド構築、セキュリティフラグ、イベント形式、usage解析はバックエンド固有」に反する。Claude Code用アダプタを追加する際に、この層を必ず作り直すことになる。
+
+**提案:** パーサをコールバックとして受け取る。使われない`final_path`は削除する。
+
+### 13. `codex-local`はCLIから選択すると必ず失敗する — 重大度: 低
+
+**根拠:** `feedian/llm_backends.py:206`、`feedian/llm_backends.py:341`
+
+**現象:** `get_backend`は`policy_verified=False`で生成するため、`preflight`が常に`BackendPolicyError`を送出する。`shutil.which`によるCLI存在確認はpolicy確認の後段にあり到達不能で、`command()`ビルダーも実プロセスからは到達しない。
+
+**影響:** 意図は`DESIGN.md`に記述されており、隔離を証明できない以上は実行しないという判断自体は妥当である。ただし`--backend`の選択肢には表示され、選ぶと必ず失敗する。`claude-code-local`は「予約」として扱われているのに対し、扱いが不揃いである。
+
+**提案:** 両者の扱いを揃える。選択肢に残すなら、選択時のエラーメッセージで予約状態であることを示す。
+
+### 14. `sanitize_error`は完全一致置換のみ — 重大度: 低
+
+**根拠:** `feedian/local_agent.py:120`
+
+**現象:** `private_values`はプロンプト全文と本文全文の完全一致置換である。本文の断片がエラーメッセージへ混入した場合は素通りする。
+
+**提案:** 完全一致で防げる範囲を前提とするなら、その限界をコメントとして残す。
+
+### 15. 画面表示が`Provider`のまま — 重大度: 低
+
+**根拠:** `feedian/cli.py:629`
+
+**現象:** `print_ingest_plan(plan, provider=backend_id, ...)`と呼んでおり、引数名も画面のラベルも`Provider`である。
+
+**影響:** 仕様の「新しいLLM設定と出力はbackendを使う」を満たさない。`provider`は収集元の意味でも使われているため、混同が残る。
+
+### 16. `temporary_parent`のパス直書き — 重大度: 低
+
+**根拠:** `feedian/ingest.py:231`
+
+**現象:** `Path(vault_root).resolve() / ".feedian" / "tmp"`と直接組み立てている。`vault_paths(root).state_dir`が同じ値を返す。
+
+### 17. `DESIGN.md`の記述誤り — 重大度: 低
+
+**根拠:** `DESIGN.md`
+
+**現象:** 「Vault設定はformat version 2で`llm.backend`、`llm.model`、`llm.auth_mode`を持つ」とあるが、`_parse_llm`が許可するのは`backend`、`model`、`fallback`のみである。`auth_mode`は設定項目ではない。
+
+## 良い点
+
+- v5からv6へのマイグレーションのbackfillが、`finish_llm_run`によって`request_json`が実ペイロードへ差し替わる事実を踏まえ、`$.provider`、`$.agent_profile`、`$.input`と`$.text`の三系統で判別している。既存データの実態を確認した上で書かれている。
+- `fingerprint_version`を独立した列として持ち、旧キーはversion 1でのみ検索する構造自体は正しい。指摘2さえ解消すれば設計どおり機能する。
+- Vault configのformat versionを上げ、未知フィールドの拒否を維持したまま`llm`を追加した点は、仕様レビューEへの正しい対応である。
+- untrusted wrappingを`build_untrusted_message`としてManus専用から共通層へ格上げし、指示、本文、再掲の順序をテストで検証している点は、仕様レビューMへの正しい対応である。
+- untrusted本文をargvへ載せない設計と、それを検証するテストが揃っている。
+
+## 採否
+
+対応はすべてこの文書を含むコミットで行った。
+
+| # | 指摘 | 重大度 | 採否 | 対応 |
+| --- | --- | --- | --- | --- |
+| 1 | 無関係なテストの破壊 | 高 | 採用 | アサーションを元に戻した |
+| 2 | legacy fingerprintの不一致 | 高 | 修正して採用 | 凍結スナップショットではなく`minItems`変更の取りやめで解消した。加えて旧キーを実測値で固定する回帰テストを追加した |
+| 3 | dry-runの書き込み | 高 | 採用 | `successful_llm_result`を読み取り専用に戻し、昇格を`promote_legacy_fingerprint`として書き込み経路へ移した |
+| 4 | `minItems`緩和の根拠不足 | 中 | 採用 | 元に戻した。指摘2の修正と同一である |
+| 5 | canonical schema検証の未実装 | 中 | 修正して採用 | 検証は実装せず、`DESIGN.md`の記述を現在の挙動へ合わせた。検証を実装するか否かは未決である |
+| 6 | エラー分類の欠落 | 中 | 保留 | 分類を増やしても現在の呼び出し側は分岐しない。再試行方針を決める作業と同時に扱う |
+| 7 | プロセスツリー終了の未実装 | 中 | 保留 | `codex-local`は指摘13のとおり実プロセスを起動できない。実行を解禁する作業と同時に扱う |
+| 8 | 無視される`fallback`設定 | 中 | 保留 | 拒否と実装のどちらを選ぶかは利用者に見える挙動の決定であり、単独で判断すべきである |
+| 9 | 強制されないcapability | 中 | 保留 | 指摘8と同じ単位で扱う |
+| 10 | モデル互換チェックの位置 | 中 | 保留 | 失敗はするので課金事故には至らない。指摘6の分類整理と同時に`preflight`へ移す |
+| 11 | ローカル監査の実効リクエスト欠落 | 中 | 保留 | 指摘13と同時に扱う |
+| 12 | 汎用ランナーの層の混在 | 低 | 保留 | `claude-code-local`のアダプタを書く時点で必ず触るため、その作業に含める |
+| 13 | `codex-local`の扱い | 低 | 保留 | 実行を解禁するか予約扱いへ揃えるかは仕様側の判断である |
+| 14 | `sanitize_error`の限界 | 低 | 不採用 | 完全一致で防げる範囲を前提とする設計は妥当である。部分一致による秘匿は誤検知でエラーを読めなくする副作用が大きい |
+| 15 | 画面表示の`Provider` | 低 | 保留 | `cli_ui`の表示変更は他コマンドの表示と揃えて行う |
+| 16 | `temporary_parent`の直書き | 低 | 保留 | 指摘13と同時に扱う |
+| 17 | `DESIGN.md`の記述誤り | 低 | 採用 | `llm.auth_mode`を`llm.fallback`へ訂正した |
+
+保留とした指摘は、いずれも`codex-local`の実行解禁、fallbackの挙動決定、エラー分類と再試行方針という三つの単位へ収束する。個別に着手するより、その単位で仕様を決めてから実装する方が手戻りが少ない。
+
+## 検証
+
+- [x] テストスイートが緑である（225 passed）。
+- [x] 対象コミットの親の時点の実装が算出する再利用キーと、現在の実装が算出する旧キーが一致する。`2385ec2`の`build_summary_request`を実際に読み込んで照合し、その値を`tests/test_ingest.py`へ固定した。
+- [x] 計画は旧キーの行を書き換えない。`test_legacy_fingerprint_is_reused_and_promoted_without_an_api_call`が、計画後は`fingerprint_version`が1のままで、ingest後に2へ昇格することを検証する。
+
+## 規約化した項目
+
+なし。ただし指摘1と同種の事象が再発した場合は、「レビュー対象と無関係なテストのアサーションを変更しない」を`AGENTS.md`へ規約として追加する。
+
+## 補足
+
+指摘2は、既存のテスト`test_legacy_fingerprint_is_reused_and_promoted_without_an_api_call`では原理的に検出できなかった。このテストは旧キーを現在の実装から算出して保存し、同じ実装で検索するため、スキーマが変わっても両者が同時に変わって一致し続ける。移行の互換性を検証するテストは、**旧実装が実際に書いた値**を基準に持つ必要がある。

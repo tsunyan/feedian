@@ -387,6 +387,18 @@ def test_legacy_fingerprint_is_reused_and_promoted_without_an_api_call(tmp_path)
         store.finish_llm_run(run_id, result=Audit.result)
 
         plan = plan_source_notes(store, model="gpt-test", backend_instance=backend)
+        planned = store.connection.execute(
+            "SELECT fingerprint_version, input_fingerprint FROM llm_run WHERE llm_run_id = ?",
+            (run_id,),
+        ).fetchone()
+
+        assert plan.reusable == 1
+        # Planning runs outside the write lock, so it must leave the row alone.
+        assert tuple(planned) == (1, candidate.legacy_fingerprint)
+
+        ingest_source_notes(
+            store, root, VaultConfig(), model="gpt-test", plan=plan, backend_instance=backend,
+        )
         migrated = store.connection.execute(
             """
             SELECT fingerprint_version, input_fingerprint, backend_metadata_json
@@ -395,8 +407,41 @@ def test_legacy_fingerprint_is_reused_and_promoted_without_an_api_call(tmp_path)
             (run_id,),
         ).fetchone()
 
-        assert plan.reusable == 1
         assert tuple(migrated[:2]) == (2, candidate.fingerprint)
         assert json.loads(migrated[2])["legacy_fingerprint_promoted"] is True
+    finally:
+        store.close()
+
+
+def test_legacy_fingerprint_matches_the_key_the_previous_release_stored(tmp_path) -> None:
+    """Pin the version-one reuse key to the value 2385ec2 actually wrote.
+
+    The key hashes the whole request, so any edit to the summary schema silently
+    stops the migration window from finding reusable results. This literal was
+    computed by running that commit's build_summary_request over this fixture.
+    """
+
+    root = tmp_path / "vault"
+    root.mkdir()
+    initialize_vault(root)
+    store = VaultStore.open(root / ".feedian" / "feedian.sqlite3")
+    try:
+        item = store.upsert_canonical_item(
+            CanonicalItem(
+                source="hatena", source_id="one", content_key="url:one",
+                url="https://example.test", title="Article",
+            )
+        )
+        store.record_resource_revision(
+            item.resource_id or "", content_markdown="Body", title="Article"
+        )
+
+        candidate = plan_source_notes(
+            store, model="gpt-test", backend_instance=FakeBackend(None)
+        ).candidates[0]
+
+        assert candidate.legacy_fingerprint == (
+            "b2cccd34551a6f6eefca14a5a31af494413d33ee4f84c2fd3bedd781f088cd95"
+        )
     finally:
         store.close()

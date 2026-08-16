@@ -44,7 +44,7 @@ CANONICAL_SUMMARY_SCHEMA: dict[str, Any] = {
         "tags": {
             "type": "array",
             "items": {"type": "string", "maxLength": 40},
-            "minItems": 0,
+            "minItems": 1,
             "maxItems": 6,
         },
         "content_type": {"type": "string"},

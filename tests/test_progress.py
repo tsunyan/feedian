@@ -113,7 +113,7 @@ class ProgressReporterTests(unittest.TestCase):
             reporter.retain_final()
 
         output = stream.getvalue()
-        self.assertEqual(output.count("process: syncing items"), 1)
+        self.assertGreaterEqual(output.count("process: syncing items"), 2)
         self.assertIn("2/2", output)
 
 

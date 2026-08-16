@@ -761,49 +761,86 @@ class VaultStore:
         summary_schema_version: str = "1",
         legacy_fingerprint: str | None = None,
     ) -> dict[str, Any] | None:
-        row = self.connection.execute(
+        """Find a reusable result, reading only.
+
+        `plan_source_notes` calls this outside the vault write lock and `--dry-run`
+        promises no writes, so a version-one hit is left as it is here;
+        `promote_legacy_fingerprint` rewrites it from the write path instead.
+        """
+        row = self._completed_llm_run(
+            resource_revision_id=resource_revision_id, operation=operation, backend=backend,
+            model=model, prompt_version=prompt_version, summary_schema_version=summary_schema_version,
+            fingerprint=input_fingerprint, fingerprint_version=2,
+        )
+        if row is None and legacy_fingerprint:
+            row = self._completed_llm_run(
+                resource_revision_id=resource_revision_id, operation=operation, backend=backend,
+                model=model, prompt_version=prompt_version, summary_schema_version=summary_schema_version,
+                fingerprint=legacy_fingerprint, fingerprint_version=1,
+            )
+        return json.loads(str(row["result_json"])) if row is not None and row["result_json"] else None
+
+    def promote_legacy_fingerprint(
+        self,
+        *,
+        resource_revision_id: str,
+        operation: str,
+        model: str,
+        prompt_version: str,
+        input_fingerprint: str,
+        legacy_fingerprint: str,
+        backend: str = "openai-responses",
+        summary_schema_version: str = "1",
+    ) -> bool:
+        """Rewrite a version-one reuse key to the current one. Callers hold the write lock."""
+        row = self._completed_llm_run(
+            resource_revision_id=resource_revision_id, operation=operation, backend=backend,
+            model=model, prompt_version=prompt_version, summary_schema_version=summary_schema_version,
+            fingerprint=legacy_fingerprint, fingerprint_version=1,
+        )
+        if row is None:
+            return False
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                UPDATE llm_run
+                SET input_fingerprint = ?,
+                    fingerprint_version = 2,
+                    backend_metadata_json = json_set(
+                        COALESCE(backend_metadata_json, '{}'),
+                        '$.legacy_fingerprint_promoted', json('true')
+                    )
+                WHERE llm_run_id = ?
+                """,
+                (input_fingerprint, str(row["llm_run_id"])),
+            )
+        return True
+
+    def _completed_llm_run(
+        self,
+        *,
+        resource_revision_id: str,
+        operation: str,
+        backend: str,
+        model: str,
+        prompt_version: str,
+        summary_schema_version: str,
+        fingerprint: str,
+        fingerprint_version: int,
+    ) -> Any:
+        return self.connection.execute(
             """
             SELECT llm_run_id, result_json FROM llm_run
             WHERE resource_revision_id = ? AND operation = ? AND backend = ? AND model = ?
-              AND prompt_version = ? AND summary_schema_version = ? AND fingerprint_version = 2
+              AND prompt_version = ? AND summary_schema_version = ? AND fingerprint_version = ?
               AND input_fingerprint = ? AND status = 'completed'
             ORDER BY finished_at DESC LIMIT 1
             """,
             (
                 resource_revision_id, operation, backend, model, prompt_version,
-                summary_schema_version, input_fingerprint,
+                summary_schema_version, fingerprint_version, fingerprint,
             ),
         ).fetchone()
-        if row is None and legacy_fingerprint:
-            row = self.connection.execute(
-                """
-                SELECT llm_run_id, result_json FROM llm_run
-                WHERE resource_revision_id = ? AND operation = ? AND backend = ? AND model = ?
-                  AND prompt_version = ? AND summary_schema_version = ? AND fingerprint_version = 1
-                  AND input_fingerprint = ? AND status = 'completed'
-                ORDER BY finished_at DESC LIMIT 1
-                """,
-                (
-                    resource_revision_id, operation, backend, model, prompt_version,
-                    summary_schema_version, legacy_fingerprint,
-                ),
-            ).fetchone()
-            if row is not None:
-                with self.transaction() as connection:
-                    connection.execute(
-                        """
-                        UPDATE llm_run
-                        SET input_fingerprint = ?,
-                            fingerprint_version = 2,
-                            backend_metadata_json = json_set(
-                                COALESCE(backend_metadata_json, '{}'),
-                                '$.legacy_fingerprint_promoted', json('true')
-                            )
-                        WHERE llm_run_id = ?
-                        """,
-                        (input_fingerprint, str(row["llm_run_id"])),
-                    )
-        return json.loads(str(row["result_json"])) if row is not None and row["result_json"] else None
 
     def start_llm_run(
         self,

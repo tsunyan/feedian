@@ -193,6 +193,15 @@ def ingest_source_notes(
         metadata = candidate.metadata
         processed += 1
         if candidate.cached_result is not None:
+            # Planning only reads, so a result found under the version-one key is
+            # rewritten here, where the vault write lock is held.
+            store.promote_legacy_fingerprint(
+                resource_revision_id=str(row["resource_revision_id"]), operation="source-note",
+                model=model, prompt_version=PROMPT_VERSION,
+                input_fingerprint=candidate.fingerprint,
+                legacy_fingerprint=candidate.legacy_fingerprint,
+                backend=backend_id, summary_schema_version=CANONICAL_SUMMARY_SCHEMA_VERSION,
+            )
             store.put_source_note(
                 resource_id=candidate.resource_id, llm_run_id=None,
                 markdown=render_source_note(row, metadata, candidate.cached_result, model=model),
