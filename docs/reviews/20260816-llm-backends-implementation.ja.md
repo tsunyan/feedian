@@ -37,7 +37,7 @@
 
 **現象:** 同じ変更の中で`tags.minItems`が`1`から`0`へ変更されている。このスキーマは`build_summary_request`を通じてrequestへ埋め込まれ、request全体がfingerprintのハッシュ対象である。したがって`_candidate`が算出する`legacy_fingerprint`は、新スキーマにlegacyな`provider`キーを足したものになり、実際にデータベースへ保存されている歴史的fingerprint（旧スキーマ＋`provider`キー）と一致しない。
 
-```
+```text
 minItems now  : 0
 legacy_fp(new): 240dfa32d1a36c9c
 historical_fp : cf51fa03ad33a525
@@ -523,7 +523,7 @@ Claude Codeの再対応で、指摘18から23に直接対応する修正とRich�
 
 **現象:** 出荷される全フラグ（`--ephemeral --ignore-user-config --ignore-rules --config mcp_servers={}` と22機能の`--disable`）を付けた上で、受け取った指示の出所を列挙させたところ、次を報告した。
 
-```
+```text
 User-provided AGENTS.md — "# グローバル作業指示"
 Skills catalog — "## Skills"
 MCP servers — none.
@@ -646,8 +646,8 @@ codex --config cli_auth_credentials_store="file" login
 
 | # | 指摘 | 採否 | 理由 |
 | --- | --- | --- | --- |
-| 28 | 保留 | Feedian専用`CODEX_HOME`案をCodexの推奨とする。実装指示と利用者による専用homeへのloginが完了するまでは未解消であり、正式な完了判定を行わない |
-| 33 | 採用 | 確定仕様のallowlist要件に対する実装漏れである。指摘28の`CODEX_HOME`配線と同じ変更で対応する |
+| 28 | グローバル`AGENTS.md`とskillsの混入 | 保留 | Feedian専用`CODEX_HOME`案をCodexの推奨とする。実装指示と利用者による専用homeへのloginが完了するまでは未解消であり、正式な完了判定を行わない |
+| 33 | local-agent子processが親環境を丸ごと継承する | 採用 | 確定仕様のallowlist要件に対する実装漏れである。指摘28の`CODEX_HOME`配線と同じ変更で対応する |
 
 ## Codex補足レビューの検証計画
 
@@ -680,7 +680,7 @@ Codexの補足レビューの推奨どおり、Feedian専用の`CODEX_HOME`と�
 
 利用者が専用homeへログインした後、指摘28と同一のプローブを出荷構成で実行した。
 
-```
+```text
 System instructions — private; cannot quote.
 Developer instructions — private; cannot quote.
 Skills catalog — first entry: "imagegen"
@@ -788,3 +788,44 @@ fallbackの実装に対する指摘3件。いずれも妥当であり、同一�
 - [x] HTTP primaryの背後のlocal fallbackが、Vault外の一時親を受け取る。
 - [x] 宛先が扱えないmodelは、runを開く前に`BackendPolicyError`になる。
 - [x] subscription primaryとmetered fallbackの組み合わせで、fallbackの上限額が表示される。
+
+## PR #11 でのCodeRabbitレビュー（2026-08-17）
+
+レビュー者: CodeRabbit (GitHub review bot)
+
+### 37. 新規作成と移行後で`llm_run`のDDLが一致しない — 重大度: 中
+
+**根拠:** `feedian/store.py`の`_create_schema`と`_migrate_v5_to_v6`
+
+**現象:** `_create_schema`は`backend`、`summary_schema_version`、`fingerprint_version`、`auth_mode`、`billing_mode`をDEFAULT無しの`NOT NULL`で作る。一方マイグレーションは同じ列をDEFAULT付きで追加する。SQLiteは既存行のあるテーブルへ`NOT NULL`列を足す際にDEFAULTを要求するため、マイグレーション側からDEFAULTを外すことはできない。
+
+**影響:** 同じ`schema_version = 6`でも、新規DBと移行済みDBでDDLが異なる。将来のマイグレーションやスキーマ比較の前提が崩れる。
+
+**対応:** 採用。`_create_schema`をマイグレーションと同じDEFAULT付きへ揃えた。`PRAGMA table_info`で両者の列定義が一致することを回帰テストで固定している。
+
+### 38. fallbackのテストが実行環境の一時ディレクトリに依存する — 重大度: 低
+
+**現象:** `isolated_local_agent_parent`はシステム一時ディレクトリの祖先を`.git`の有無で走査する。`TMPDIR`がGit管理下にある環境では、fallbackの検証に入る前に`BackendPolicyError`で失敗する。
+
+**対応:** 採用。既存テストと同じく`tempfile.gettempdir`を固定した。
+
+### 39・40. Markdownの整形 — 重大度: 低
+
+コードフェンスの言語指定（MD040）3箇所と、`Codex補足レビューの採否`表の列数不一致を修正した。後者はヘッダーが4列に対して本文が3列で、指摘名の列が欠落していた。
+
+### 不採用とした指摘
+
+| 指摘 | 採否 | 理由 |
+| --- | --- | --- |
+| `AGENTS.md`の`最終案`省略規則を修正する | 不採用 | レビュー不要時に`最終案`を省略できる規則は矛盾ではなく意図である。レビューが無ければ草案がそのまま結論であり、同じ内容を持つ節を別に作っても情報が増えない。当該規則は「ステータスは`確定`とする」と併記しており、この場合を検討した上で書かれている。加えてこれは本PR以前から存在する人間が定めた運用規約であり、bot指摘だけを根拠に変更しない |
+| `docs/specs/llm-backends.ja.md`を日付付きへ改名する | 不採用 | 本PRが触れていない既存ファイルである。規約自身が「一度付けた名前を変更しない」と定めており、さらに確定版`20260816-llm-backends.ja.md`が本文でこのファイル名を参照している。確定仕様は編集しない規約であるため、改名すると参照が壊れる。命名規約より前に作られた文書の扱いは、必要なら別途決める |
+
+### `ingest.py:204`について
+
+CodeRabbitとCodexの双方が同じfallback隔離の問題を指摘した。CodeRabbitのレビュー対象commitは`c47f463`であり、`e02e872`（指摘34）で修正済みである。
+
+### 検証
+
+- [x] テストスイートが緑である（253件）。`ruff check`も通る。
+- [x] 新規DBと移行済みDBの`llm_run`列定義が`PRAGMA table_info`で一致する。
+- [x] fallbackのテストが`tempfile.gettempdir`の固定により環境非依存になった。

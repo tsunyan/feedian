@@ -496,3 +496,41 @@ def test_failed_v4_migration_leaves_the_database_at_version_four(tmp_path, monke
 
     assert version == "4"
     assert "response_etag" not in columns
+
+
+def test_a_migrated_database_has_the_same_llm_run_columns_as_a_fresh_one(tmp_path) -> None:
+    """Same schema_version must mean the same table, however it got there.
+
+    SQLite needs a default when a NOT NULL column joins a populated table, so the
+    migration has to supply one; a fresh database must declare the same defaults
+    or the two diverge under one version number.
+    """
+
+    def llm_run_columns(path) -> dict[str, tuple]:
+        store = VaultStore.open(path, allow_migration=True)
+        try:
+            assert store.schema_version() == 6
+            rows = store.connection.execute("PRAGMA table_info(llm_run)").fetchall()
+            return {row[1]: (row[2], row[3], row[5]) for row in rows}
+        finally:
+            store.close()
+
+    fresh_path = tmp_path / "fresh.sqlite3"
+    fresh_columns = llm_run_columns(fresh_path)
+
+    migrated_path = tmp_path / "migrated.sqlite3"
+    VaultStore.open(migrated_path).close()
+    connection = sqlite3.connect(migrated_path)
+    try:
+        connection.execute("DROP INDEX IF EXISTS llm_run_reuse_idx")
+        for column in (
+            "backend", "summary_schema_version", "fingerprint_version",
+            "auth_mode", "billing_mode", "backend_metadata_json", "duration_ms",
+        ):
+            connection.execute(f"ALTER TABLE llm_run DROP COLUMN {column}")
+        connection.execute("UPDATE schema_meta SET value = '5' WHERE key = 'schema_version'")
+        connection.commit()
+    finally:
+        connection.close()
+
+    assert llm_run_columns(migrated_path) == fresh_columns

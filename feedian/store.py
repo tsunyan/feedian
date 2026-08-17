@@ -1269,11 +1269,15 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             resource_id TEXT REFERENCES resource(resource_id),
             resource_revision_id TEXT REFERENCES resource_revision(resource_revision_id),
             operation TEXT NOT NULL,
-            backend TEXT NOT NULL,
+            -- The defaults match what _migrate_v5_to_v6 must use: SQLite requires
+            -- one when adding a NOT NULL column to a table that already has rows.
+            -- Without them a fresh database and a migrated one would carry
+            -- different DDL under the same schema_version.
+            backend TEXT NOT NULL DEFAULT 'unknown',
             model TEXT NOT NULL,
             prompt_version TEXT NOT NULL,
-            summary_schema_version TEXT NOT NULL,
-            fingerprint_version INTEGER NOT NULL,
+            summary_schema_version TEXT NOT NULL DEFAULT 'unknown',
+            fingerprint_version INTEGER NOT NULL DEFAULT 1,
             input_fingerprint TEXT NOT NULL,
             request_json TEXT NOT NULL,
             response_json TEXT,
@@ -1282,8 +1286,8 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             price_json TEXT,
             status TEXT NOT NULL,
             error TEXT,
-            auth_mode TEXT NOT NULL,
-            billing_mode TEXT NOT NULL,
+            auth_mode TEXT NOT NULL DEFAULT 'unknown',
+            billing_mode TEXT NOT NULL DEFAULT 'unknown',
             backend_metadata_json TEXT NOT NULL DEFAULT '{}',
             duration_ms INTEGER,
             retry_of_llm_run_id TEXT REFERENCES llm_run(llm_run_id),

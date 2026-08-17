@@ -585,11 +585,16 @@ class _Audit:
     usage = {"input_tokens": 5, "output_tokens": 2}
 
 
-def test_enabled_fallback_runs_the_named_backend_and_records_it_separately(tmp_path) -> None:
+def test_enabled_fallback_runs_the_named_backend_and_records_it_separately(tmp_path, monkeypatch) -> None:
     """An allowance that runs out is why fallback exists; the audit must show both."""
 
     root = tmp_path / "vault"
     root.mkdir()
+    # isolated_local_agent_parent walks the system temp directory's ancestors for
+    # .git, so an unpinned TMPDIR under version control fails before the assertion.
+    system_temp = tmp_path / "system-temp"
+    system_temp.mkdir()
+    monkeypatch.setattr("feedian.local_agent.tempfile.gettempdir", lambda: str(system_temp))
     store = _vault_with_one_article(root)
     try:
         config = VaultConfig()
@@ -669,7 +674,7 @@ def test_fallback_stays_off_unless_the_config_enables_it(tmp_path) -> None:
         store.close()
 
 
-def test_a_local_fallback_runs_outside_the_vault_even_behind_an_http_primary(tmp_path) -> None:
+def test_a_local_fallback_runs_outside_the_vault_even_behind_an_http_primary(tmp_path, monkeypatch) -> None:
     """The primary picks no isolation root for the fallback; the fallback does.
 
     An HTTP primary leaves temporary_parent inside the Vault, and Codex treats
@@ -678,6 +683,11 @@ def test_a_local_fallback_runs_outside_the_vault_even_behind_an_http_primary(tmp
 
     root = tmp_path / "vault"
     root.mkdir()
+    # isolated_local_agent_parent walks the system temp directory's ancestors for
+    # .git, so an unpinned TMPDIR under version control fails before the assertion.
+    system_temp = tmp_path / "system-temp"
+    system_temp.mkdir()
+    monkeypatch.setattr("feedian.local_agent.tempfile.gettempdir", lambda: str(system_temp))
     store = _vault_with_one_article(root)
     try:
         config = VaultConfig()
