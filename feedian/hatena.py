@@ -314,6 +314,12 @@ def _read_json(request: Request, timeout_seconds: int) -> dict[str, Any]:
 
 
 def _wsse_header(username: str, api_key: str) -> str:
+    # SHA-1 is fixed by the WSSE UsernameToken profile, which Hatena's API implements:
+    # the server recomputes Base64(SHA1(nonce + created + key)) to verify. A stronger
+    # digest here fails authentication. CodeQL flags this as weak password hashing
+    # (py/weak-sensitive-data-hashing); the rule targets password storage, where an
+    # attacker brute-forces a stolen digest offline. This one goes over HTTPS with a
+    # fresh 20-byte nonce, and recovering the key from it needs a SHA-1 preimage.
     nonce = os.urandom(20)
     created = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     digest = hashlib.sha1(nonce + created.encode("utf-8") + api_key.encode("utf-8")).digest()
