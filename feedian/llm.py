@@ -94,10 +94,32 @@ PROVIDER_OUTPUT_SCHEMA["properties"]["tags"]["minItems"] = 1
 SUMMARY_SCHEMA = PROVIDER_OUTPUT_SCHEMA
 
 # The provider schema exactly as commit 2385ec2 hashed it into the reuse key.
-# The key covers the whole request, so editing PROVIDER_OUTPUT_SCHEMA would
-# otherwise stop the migration window from recognising anything ever stored.
+# Written out rather than derived: deriving it from PROVIDER_OUTPUT_SCHEMA would
+# carry any future edit into the version-one key, and the key covers the whole
+# request, so the migration window would stop recognising anything ever stored.
 # Frozen deliberately: never edit this to match a schema change.
-LEGACY_V1_PROVIDER_SCHEMA: dict[str, Any] = deepcopy(PROVIDER_OUTPUT_SCHEMA)
+LEGACY_V1_PROVIDER_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "note_title": {"type": "string", "maxLength": 80},
+        "summary": {"type": "string", "maxLength": 300},
+        "key_points": {
+            "type": "array",
+            "items": {"type": "string", "maxLength": 80},
+            "minItems": 0,
+            "maxItems": 4,
+        },
+        "tags": {
+            "type": "array",
+            "items": {"type": "string", "maxLength": 40},
+            "minItems": 1,
+            "maxItems": 6,
+        },
+        "content_type": {"type": "string"},
+    },
+    "required": ["note_title", "summary", "key_points", "tags", "content_type"],
+    "additionalProperties": False,
+}
 
 
 MANUS_UNTRUSTED_REMINDER = (

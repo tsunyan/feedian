@@ -829,3 +829,35 @@ CodeRabbitとCodexの双方が同じfallback隔離の問題を指摘した。Cod
 - [x] テストスイートが緑である（253件）。`ruff check`も通る。
 - [x] 新規DBと移行済みDBの`llm_run`列定義が`PRAGMA table_info`で一致する。
 - [x] fallbackのテストが`tempfile.gettempdir`の固定により環境非依存になった。
+
+### 41. `LEGACY_V1_PROVIDER_SCHEMA`が凍結されていない — 重大度: 中
+
+**根拠:** `feedian/llm.py`、CodeRabbitの指摘
+
+**現象:** 凍結スナップショットを`deepcopy(PROVIDER_OUTPUT_SCHEMA)`で定義していた。実行時の変更からは守られるが、**ソースを編集すれば旧キーも一緒に変わる**。凍結が守るべきなのはまさにその場合である。
+
+**影響:** 指摘2とまったく同じ失敗、すなわち移行期間中の旧キー検索が無言で一致しなくなり全記事が再課金される事態を、指摘2の修正自身が再現していた。実測値を固定した回帰テストが最後の砦として残ってはいたが、定数の定義がその意図を表していなかった。
+
+**対応:** 採用。`2385ec2`の`SUMMARY_SCHEMA`と一致するリテラルを書き下した。両者が一致することを確認済みである。
+
+### 42. 幅依存のテストがまだ2件あった — 重大度: 低
+
+**現象:** 指摘22で`tests/test_progress.py`を直したが、`tests/test_cli.py`にも幅依存が残っていた。プラン表示のテストは`COLUMNS`に加えて一時パスの長さでも折り返し位置が変わる。argparseのhelpを検証するテストも`COLUMNS`を見る。
+
+**対応:** 採用。両方で`COLUMNS`を固定した。`tests/test_cli.py`と`tests/test_progress.py`が幅40・80・200で通ることを確認した。
+
+### 43. Vaultルート自体を拒否するassertionが無い — 重大度: 低
+
+**現象:** `Path.parents`は対象パス自身を含まない。fallbackの一時親がVaultルートと等しい場合、既存のassertionは成功してしまう。
+
+**対応:** 採用。`used != root.resolve()`を追加した。
+
+### CodeRabbit指摘のうち対応済みだったもの
+
+`feedian/llm_backends.py`の「初回実行前に専用`CODEX_HOME`を作成する」は、`_verify_home`の`mkdir(parents=True, exist_ok=True)`で対応済みである。CodeRabbitのレビュー対象commitがその修正より前だった。
+
+### 検証
+
+- [x] `LEGACY_V1_PROVIDER_SCHEMA`が`2385ec2`の`SUMMARY_SCHEMA`とオブジェクトとして等しい。
+- [x] `tests/test_cli.py`と`tests/test_progress.py`が幅40・80・200で通る。
+- [x] テストスイートが緑である（253件）。`ruff check`も通る。

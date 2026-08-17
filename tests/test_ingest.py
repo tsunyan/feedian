@@ -706,6 +706,8 @@ def test_a_local_fallback_runs_outside_the_vault_even_behind_an_http_primary(tmp
         )
 
         used = fallback.summarize_kwargs["temporary_parent"].resolve()
+        # Path.parents excludes the path itself, so the Vault root would slip past.
+        assert used != root.resolve()
         assert root.resolve() not in used.parents
         assert used != (root / ".feedian" / "tmp").resolve()
     finally:

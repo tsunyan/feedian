@@ -20,7 +20,9 @@ def test_no_arguments_show_help_without_creating_files(capsys, tmp_path, monkeyp
     assert not (tmp_path / ".feedian").exists()
 
 
-def test_package_help_uses_modern_command_help(capsys) -> None:
+def test_package_help_uses_modern_command_help(capsys, monkeypatch) -> None:
+    # argparse wraps its help to COLUMNS, splitting the phrases asserted below.
+    monkeypatch.setenv("COLUMNS", "300")
     with pytest.raises(SystemExit) as exc_info:
         package_main(["--help"])
     assert exc_info.value.code == 0
@@ -117,6 +119,9 @@ def test_ingest_dry_run_prints_plan_without_writes(tmp_path, capsys, monkeypatch
     root = tmp_path / "vault"
     root.mkdir()
     monkeypatch.chdir(tmp_path)
+    # The plan is a four-column Rich grid; a narrow terminal wraps the model name
+    # out of the row this test reads back.
+    monkeypatch.setenv("COLUMNS", "300")
     monkeypatch.setenv("OPENAI_MODEL", "gpt-5.6-sol")
     assert main(["init", "--vault", str(root)]) == 0
     assert main(["migrate", "--vault", str(root)]) == 0
