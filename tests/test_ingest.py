@@ -1,9 +1,76 @@
 from __future__ import annotations
 
+import json
+
+import pytest
+
 from feedian.canonical import CanonicalItem
-from feedian.ingest import ingest_source_notes, plan_source_notes, render_source_notes
+from feedian.ingest import (
+    fallback_maximum_cost,
+    ingest_source_notes,
+    plan_source_notes,
+    render_source_notes,
+    resolve_fallback,
+)
+from feedian.llm import PROVIDER_OUTPUT_SCHEMA
+from feedian.llm_backends import (
+    BackendAudit,
+    BackendAuthError,
+    BackendCapabilities,
+    BackendPolicyError,
+    BackendRateLimitError,
+)
 from feedian.store import VaultStore
-from feedian.vault import VaultConfig, initialize_vault
+from feedian.vault import LLMFallbackSettings, VaultConfig, initialize_vault
+
+
+class FakeBackend:
+    def __init__(
+        self,
+        audit,
+        *,
+        backend: str = "openai-responses",
+        auth_mode: str = "api-key",
+        execution_kind: str = "http",
+        billing_mode: str = "metered-api",
+        error: Exception | None = None,
+    ) -> None:
+        self.audit = audit
+        self.error = error
+        self.temporary_parent = None
+        self.summarize_kwargs = {}
+        self.capabilities = BackendCapabilities(
+            backend=backend,
+            execution_kind=execution_kind,
+            auth_mode=auth_mode,
+            billing_mode=billing_mode,
+            max_article_chars=3_000 if backend == "manus-api" else 10_000,
+            usage_available=bool(getattr(audit, "usage", {})),
+        )
+
+    def default_model(self) -> str:
+        return "model"
+
+    def supports_model(self, model: str) -> bool:
+        del model
+        return True
+
+    def preflight(self):
+        return {"implementation_revision": "test"}
+
+    def summarize(self, **kwargs):
+        self.summarize_kwargs = kwargs
+        if self.error is not None:
+            raise self.error
+        return BackendAudit(
+            result=self.audit.result,
+            request=self.audit.request,
+            response=self.audit.response,
+            usage=self.audit.usage,
+            auth_mode=self.capabilities.auth_mode,
+            billing_mode=self.capabilities.billing_mode,
+            metadata={"implementation_revision": "test"},
+        )
 
 
 def test_ingest_reuses_stored_llm_result_without_calling_api(tmp_path, monkeypatch) -> None:
@@ -24,13 +91,15 @@ def test_ingest_reuses_stored_llm_result_without_calling_api(tmp_path, monkeypat
             response = {"id": "response"}
             usage = {"input_tokens": 1, "output_tokens": 1}
 
-        monkeypatch.setattr("feedian.ingest.summarize_bookmark_with_audit", lambda *args, **kwargs: Audit())
+        backend = FakeBackend(Audit())
         progress = []
         first = ingest_source_notes(
             store, root, VaultConfig(), model="gpt-5.6-terra",
-            progress=lambda *event: progress.append(event),
+            progress=lambda *event: progress.append(event), backend_instance=backend,
         )
-        second = ingest_source_notes(store, root, VaultConfig(), model="gpt-5.6-terra")
+        second = ingest_source_notes(
+            store, root, VaultConfig(), model="gpt-5.6-terra", backend_instance=backend
+        )
         written, skipped = render_source_notes(store, root, VaultConfig())
 
         assert first.created == 1
@@ -60,14 +129,12 @@ def test_ingest_dry_run_plans_without_api_key_or_writes(tmp_path, monkeypatch) -
             )
         )
         store.record_resource_revision(item.resource_id or "", content_markdown="Body", title="Article")
-        monkeypatch.setattr(
-            "feedian.ingest.summarize_bookmark_with_audit",
-            lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("API called")),
-        )
+        backend = FakeBackend(None, error=AssertionError("API called"))
 
-        plan = plan_source_notes(store, model="gpt-5.6-terra")
+        plan = plan_source_notes(store, model="gpt-5.6-terra", backend_instance=backend)
         report = ingest_source_notes(
             store, root, VaultConfig(), model="gpt-5.6-terra", dry_run=True,
+            backend_instance=backend,
         )
 
         assert len(plan.candidates) == 1
@@ -137,8 +204,10 @@ def test_plan_uses_historical_output_ratio_for_expected_cost(tmp_path, monkeypat
             response = {"id": "response"}
             usage = {"input_tokens": 1000, "output_tokens": 100}
 
-        monkeypatch.setattr("feedian.ingest.summarize_bookmark_with_audit", lambda *args, **kwargs: Audit())
-        ingest_source_notes(store, root, VaultConfig(), model="gpt-5.6-terra")
+        backend = FakeBackend(Audit())
+        ingest_source_notes(
+            store, root, VaultConfig(), model="gpt-5.6-terra", backend_instance=backend
+        )
         second_item = store.upsert_canonical_item(
             CanonicalItem(
                 source="hatena", source_id="two", content_key="url:two",
@@ -147,7 +216,7 @@ def test_plan_uses_historical_output_ratio_for_expected_cost(tmp_path, monkeypat
         )
         store.record_resource_revision(second_item.resource_id or "", content_markdown="Two body", title="Two")
 
-        plan = plan_source_notes(store, model="gpt-5.6-terra")
+        plan = plan_source_notes(store, model="gpt-5.6-terra", backend_instance=backend)
 
         assert plan.usage_records == 1
         assert plan.estimated_output_tokens is not None
@@ -179,17 +248,22 @@ def test_llm_run_records_the_request_that_was_actually_sent(tmp_path, monkeypatc
             response = {"id": "response"}
             usage: dict[str, int] = {}
 
-        monkeypatch.setattr("feedian.ingest.summarize_bookmark_with_audit", lambda *args, **kwargs: Audit())
-        ingest_source_notes(store, root, VaultConfig(), model="manus-1.6", provider="manus")
+        backend = FakeBackend(Audit(), backend="manus-api")
+        ingest_source_notes(
+            store, root, VaultConfig(), model="manus-1.6", provider="manus",
+            backend_instance=backend,
+        )
 
-        stored = store.connection.execute("SELECT request_json FROM llm_run").fetchone()[0]
-        assert "sent to manus" in stored
-        assert "input_text" not in stored
+        stored = json.loads(
+            store.connection.execute("SELECT request_json FROM llm_run").fetchone()[0]
+        )
+        assert stored["actual"]["message"]["content"] == "sent to manus"
+        assert stored["logical"]["input"][0]["content"][0]["type"] == "input_text"
     finally:
         store.close()
 
 
-def test_failed_run_keeps_the_request_it_started_with(tmp_path, monkeypatch) -> None:
+def test_failed_run_keeps_a_stable_logical_and_actual_request_envelope(tmp_path, monkeypatch) -> None:
     root = tmp_path / "vault"
     root.mkdir()
     initialize_vault(root)
@@ -203,17 +277,61 @@ def test_failed_run_keeps_the_request_it_started_with(tmp_path, monkeypatch) -> 
             )
         )
         store.record_resource_revision(item.resource_id or "", content_markdown="Body", title="Article")
-        monkeypatch.setattr(
-            "feedian.ingest.summarize_bookmark_with_audit",
-            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
-        )
+        backend = FakeBackend(None, error=RuntimeError("boom"))
 
-        report = ingest_source_notes(store, root, VaultConfig(), model="gpt-5.6-terra")
+        report = ingest_source_notes(
+            store, root, VaultConfig(), model="gpt-5.6-terra", backend_instance=backend
+        )
 
         row = store.connection.execute("SELECT status, request_json FROM llm_run").fetchone()
         assert report.failed == 1
         assert row[0] == "failed"
-        assert "input_text" in row[1]
+        request = json.loads(row[1])
+        assert request["logical"]["input"][0]["content"][0]["type"] == "input_text"
+        assert request["actual"] is None
+    finally:
+        store.close()
+
+
+def test_local_backend_runs_outside_the_vault_project(tmp_path, monkeypatch) -> None:
+    root = tmp_path / "vault"
+    root.mkdir()
+    initialize_vault(root)
+    (root / ".git").mkdir()
+    (root / "AGENTS.md").write_text("project instructions", encoding="utf-8")
+    system_temp = tmp_path / "system-temp"
+    system_temp.mkdir()
+    monkeypatch.setattr("feedian.local_agent.tempfile.gettempdir", lambda: str(system_temp))
+    store = VaultStore.open(root / ".feedian" / "feedian.sqlite3")
+    try:
+        item = store.upsert_canonical_item(
+            CanonicalItem(
+                source="hatena", source_id="one", content_key="url:one",
+                url="https://example.test", title="Article",
+            )
+        )
+        store.record_resource_revision(item.resource_id or "", content_markdown="Body", title="Article")
+
+        class Audit:
+            result = {
+                "note_title": "One", "summary": "Short", "key_points": [],
+                "tags": [], "content_type": "",
+            }
+            request = {"mode": "stdin", "argv": ["codex-test", "exec", "-"]}
+            response = {}
+            usage = {}
+
+        backend = FakeBackend(
+            Audit(), backend="codex-local", auth_mode="local-session", execution_kind="local-agent",
+            billing_mode="subscription",
+        )
+        ingest_source_notes(
+            store, root, VaultConfig(), model="gpt-test", backend="codex-local",
+            backend_instance=backend,
+        )
+
+        assert backend.summarize_kwargs["temporary_parent"] == system_temp.resolve()
+        assert root.resolve() not in system_temp.resolve().parents
     finally:
         store.close()
 
@@ -239,11 +357,14 @@ def test_ingest_counts_requests_it_cannot_price_or_meter(tmp_path, monkeypatch) 
             response = {"id": "response"}
             usage: dict[str, int] = {}
 
-        monkeypatch.setattr("feedian.ingest.summarize_bookmark_with_audit", lambda *args, **kwargs: Audit())
+        backend = FakeBackend(Audit(), backend="manus-api")
 
-        plan = plan_source_notes(store, model="manus-1.6", provider="manus")
+        plan = plan_source_notes(
+            store, model="manus-1.6", provider="manus", backend_instance=backend
+        )
         report = ingest_source_notes(
             store, root, VaultConfig(), model="manus-1.6", provider="manus", plan=plan,
+            backend_instance=backend,
         )
 
         # A provider Feedian cannot price must not read as a completed free run.
@@ -252,5 +373,381 @@ def test_ingest_counts_requests_it_cannot_price_or_meter(tmp_path, monkeypatch) 
         assert report.cost_usd == 0.0
         assert report.unpriced_requests == 1
         assert report.unmetered_requests == 1
+        row = store.connection.execute(
+            "SELECT backend, auth_mode, billing_mode, usage_json FROM llm_run"
+        ).fetchone()
+        assert tuple(row) == ("manus-api", "api-key", "metered-api", None)
+    finally:
+        store.close()
+
+
+def test_results_are_not_reused_across_backend_boundaries(tmp_path) -> None:
+    root = tmp_path / "vault"
+    root.mkdir()
+    initialize_vault(root)
+    store = VaultStore.open(root / ".feedian" / "feedian.sqlite3")
+    try:
+        item = store.upsert_canonical_item(
+            CanonicalItem(
+                source="hatena", source_id="one", content_key="url:one",
+                url="https://example.test", title="Article",
+            )
+        )
+        store.record_resource_revision(item.resource_id or "", content_markdown="Body", title="Article")
+
+        class Audit:
+            result = {"note_title": "One", "summary": "Short", "key_points": [], "tags": [], "content_type": ""}
+            request = {}
+            response = {}
+            usage = {"input_tokens": 1, "output_tokens": 1}
+
+        openai = FakeBackend(Audit())
+        ingest_source_notes(
+            store, root, VaultConfig(), model="same-model", backend_instance=openai
+        )
+        manus = FakeBackend(Audit(), backend="manus-api")
+        plan = plan_source_notes(
+            store, model="same-model", backend="manus-api", backend_instance=manus
+        )
+
+        assert plan.new_requests == 1
+        assert plan.reusable == 0
+    finally:
+        store.close()
+
+
+def test_legacy_fingerprint_is_reused_and_promoted_without_an_api_call(tmp_path) -> None:
+    root = tmp_path / "vault"
+    root.mkdir()
+    initialize_vault(root)
+    store = VaultStore.open(root / ".feedian" / "feedian.sqlite3")
+    try:
+        item = store.upsert_canonical_item(
+            CanonicalItem(
+                source="hatena", source_id="one", content_key="url:one",
+                url="https://example.test", title="Article",
+            )
+        )
+        revision, _ = store.record_resource_revision(
+            item.resource_id or "", content_markdown="Body", title="Article"
+        )
+
+        class Audit:
+            result = {"note_title": "One", "summary": "Short", "key_points": [], "tags": [], "content_type": ""}
+            request = {}
+            response = {}
+            usage = {}
+
+        backend = FakeBackend(Audit())
+        candidate = plan_source_notes(
+            store, model="gpt-test", force=True, backend_instance=backend
+        ).candidates[0]
+        run_id = store.start_llm_run(
+            resource_id=item.resource_id or "",
+            resource_revision_id=revision,
+            operation="source-note",
+            model="gpt-test",
+            prompt_version="source-note-v1",
+            input_fingerprint=candidate.legacy_fingerprint,
+            request={"provider": "openai"},
+            backend="openai-responses",
+            summary_schema_version="1",
+            fingerprint_version=1,
+            auth_mode="api-key",
+            billing_mode="metered-api",
+        )
+        store.finish_llm_run(run_id, result=Audit.result)
+
+        plan = plan_source_notes(store, model="gpt-test", backend_instance=backend)
+        planned = store.connection.execute(
+            "SELECT fingerprint_version, input_fingerprint FROM llm_run WHERE llm_run_id = ?",
+            (run_id,),
+        ).fetchone()
+
+        assert plan.reusable == 1
+        # Planning runs outside the write lock, so it must leave the row alone.
+        assert tuple(planned) == (1, candidate.legacy_fingerprint)
+
+        ingest_source_notes(
+            store, root, VaultConfig(), model="gpt-test", plan=plan, backend_instance=backend,
+        )
+        migrated = store.connection.execute(
+            """
+            SELECT fingerprint_version, input_fingerprint, backend_metadata_json
+            FROM llm_run WHERE llm_run_id = ?
+            """,
+            (run_id,),
+        ).fetchone()
+
+        assert tuple(migrated[:2]) == (2, candidate.fingerprint)
+        assert json.loads(migrated[2])["legacy_fingerprint_promoted"] is True
+    finally:
+        store.close()
+
+
+def test_legacy_fingerprint_matches_the_key_the_previous_release_stored(tmp_path) -> None:
+    """Pin the version-one reuse key to the value 2385ec2 actually wrote.
+
+    The key hashes the whole request, so any edit to the summary schema silently
+    stops the migration window from finding reusable results. This literal was
+    computed by running that commit's build_summary_request over this fixture.
+    """
+
+    root = tmp_path / "vault"
+    root.mkdir()
+    initialize_vault(root)
+    store = VaultStore.open(root / ".feedian" / "feedian.sqlite3")
+    try:
+        item = store.upsert_canonical_item(
+            CanonicalItem(
+                source="hatena", source_id="one", content_key="url:one",
+                url="https://example.test", title="Article",
+            )
+        )
+        store.record_resource_revision(
+            item.resource_id or "", content_markdown="Body", title="Article"
+        )
+
+        candidate = plan_source_notes(
+            store, model="gpt-test", backend_instance=FakeBackend(None)
+        ).candidates[0]
+
+        assert candidate.legacy_fingerprint == (
+            "b2cccd34551a6f6eefca14a5a31af494413d33ee4f84c2fd3bedd781f088cd95"
+        )
+    finally:
+        store.close()
+
+
+def test_legacy_fingerprint_is_isolated_from_provider_schema_changes(tmp_path) -> None:
+    """Changing what providers are asked for must not end the migration window.
+
+    The current key covers the whole request and is meant to move; the version-one
+    key is rebuilt from a frozen schema and must not.
+    """
+
+    root = tmp_path / "vault"
+    root.mkdir()
+    initialize_vault(root)
+    store = VaultStore.open(root / ".feedian" / "feedian.sqlite3")
+    try:
+        item = store.upsert_canonical_item(
+            CanonicalItem(
+                source="hatena", source_id="one", content_key="url:one",
+                url="https://example.test", title="Article",
+            )
+        )
+        store.record_resource_revision(
+            item.resource_id or "", content_markdown="Body", title="Article"
+        )
+
+        def plan() -> object:
+            return plan_source_notes(
+                store, model="gpt-test", backend_instance=FakeBackend(None)
+            ).candidates[0]
+
+        before = plan()
+        original = PROVIDER_OUTPUT_SCHEMA["properties"]["tags"]["minItems"]
+        PROVIDER_OUTPUT_SCHEMA["properties"]["tags"]["minItems"] = 2
+        try:
+            after = plan()
+        finally:
+            PROVIDER_OUTPUT_SCHEMA["properties"]["tags"]["minItems"] = original
+
+        assert after.fingerprint != before.fingerprint
+        assert after.legacy_fingerprint == before.legacy_fingerprint
+    finally:
+        store.close()
+
+
+def _vault_with_one_article(root):
+    initialize_vault(root)
+    store = VaultStore.open(root / ".feedian" / "feedian.sqlite3")
+    item = store.upsert_canonical_item(
+        CanonicalItem(
+            source="hatena", source_id="one", content_key="url:one",
+            url="https://example.test", title="Article",
+        )
+    )
+    store.record_resource_revision(
+        item.resource_id or "", content_markdown="Body", title="Article"
+    )
+    return store
+
+
+class _Audit:
+    result = {
+        "note_title": "One", "summary": "Short", "key_points": [],
+        "tags": ["one"], "content_type": "article",
+    }
+    request = {}
+    response = {"id": "response"}
+    usage = {"input_tokens": 5, "output_tokens": 2}
+
+
+def test_enabled_fallback_runs_the_named_backend_and_records_it_separately(tmp_path, monkeypatch) -> None:
+    """An allowance that runs out is why fallback exists; the audit must show both."""
+
+    root = tmp_path / "vault"
+    root.mkdir()
+    # isolated_local_agent_parent walks the system temp directory's ancestors for
+    # .git, so an unpinned TMPDIR under version control fails before the assertion.
+    system_temp = tmp_path / "system-temp"
+    system_temp.mkdir()
+    monkeypatch.setattr("feedian.local_agent.tempfile.gettempdir", lambda: str(system_temp))
+    store = _vault_with_one_article(root)
+    try:
+        config = VaultConfig()
+        config.llm.fallback = LLMFallbackSettings(
+            enabled=True, backend="openai-responses", model="gpt-5.6-terra"
+        )
+        primary = FakeBackend(
+            None, backend="codex-local", execution_kind="local-agent",
+            auth_mode="local-session", billing_mode="subscription",
+            error=BackendRateLimitError("weekly allowance reached"),
+        )
+        fallback = FakeBackend(_Audit())
+
+        report = ingest_source_notes(
+            store, root, config, model="gpt-test", backend="codex-local",
+            backend_instance=primary, fallback_instance=fallback,
+        )
+
+        rows = store.connection.execute(
+            "SELECT backend, model, status FROM llm_run ORDER BY started_at"
+        ).fetchall()
+        assert report.created == 1
+        assert report.failed == 0
+        assert [tuple(row) for row in rows] == [
+            ("codex-local", "gpt-test", "failed"),
+            ("openai-responses", "gpt-5.6-terra", "completed"),
+        ]
+    finally:
+        store.close()
+
+
+def test_fallback_does_not_rescue_a_credential_or_policy_failure(tmp_path) -> None:
+    """A rejected credential is a fault to fix, not a reason to start billing."""
+
+    root = tmp_path / "vault"
+    root.mkdir()
+    store = _vault_with_one_article(root)
+    try:
+        config = VaultConfig()
+        config.llm.fallback = LLMFallbackSettings(
+            enabled=True, backend="openai-responses", model="gpt-5.6-terra"
+        )
+        primary = FakeBackend(
+            None, backend="codex-local", execution_kind="local-agent",
+            auth_mode="local-session", billing_mode="subscription",
+            error=BackendAuthError("not logged in"),
+        )
+        fallback = FakeBackend(_Audit(), error=AssertionError("fallback must not run"))
+
+        report = ingest_source_notes(
+            store, root, config, model="gpt-test", backend="codex-local",
+            backend_instance=primary, fallback_instance=fallback,
+        )
+
+        assert report.failed == 1
+        assert report.created == 0
+        assert store.connection.execute("SELECT COUNT(*) FROM llm_run").fetchone()[0] == 1
+    finally:
+        store.close()
+
+
+def test_fallback_stays_off_unless_the_config_enables_it(tmp_path) -> None:
+    root = tmp_path / "vault"
+    root.mkdir()
+    store = _vault_with_one_article(root)
+    try:
+        primary = FakeBackend(None, error=BackendRateLimitError("429"))
+        fallback = FakeBackend(_Audit(), error=AssertionError("fallback must not run"))
+
+        report = ingest_source_notes(
+            store, root, VaultConfig(), model="gpt-test", backend_instance=primary,
+            fallback_instance=fallback,
+        )
+
+        assert report.failed == 1
+    finally:
+        store.close()
+
+
+def test_a_local_fallback_runs_outside_the_vault_even_behind_an_http_primary(tmp_path, monkeypatch) -> None:
+    """The primary picks no isolation root for the fallback; the fallback does.
+
+    An HTTP primary leaves temporary_parent inside the Vault, and Codex treats
+    its cwd as a project, so running there would reinstate project instructions.
+    """
+
+    root = tmp_path / "vault"
+    root.mkdir()
+    # isolated_local_agent_parent walks the system temp directory's ancestors for
+    # .git, so an unpinned TMPDIR under version control fails before the assertion.
+    system_temp = tmp_path / "system-temp"
+    system_temp.mkdir()
+    monkeypatch.setattr("feedian.local_agent.tempfile.gettempdir", lambda: str(system_temp))
+    store = _vault_with_one_article(root)
+    try:
+        config = VaultConfig()
+        config.llm.fallback = LLMFallbackSettings(
+            enabled=True, backend="codex-local", model="gpt-test"
+        )
+        primary = FakeBackend(None, error=BackendRateLimitError("429"))
+        fallback = FakeBackend(
+            _Audit(), backend="codex-local", execution_kind="local-agent",
+            auth_mode="local-session", billing_mode="subscription",
+        )
+
+        ingest_source_notes(
+            store, root, config, model="gpt-test", backend_instance=primary,
+            fallback_instance=fallback,
+        )
+
+        used = fallback.summarize_kwargs["temporary_parent"].resolve()
+        # Path.parents excludes the path itself, so the Vault root would slip past.
+        assert used != root.resolve()
+        assert root.resolve() not in used.parents
+        assert used != (root / ".feedian" / "tmp").resolve()
+    finally:
+        store.close()
+
+
+def test_a_fallback_model_the_destination_cannot_serve_is_refused(tmp_path) -> None:
+    """Recorded provenance would otherwise name a model that never ran."""
+
+    config = VaultConfig()
+    config.llm.fallback = LLMFallbackSettings(
+        enabled=True, backend="manus-api", model="gpt-5.6-terra"
+    )
+
+    with pytest.raises(BackendPolicyError, match="does not support model"):
+        resolve_fallback(config, "openai-responses")
+
+
+def test_the_plan_states_what_an_enabled_metered_fallback_could_cost(tmp_path) -> None:
+    """A subscription primary reports no cost, so the fallback states its own."""
+
+    root = tmp_path / "vault"
+    root.mkdir()
+    store = _vault_with_one_article(root)
+    try:
+        subscription = FakeBackend(
+            None, backend="codex-local", execution_kind="local-agent",
+            auth_mode="local-session", billing_mode="subscription",
+        )
+        plan = plan_source_notes(
+            store, model="gpt-5.6-terra", backend="codex-local", backend_instance=subscription,
+        )
+        metered = FakeBackend(_Audit())
+        config = VaultConfig()
+        config.llm.fallback = LLMFallbackSettings(
+            enabled=True, backend="openai-responses", model="gpt-5.6-terra"
+        )
+        fallback = resolve_fallback(config, "codex-local", backend_instance=metered)
+
+        assert plan.max_cost_usd is None
+        assert fallback_maximum_cost(plan, fallback) > 0
     finally:
         store.close()

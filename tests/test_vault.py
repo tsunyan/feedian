@@ -4,7 +4,14 @@ import json
 
 import pytest
 
-from feedian.vault import find_vault_root, initialize_vault, load_vault_config, save_default_vault, user_settings_path
+from feedian.vault import (
+    find_vault_root,
+    initialize_vault,
+    load_vault_config,
+    migrate_vault_config,
+    save_default_vault,
+    user_settings_path,
+)
 
 
 def test_initialize_vault_creates_portable_config(tmp_path) -> None:
@@ -18,6 +25,8 @@ def test_initialize_vault_creates_portable_config(tmp_path) -> None:
     ignored = (root / ".feedian" / ".gitignore").read_text(encoding="utf-8").splitlines()
     assert {"staging/", "tmp/", "scheduled-run.cmd"}.issubset(ignored)
     assert config.raw_folder == "raw"
+    assert config.format_version == 2
+    assert config.llm.backend == "openai-responses"
     assert config.provider_output_folder("hatena").as_posix() == "raw/Hatena"
     assert "vault_path" not in json.loads(paths.config_path.read_text(encoding="utf-8"))
 
@@ -54,7 +63,7 @@ def test_load_vault_config_accepts_rss_feeds(tmp_path) -> None:
     initialize_vault(root)
     config_path = root / ".feedian" / "config.json"
     config_path.write_text(
-        '{"providers":{"rss":{"folder":"RSS","enabled":true,"poll_hours":6,"feeds":["https://example.test/feed.xml"]}}}',
+        '{"format_version":2,"providers":{"rss":{"folder":"RSS","enabled":true,"poll_hours":6,"feeds":["https://example.test/feed.xml"]}}}',
         encoding="utf-8",
     )
     config = load_vault_config(root)
@@ -69,6 +78,7 @@ def test_load_vault_config_accepts_rss_feed_routing(tmp_path) -> None:
     config_path = root / ".feedian" / "config.json"
     config_path.write_text(
         """{
+          "format_version": 2,
           "providers": {
             "rss": {
               "folder": "RSS",
@@ -96,3 +106,49 @@ def test_load_vault_config_accepts_rss_feed_routing(tmp_path) -> None:
     assert settings.feeds[0].folder == "Example Feed"
     assert settings.feeds[0].tags == ["news"]
     assert settings.feeds[0].route == "reading"
+
+
+def test_v1_config_requires_explicit_migration(tmp_path) -> None:
+    root = tmp_path / "vault"
+    root.mkdir()
+    initialize_vault(root)
+    config_path = root / ".feedian" / "config.json"
+    config_path.write_text('{"format_version":1,"source_folder":"notes"}', encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="migration is required"):
+        load_vault_config(root)
+
+    assert migrate_vault_config(root) is True
+    config = load_vault_config(root)
+    assert config.format_version == 2
+    assert config.source_folder == "notes"
+    assert config.llm.backend == "openai-responses"
+    assert migrate_vault_config(root) is False
+
+
+def test_enabled_fallback_requires_both_a_backend_and_a_model(tmp_path) -> None:
+    """Feedian never picks the destination itself, so the config must name it."""
+
+    root = tmp_path / "vault"
+    root.mkdir()
+    initialize_vault(root)
+    config_path = root / ".feedian" / "config.json"
+    config_path.write_text(
+        '{"format_version":2,"llm":{"backend":"codex-local","model":"gpt-test",'
+        '"fallback":{"enabled":true,"backend":"openai-responses"}}}',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="requires both backend and model"):
+        load_vault_config(root)
+
+    config_path.write_text(
+        '{"format_version":2,"llm":{"backend":"codex-local","model":"gpt-test",'
+        '"fallback":{"enabled":true,"backend":"openai-responses","model":"gpt-5.6-terra"}}}',
+        encoding="utf-8",
+    )
+    config = load_vault_config(root)
+
+    assert config.llm.fallback.enabled
+    assert config.llm.fallback.backend == "openai-responses"
+    assert config.llm.fallback.model == "gpt-5.6-terra"

@@ -17,7 +17,14 @@ from .cli_ui import (
     print_ingest_plan,
 )
 from .env import load_env_file
-from .ingest import ingest_source_notes, plan_source_notes, render_source_notes
+from .ingest import (
+    ingest_source_notes,
+    plan_source_notes,
+    render_source_notes,
+    fallback_maximum_cost,
+    resolve_fallback,
+)
+from .llm_backends import BACKEND_IDS, canonical_backend_id, get_backend
 from .notifications import notify_windows
 from .progress import PROGRESS_MODES, ProgressReporter
 from .restore import download_and_restore, restore_database
@@ -34,6 +41,7 @@ from .vault import (
     find_vault_root,
     initialize_vault,
     load_vault_config,
+    migrate_vault_config,
     save_default_vault,
     user_env_path,
     vault_paths,
@@ -128,12 +136,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     ingest = subparsers.add_parser("ingest", help="Use the LLM to create source notes from stored resources.")
     ingest.add_argument("--vault", help="Vault root. Defaults to the current or configured Vault.")
-    ingest.add_argument("--model", help="Model/profile for this run. Uses the provider default when omitted.")
-    ingest.add_argument(
-        "--provider", choices=("openai", "manus"),
-        default=os.environ.get("LLM_PROVIDER", "openai"),
-        help="LLM provider for this run (default: openai).",
+    ingest.add_argument("--model", help="Model/profile for this run. Uses the backend setting when omitted.")
+    backend_group = ingest.add_mutually_exclusive_group()
+    backend_group.add_argument(
+        "--backend", choices=BACKEND_IDS,
+        help="LLM execution backend. Defaults to the Vault config.",
     )
+    backend_group.add_argument("--provider", choices=("openai", "manus"), help=argparse.SUPPRESS)
     ingest.add_argument("--language", default="Japanese")
     ingest.add_argument("--limit", type=int)
     ingest.add_argument("--force", action="store_true", help="Ignore matching successful LLM results and run again.")
@@ -238,6 +247,8 @@ def _migrate(explicit_vault: str | None) -> int:
     paths.state_dir.mkdir(parents=True, exist_ok=True)
     backup_path: Path | None = None
     with vault_write_lock(paths.state_dir):
+        if migrate_vault_config(root):
+            print(f"migration: vault config upgraded to format_version=2: {paths.config_path}")
         if paths.database_path.exists() and _database_schema_version(paths.database_path) < SCHEMA_VERSION:
             backup_path = paths.state_dir / "tmp" / f"migration-v{_database_schema_version(paths.database_path)}.sqlite3"
             print(f"migration: creating temporary safety backup: {backup_path}")
@@ -607,20 +618,40 @@ def _ingest(args: argparse.Namespace) -> int:
         raise FileNotFoundError(f"Database not found: {paths.database_path}; run feedian sync first.")
     store = VaultStore.open(paths.database_path)
     try:
-        model = args.model or (
-            os.environ.get("MANUS_MODEL", "manus-1.6")
-            if args.provider == "manus"
-            else os.environ.get("OPENAI_MODEL", "gpt-5.6-terra")
+        legacy_environment = os.environ.get("LLM_PROVIDER", "").strip()
+        backend_id = canonical_backend_id(
+            args.backend or args.provider or os.environ.get("LLM_BACKEND", "").strip()
+            or legacy_environment or config.llm.backend
         )
+        backend = get_backend(backend_id)
+        fallback = resolve_fallback(config, backend_id)
+        fallback_label = (
+            f"{fallback.backend_id} / {fallback.model}" if fallback is not None else ""
+        )
+        configured_backend = canonical_backend_id(config.llm.backend)
+        backend_model_environment = {
+            "openai-responses": "OPENAI_MODEL",
+            "manus-api": "MANUS_MODEL",
+            "codex-local": "CODEX_MODEL",
+            "claude-code-local": "CLAUDE_CODE_MODEL",
+        }[backend_id]
+        environment_model = os.environ.get(backend_model_environment, "").strip()
+        model = args.model or (
+            environment_model
+            or (config.llm.model if backend_id == configured_backend else "")
+            or backend.default_model()
+        )
+        if not model:
+            raise ValueError(f"A model must be configured for backend {backend_id}.")
         if args.limit is not None and args.limit < 0:
             raise ValueError("--limit must be zero or greater.")
         if args.dry_run:
             plan = plan_source_notes(
                 store, model=model, language=args.language, limit=args.limit,
-                force=args.force, auto=args.auto, provider=args.provider,
+                force=args.force, auto=args.auto, backend=backend_id, backend_instance=backend,
             )
             print_ingest_plan(
-                plan, provider=args.provider, model=model, dry_run=True, command=args._invocation,
+                plan, backend=backend_id, fallback=fallback_label, fallback_max_cost_usd=fallback_maximum_cost(plan, fallback), model=model, dry_run=True, command=args._invocation,
             )
             return 0
 
@@ -628,10 +659,10 @@ def _ingest(args: argparse.Namespace) -> int:
         with vault_write_lock(paths.state_dir):
             plan = plan_source_notes(
                 store, model=model, language=args.language, limit=args.limit,
-                force=args.force, auto=args.auto, provider=args.provider,
+                force=args.force, auto=args.auto, backend=backend_id, backend_instance=backend,
             )
             print_ingest_plan(
-                plan, provider=args.provider, model=model, dry_run=False, command=args._invocation,
+                plan, backend=backend_id, fallback=fallback_label, fallback_max_cost_usd=fallback_maximum_cost(plan, fallback), model=model, dry_run=False, command=args._invocation,
             )
 
             with reporter:
@@ -657,7 +688,8 @@ def _ingest(args: argparse.Namespace) -> int:
                 report = ingest_source_notes(
                     store, root, config, model=model, language=args.language,
                     limit=args.limit, force=args.force, auto=args.auto,
-                    progress=ingest_progress, plan=plan, provider=args.provider,
+                    progress=ingest_progress, plan=plan, backend=backend_id,
+                    backend_instance=backend,
                 )
                 written, skipped = render_source_notes(store, root, config)
         print(

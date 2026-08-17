@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
+import time
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -11,10 +12,17 @@ from urllib.parse import urlsplit
 
 from .estimate import MODEL_PRICES, comparison_model, count_prompt_tokens, usage_cost_usd
 from .extract import PageFetchResult
-from .llm import SUMMARY_INSTRUCTIONS, build_summary_request, summarize_bookmark_with_audit
+from .llm import (
+    CANONICAL_SUMMARY_SCHEMA_VERSION,
+    LEGACY_V1_PROVIDER_SCHEMA,
+    SUMMARY_INSTRUCTIONS,
+    build_summary_request,
+)
+from .llm_backends import BackendPolicyError, LLMBackend, canonical_backend_id, get_backend
+from .local_agent import isolated_local_agent_parent, sanitize_error
 from .markdown import escape_markdown_heading, sanitize_filename, yaml_frontmatter
 from .store import VaultStore, stable_json
-from .vault import VaultConfig
+from .vault import VaultConfig, vault_paths
 
 
 PROMPT_VERSION = "source-note-v1"
@@ -44,6 +52,7 @@ class IngestCandidate:
     metadata: dict[str, Any]
     request: dict[str, Any]
     fingerprint: str
+    legacy_fingerprint: str
     cached_result: dict[str, Any] | None
     input_tokens: int
     topic: str
@@ -94,11 +103,23 @@ def plan_source_notes(
     limit: int | None = None,
     force: bool = False,
     auto: bool = False,
-    provider: str = "openai",
+    backend: str = "openai-responses",
+    provider: str | None = None,
+    backend_instance: LLMBackend | None = None,
 ) -> IngestPlan:
+    backend_id = canonical_backend_id(provider or backend)
+    selected_backend = backend_instance or get_backend(backend_id)
     rows = _source_rows(store)
     all_candidates = [
-        _candidate(store, row, model=model, language=language, force=force, provider=provider)
+        _candidate(
+            store,
+            row,
+            model=model,
+            language=language,
+            force=force,
+            backend=backend_id,
+            backend_instance=selected_backend,
+        )
         for row in rows
     ]
     if auto:
@@ -109,7 +130,7 @@ def plan_source_notes(
     new_requests = sum(candidate.cached_result is None for candidate in candidates)
     reusable = len(candidates) - new_requests
     input_tokens = sum(candidate.input_tokens for candidate in candidates if candidate.cached_result is None)
-    output_ratio, usage_records = _historical_output_ratio(store, model)
+    output_ratio, usage_records = _historical_output_ratio(store, backend_id, model)
     estimated_output_tokens = (
         sum(min(round(candidate.input_tokens * output_ratio), 800) for candidate in candidates if candidate.cached_result is None)
         if output_ratio is not None else None
@@ -123,10 +144,16 @@ def plan_source_notes(
         estimated_output_tokens=estimated_output_tokens,
         max_output_tokens=new_requests * 800,
         estimated_cost_usd=(
-            _maximum_cost(input_tokens, estimated_output_tokens, model)
+            _maximum_cost(
+                input_tokens, estimated_output_tokens, model,
+                billing_mode=selected_backend.capabilities.billing_mode,
+            )
             if estimated_output_tokens is not None else None
         ),
-        max_cost_usd=_maximum_cost(input_tokens, new_requests * 800, model),
+        max_cost_usd=_maximum_cost(
+            input_tokens, new_requests * 800, model,
+            billing_mode=selected_backend.capabilities.billing_mode,
+        ),
         usage_records=usage_records,
         auto=auto,
     )
@@ -145,26 +172,55 @@ def ingest_source_notes(
     dry_run: bool = False,
     progress: IngestProgress | None = None,
     plan: IngestPlan | None = None,
-    provider: str = "openai",
+    backend: str = "openai-responses",
+    provider: str | None = None,
+    backend_instance: LLMBackend | None = None,
+    fallback_instance: LLMBackend | None = None,
 ) -> IngestReport:
+    backend_id = canonical_backend_id(provider or backend)
+    selected_backend = backend_instance or get_backend(backend_id)
     plan = plan or plan_source_notes(
-        store, model=model, language=language, limit=limit, force=force, auto=auto, provider=provider,
+        store,
+        model=model,
+        language=language,
+        limit=limit,
+        force=force,
+        auto=auto,
+        backend=backend_id,
+        backend_instance=selected_backend,
     )
     if dry_run:
         return IngestReport(processed=len(plan.candidates), reused=plan.reusable)
-    api_key_name = "MANUS_API_KEY" if provider == "manus" else "OPENAI_API_KEY"
-    api_key = os.environ.get(api_key_name, "").strip()
-    if plan.new_requests and not api_key:
-        raise RuntimeError(f"Missing required environment variable: {api_key_name}")
+    if plan.new_requests and not selected_backend.supports_model(model):
+        raise BackendPolicyError(f"Backend {backend_id} does not support model {model!r}.")
+    preflight_metadata = selected_backend.preflight() if plan.new_requests else {}
+    temporary_parent = (
+        _temporary_parent_for(selected_backend, vault_root) if plan.new_requests
+        else vault_paths(vault_root).state_dir / "tmp"
+    )
+    fallback = (
+        resolve_fallback(config, backend_id, backend_instance=fallback_instance)
+        if plan.new_requests else None
+    )
+    start_interval = selected_backend.capabilities.min_start_interval_seconds
+    last_start = 0.0
     processed = created = reused = failed = input_tokens = output_tokens = 0
     unpriced = unmetered = 0
     cost_usd = 0.0
-    max_article_chars = 3_000 if provider == "manus" else 10_000
     for candidate in plan.candidates:
         row = candidate.row
         metadata = candidate.metadata
         processed += 1
         if candidate.cached_result is not None:
+            # Planning only reads, so a result found under the version-one key is
+            # rewritten here, where the vault write lock is held.
+            store.promote_legacy_fingerprint(
+                resource_revision_id=str(row["resource_revision_id"]), operation="source-note",
+                model=model, prompt_version=PROMPT_VERSION,
+                input_fingerprint=candidate.fingerprint,
+                legacy_fingerprint=candidate.legacy_fingerprint,
+                backend=backend_id, summary_schema_version=CANONICAL_SUMMARY_SCHEMA_VERSION,
+            )
             store.put_source_note(
                 resource_id=candidate.resource_id, llm_run_id=None,
                 markdown=render_source_note(row, metadata, candidate.cached_result, model=model),
@@ -179,42 +235,64 @@ def ingest_source_notes(
                     ),
                 )
             continue
-        run_id = store.start_llm_run(
-            resource_id=candidate.resource_id, resource_revision_id=str(row["resource_revision_id"]),
-            operation="source-note", model=model, prompt_version=PROMPT_VERSION,
-            input_fingerprint=candidate.fingerprint, request=candidate.request,
+        if start_interval > 0:
+            delay = start_interval - (time.monotonic() - last_start)
+            if delay > 0:
+                time.sleep(delay)
+        last_start = time.monotonic()
+        attempt = _attempt_candidate(
+            store, vault_root, row=row, metadata=metadata, candidate=candidate,
+            backend_id=backend_id, backend=selected_backend, model=model, language=language,
+            temporary_parent=temporary_parent, preflight_metadata=preflight_metadata,
         )
-        item_status = "created"
-        item_error = None
-        try:
-            page = _page(row, metadata)
-            audit = summarize_bookmark_with_audit(
-                api_key, model, metadata, page, language, 60, 800, "low", 3, 1.0, max_article_chars,
-                provider=provider,
+        if (
+            attempt.error is not None
+            and fallback is not None
+            and getattr(attempt.error, "fallback_eligible", False)
+        ):
+            # Named in the plan before the run started; Feedian never picks a
+            # destination on its own.
+            fallback_candidate = _candidate(
+                store, row, model=fallback.model, language=language, force=force,
+                backend=fallback.backend_id, backend_instance=fallback.backend,
             )
-            price = _price_record(audit.usage, model)
-            store.finish_llm_run(
-                run_id, request=audit.request, response=audit.response,
-                result=audit.result, usage=audit.usage, price=price,
-            )
-            store.put_source_note(
-                resource_id=candidate.resource_id, llm_run_id=run_id,
-                markdown=render_source_note(row, metadata, audit.result, model=model),
-            )
+            if fallback_candidate.cached_result is not None:
+                store.put_source_note(
+                    resource_id=candidate.resource_id, llm_run_id=None,
+                    markdown=render_source_note(
+                        row, metadata, fallback_candidate.cached_result, model=fallback.model,
+                    ),
+                )
+                attempt = _Attempt(run_id=attempt.run_id, audit=None, error=None, reused=True)
+            else:
+                attempt = _attempt_candidate(
+                    store, vault_root, row=row, metadata=metadata, candidate=fallback_candidate,
+                    backend_id=fallback.backend_id, backend=fallback.backend,
+                    model=fallback.model, language=language,
+                    # An HTTP primary leaves temporary_parent inside the Vault; a
+                    # local fallback must not run there.
+                    temporary_parent=_temporary_parent_for(fallback.backend, vault_root),
+                    preflight_metadata=fallback.preflight(),
+                )
+        run_id = attempt.run_id
+        item_error = attempt.error_text
+        if attempt.reused:
+            item_status = "reused"
+            reused += 1
+        elif attempt.audit is not None:
+            item_status = "created"
             created += 1
+            audit = attempt.audit
             input_tokens += _usage_count(audit.usage.get("input_tokens"))
             output_tokens += _usage_count(audit.usage.get("output_tokens"))
-            if not audit.usage:
+            if not audit.usage or not attempt.usage_available:
                 unmetered += 1
-            estimated_cost = price.get("estimated_cost_usd")
-            if isinstance(estimated_cost, (int, float)):
-                cost_usd += float(estimated_cost)
+            if isinstance(attempt.estimated_cost, (int, float)):
+                cost_usd += float(attempt.estimated_cost)
             else:
                 unpriced += 1
-        except Exception as exc:
+        else:
             item_status = "failed"
-            item_error = str(exc)
-            store.finish_llm_run(run_id, error=item_error)
             failed += 1
         if progress is not None:
             progress(
@@ -228,6 +306,138 @@ def ingest_source_notes(
     return IngestReport(
         processed, created, reused, failed, input_tokens, output_tokens, cost_usd, unpriced, unmetered,
     )
+
+
+@dataclass(frozen=True)
+class _Attempt:
+    run_id: str
+    audit: Any = None
+    error: Exception | None = None
+    reused: bool = False
+    error_text: str | None = None
+    estimated_cost: Any = None
+    usage_available: bool = True
+
+
+@dataclass(frozen=True)
+class _Fallback:
+    backend_id: str
+    backend: LLMBackend
+    model: str
+    _metadata: dict[str, Any] | None = None
+
+    def preflight(self) -> dict[str, Any]:
+        """Deferred: a fallback that never fires must not demand credentials."""
+        return self.backend.preflight()
+
+
+def _temporary_parent_for(backend: LLMBackend, vault_root: str | Path) -> Path:
+    """Where this backend may create per-article working directories.
+
+    A local agent treats its cwd as a project, so it runs outside the Vault; an
+    HTTP backend never opens one and keeps the Vault's own temporary directory.
+    """
+    if backend.capabilities.execution_kind != "local-agent":
+        return vault_paths(vault_root).state_dir / "tmp"
+    try:
+        return isolated_local_agent_parent(vault_root)
+    except RuntimeError as exc:
+        raise BackendPolicyError(str(exc)) from exc
+
+
+def _attempt_candidate(
+    store: VaultStore,
+    vault_root: str | Path,
+    *,
+    row: Any,
+    metadata: dict[str, Any],
+    candidate: IngestCandidate,
+    backend_id: str,
+    backend: LLMBackend,
+    model: str,
+    language: str,
+    temporary_parent: Path,
+    preflight_metadata: dict[str, Any],
+) -> _Attempt:
+    """Open one llm_run, execute it, and close it either way."""
+    run_id = store.start_llm_run(
+        resource_id=candidate.resource_id, resource_revision_id=str(row["resource_revision_id"]),
+        operation="source-note", model=model, prompt_version=PROMPT_VERSION,
+        input_fingerprint=candidate.fingerprint,
+        request={"logical": candidate.request, "actual": None},
+        backend=backend_id,
+        summary_schema_version=CANONICAL_SUMMARY_SCHEMA_VERSION,
+        fingerprint_version=2,
+        auth_mode=backend.capabilities.auth_mode,
+        billing_mode=backend.capabilities.billing_mode,
+        backend_metadata=preflight_metadata,
+    )
+    started_at = time.monotonic()
+    try:
+        audit = backend.summarize(
+            model=model, item=metadata, page=_page(row, metadata), language=language,
+            timeout_seconds=60, max_output_tokens=800, reasoning_effort="low",
+            max_retries=3, retry_base_seconds=1.0, temporary_parent=temporary_parent,
+        )
+    except Exception as exc:
+        prompt = str(candidate.request["input"][0]["content"][0]["text"])
+        error_text = sanitize_error(
+            str(exc), Path(vault_root).resolve(),
+            private_values=(prompt, str(row["content_markdown"] or "")),
+        )
+        store.finish_llm_run(
+            run_id,
+            request={"logical": candidate.request, "actual": getattr(exc, "request", None)},
+            error=error_text,
+            duration_ms=round((time.monotonic() - started_at) * 1000),
+        )
+        return _Attempt(run_id=run_id, error=exc, error_text=error_text)
+    price = _price_record(audit.usage, model, billing_mode=audit.billing_mode)
+    store.finish_llm_run(
+        run_id,
+        request={"logical": candidate.request, "actual": audit.request},
+        response=audit.response, result=audit.result, usage=audit.usage or None, price=price,
+        auth_mode=audit.auth_mode, billing_mode=audit.billing_mode,
+        backend_metadata=audit.metadata,
+        duration_ms=round((time.monotonic() - started_at) * 1000),
+    )
+    store.put_source_note(
+        resource_id=candidate.resource_id, llm_run_id=run_id,
+        markdown=render_source_note(row, metadata, audit.result, model=model),
+    )
+    return _Attempt(
+        run_id=run_id, audit=audit,
+        estimated_cost=price.get("estimated_cost_usd"),
+        usage_available=backend.capabilities.usage_available,
+    )
+
+
+def fallback_maximum_cost(plan: IngestPlan, fallback: "_Fallback | None") -> float | None:
+    """What the fallback could add if every new request failed over to it."""
+    if fallback is None or not plan.new_requests:
+        return None
+    return _maximum_cost(
+        plan.input_tokens, plan.new_requests * 800, fallback.model,
+        billing_mode=fallback.backend.capabilities.billing_mode,
+    )
+
+
+def resolve_fallback(
+    config: VaultConfig, backend_id: str, *, backend_instance: LLMBackend | None = None,
+) -> _Fallback | None:
+    """The configured fallback, or None. Disabled by default and never inferred."""
+    settings = config.llm.fallback
+    if not settings.enabled:
+        return None
+    destination = canonical_backend_id(settings.backend)
+    if destination == backend_id:
+        return None
+    backend = backend_instance or get_backend(destination)
+    if not backend.supports_model(settings.model):
+        raise BackendPolicyError(
+            f"Fallback backend {destination} does not support model {settings.model!r}."
+        )
+    return _Fallback(destination, backend, settings.model)
 
 
 def _source_rows(store: VaultStore) -> list[Any]:
@@ -248,23 +458,43 @@ def _source_rows(store: VaultStore) -> list[Any]:
 
 
 def _candidate(
-    store: VaultStore, row: Any, *, model: str, language: str, force: bool, provider: str = "openai",
+    store: VaultStore,
+    row: Any,
+    *,
+    model: str,
+    language: str,
+    force: bool,
+    backend: str = "openai-responses",
+    backend_instance: LLMBackend | None = None,
 ) -> IngestCandidate:
+    backend_id = canonical_backend_id(backend)
+    selected_backend = backend_instance or get_backend(backend_id)
     metadata = json.loads(str(row["metadata_json"]))
-    max_article_chars = 3_000 if provider == "manus" else 10_000
     request = build_summary_request(
         model=model, item=metadata, page=_page(row, metadata), language=language,
-        max_output_tokens=800, reasoning_effort="low", max_article_chars=max_article_chars,
+        max_output_tokens=800, reasoning_effort="low",
+        max_article_chars=selected_backend.capabilities.max_article_chars,
     )
-    request["provider"] = provider
     fingerprint = hashlib.sha256(stable_json(request).encode("utf-8")).hexdigest()
+    # Rebuild the key exactly as the release before backend IDs wrote it, from a
+    # frozen schema, so editing the provider schema cannot silently end the
+    # migration window. A prompt change is meant to invalidate reuse and does so
+    # through PROMPT_VERSION.
+    legacy_request = deepcopy(request)
+    legacy_request["text"]["format"]["schema"] = LEGACY_V1_PROVIDER_SCHEMA
+    legacy_request["provider"] = "manus" if backend_id == "manus-api" else "openai"
+    legacy_fingerprint = hashlib.sha256(stable_json(legacy_request).encode("utf-8")).hexdigest()
     cached = None if force else store.successful_llm_result(
         resource_revision_id=str(row["resource_revision_id"]), operation="source-note", model=model,
-        prompt_version=PROMPT_VERSION, input_fingerprint=fingerprint,
+        prompt_version=PROMPT_VERSION, input_fingerprint=fingerprint, backend=backend_id,
+        summary_schema_version=CANONICAL_SUMMARY_SCHEMA_VERSION,
+        legacy_fingerprint=legacy_fingerprint,
     )
     prompt = str(request["input"][0]["content"][0]["text"])
     input_tokens, _ = count_prompt_tokens(f"{SUMMARY_INSTRUCTIONS}\n\n{prompt}", model)
-    return IngestCandidate(row, metadata, request, fingerprint, cached, input_tokens, _topics(metadata)[0])
+    return IngestCandidate(
+        row, metadata, request, fingerprint, legacy_fingerprint, cached, input_tokens, _topics(metadata)[0]
+    )
 
 
 def _page(row: Any, metadata: dict[str, Any]) -> PageFetchResult:
@@ -307,7 +537,7 @@ def _select_auto_candidates(
         reason = "uncovered-field" if topic not in covered_topics else "largest-field"
         selected = IngestCandidate(
             candidate.row, candidate.metadata, candidate.request, candidate.fingerprint,
-            candidate.cached_result, candidate.input_tokens, topic,
+            candidate.legacy_fingerprint, candidate.cached_result, candidate.input_tokens, topic,
             reason=reason, topic_count=topic_counts[topic],
         )
         buckets.setdefault(topic, []).append(selected)
@@ -360,7 +590,11 @@ def _topics(metadata: dict[str, Any]) -> list[str]:
     return [hostname.removeprefix("www.")]
 
 
-def _maximum_cost(input_tokens: int, output_tokens: int, model: str) -> float | None:
+def _maximum_cost(
+    input_tokens: int, output_tokens: int, model: str, *, billing_mode: str = "metered-api"
+) -> float | None:
+    if billing_mode != "metered-api":
+        return None
     pricing_model = comparison_model(model)
     price = next((value for value in MODEL_PRICES if value.model == pricing_model), None)
     if price is None:
@@ -368,14 +602,16 @@ def _maximum_cost(input_tokens: int, output_tokens: int, model: str) -> float | 
     return (input_tokens * price.input_per_million + output_tokens * price.output_per_million) / 1_000_000
 
 
-def _historical_output_ratio(store: VaultStore, model: str) -> tuple[float | None, int]:
+def _historical_output_ratio(
+    store: VaultStore, backend: str, model: str
+) -> tuple[float | None, int]:
     rows = store.connection.execute(
         """
         SELECT usage_json FROM llm_run
-        WHERE operation = 'source-note' AND model = ? AND status = 'completed'
+        WHERE operation = 'source-note' AND backend = ? AND model = ? AND status = 'completed'
           AND usage_json IS NOT NULL
         """,
-        (model,),
+        (backend, model),
     ).fetchall()
     input_total = output_total = records = 0
     for row in rows:
@@ -447,7 +683,16 @@ def render_source_note(row: Any, metadata: dict[str, Any], result: dict[str, Any
     return "\n".join(lines).rstrip() + "\n"
 
 
-def _price_record(usage: dict[str, Any], model: str) -> dict[str, Any]:
+def _price_record(
+    usage: dict[str, Any], model: str, *, billing_mode: str = "metered-api"
+) -> dict[str, Any]:
+    if billing_mode != "metered-api":
+        return {
+            "model": model,
+            "billing_mode": billing_mode,
+            "source": "not-metered-api",
+            "estimated_cost_usd": None,
+        }
     pricing_model = comparison_model(model)
     price = next((value for value in MODEL_PRICES if value.model == pricing_model), None)
     if price is None:

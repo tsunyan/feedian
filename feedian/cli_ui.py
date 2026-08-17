@@ -116,7 +116,9 @@ def print_ingest_plan(
     plan: Any,
     *,
     model: str,
-    provider: str = "openai",
+    backend: str = "openai-responses",
+    fallback: str = "",
+    fallback_max_cost_usd: float | None = None,
     dry_run: bool,
     command: str,
     file: TextIO | None = None,
@@ -143,13 +145,25 @@ def print_ingest_plan(
     identity.add_column(ratio=1)
     identity.add_row(
         Text.assemble(("Mode  ", MUTED), (mode, "bold")),
-        Text.assemble(("Provider  ", MUTED), (provider, f"bold {CYAN}")),
+        Text.assemble(("Backend  ", MUTED), (backend, f"bold {CYAN}")),
         Text.assemble(("Model  ", MUTED), (model, f"bold {BLUE}")),
         Text.assemble(("Cached  ", MUTED), (f"{plan.reusable:,}", "bold")),
     )
     command_line = Text.assemble(
         ("Command  ", MUTED),
         (command, f"bold {BLUE}"),
+    )
+    # The specification requires the destination be named before the run starts,
+    # so that no article can move to another backend unannounced.
+    # A subscription primary shows no cost of its own, so an enabled metered
+    # fallback states what it could add before anything runs.
+    fallback_cost = (
+        f"  max {_money(fallback_max_cost_usd)}" if fallback_max_cost_usd is not None else ""
+    )
+    fallback_line = Text.assemble(
+        ("Fallback  ", MUTED),
+        (fallback or "disabled", f"bold {VIOLET}" if fallback else MUTED),
+        (fallback_cost, MUTED),
     )
     console.print(
         Panel(
@@ -158,6 +172,7 @@ def print_ingest_plan(
                 Text(action, style=MUTED),
                 Text(""),
                 command_line,
+                fallback_line,
                 Text(""),
                 flow,
                 Text(""),

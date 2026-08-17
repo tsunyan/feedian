@@ -1,11 +1,20 @@
 import io
+import os
 import unittest
+from unittest import mock
 from unittest.mock import Mock
 
 from feedian.progress import ProgressReporter
 
 
 class ProgressReporterTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # Rich renders to the host terminal's width, and a narrow one drops whole
+        # columns from the output these tests read back.
+        width = mock.patch.dict(os.environ, {"COLUMNS": "120"})
+        width.start()
+        self.addCleanup(width.stop)
+
     def test_auto_mode_uses_plain_output_for_a_non_terminal_stream(self) -> None:
         stream = Mock(spec=io.StringIO)
         stream.isatty.return_value = False
@@ -104,17 +113,25 @@ class ProgressReporterTests(unittest.TestCase):
 
     def test_rich_mode_can_retain_a_final_static_progress_display(self) -> None:
         stream = io.StringIO()
-        reporter = ProgressReporter("rich", stream=stream)
-
-        with reporter:
-            reporter.start_task("process: syncing items", total=2)
-            reporter.advance(2)
-            reporter.finish_task(2)
-            reporter.retain_final()
+        # Rich takes its width from COLUMNS; narrow terminals drop the progress
+        # column entirely, so pin it rather than inherit the host's terminal.
+        with mock.patch.dict(os.environ, {"COLUMNS": "120"}):
+            reporter = ProgressReporter("rich", stream=stream)
+            with reporter:
+                reporter.start_task("process: syncing items", total=2)
+                reporter.advance(2)
+                reporter.finish_task(2)
+                reporter.retain_final()
 
         output = stream.getvalue()
-        self.assertGreaterEqual(output.count("process: syncing items"), 2)
+        self.assertIn("process: syncing items", output)
         self.assertIn("2/2", output)
+        # The live display is transient and a static copy is printed after it, so
+        # the completed state must be what the output ends on. Counting how many
+        # times the live display redrew would only measure Rich's refresh timing.
+        self.assertLess(
+            output.rindex("process: syncing items"), output.rindex("2/2")
+        )
 
 
 if __name__ == "__main__":
