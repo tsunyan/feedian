@@ -1176,7 +1176,12 @@ def test_record_failed_fetch_stores_null_http_status_when_none_and_no_prior_stat
         store.close()
 
 
-def test_record_failed_fetch_stores_and_keeps_an_http_status_across_a_later_none(tmp_path) -> None:
+def test_record_failed_fetch_replaces_a_terminal_status_with_a_later_transient_one(tmp_path) -> None:
+    """http_status is the latest failure's state, not a value to preserve.
+
+    Keeping the 404 would leave the terminal rule suppressing a resource whose
+    current failure is a timeout, with no route back to the backoff.
+    """
     store = VaultStore.open(tmp_path / "feedian.sqlite3")
     try:
         item = store.upsert_canonical_item(_item())
@@ -1189,13 +1194,32 @@ def test_record_failed_fetch_stores_and_keeps_an_http_status_across_a_later_none
 
         store.record_failed_fetch(resource_id, warning="timed out", http_status=None)
 
-        http_status = store.connection.execute(
+        assert store.connection.execute(
             "SELECT http_status FROM fetch_capture WHERE resource_id = ?", (resource_id,)
-        ).fetchone()["http_status"]
-        assert http_status == 404
+        ).fetchone()["http_status"] is None
     finally:
         store.close()
 
+
+def test_a_transient_failure_after_a_terminal_one_becomes_due_again(tmp_path) -> None:
+    """404 -> --force-fetch -> a non-HTTP failure must return to the backoff."""
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        item = store.upsert_canonical_item(_item())
+        resource_id = item.resource_id or ""
+        store.record_failed_fetch(resource_id, warning="not found", http_status=404)
+        assert store.should_fetch_resource(resource_id, refresh_days=30) is False
+
+        store.record_failed_fetch(resource_id, warning="DNS failure", http_status=None)
+        store.connection.execute(
+            "UPDATE fetch_capture SET fetched_at = ? WHERE resource_id = ?",
+            ("2000-01-01T00:00:00+00:00", resource_id),
+        )
+        store.connection.commit()
+
+        assert store.should_fetch_resource(resource_id, refresh_days=30) is True
+    finally:
+        store.close()
 
 def test_record_not_modified_fetch_clears_failure_state_and_sets_304(tmp_path) -> None:
     store = VaultStore.open(tmp_path / "feedian.sqlite3")
@@ -1235,6 +1259,62 @@ def test_consecutive_failures_after_a_success_failure_not_modified_failure_seque
         assert consecutive_failures == 1
     finally:
         store.close()
+
+
+def _downgrade_to_v7(path) -> None:
+    connection = sqlite3.connect(path)
+    try:
+        connection.executescript(
+            """
+            ALTER TABLE fetch_capture DROP COLUMN consecutive_failures;
+            ALTER TABLE fetch_capture DROP COLUMN http_status;
+            UPDATE schema_meta SET value = '7' WHERE key = 'schema_version';
+            """
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def test_v7_migration_backfills_retry_state_on_a_failed_capture(tmp_path) -> None:
+    path = tmp_path / "feedian.sqlite3"
+    store = VaultStore.open(path)
+    try:
+        item = store.upsert_canonical_item(_item())
+        resource_id = item.resource_id or ""
+        # A resource with no body, left behind by a failed fetch before
+        # consecutive_failures/http_status tracking existed.
+        store.record_failed_fetch(resource_id, warning="HTTP 500")
+        store.connection.execute(
+            "UPDATE fetch_capture SET fetched_at = ? WHERE resource_id = ?",
+            ((datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(), resource_id),
+        )
+        store.connection.commit()
+    finally:
+        store.close()
+    _downgrade_to_v7(path)
+
+    migrated = VaultStore.open(path, allow_migration=True)
+    try:
+        assert migrated.schema_version() == 8
+        columns = {
+            str(row[1]) for row in migrated.connection.execute("PRAGMA table_info(fetch_capture)")
+        }
+        assert {"consecutive_failures", "http_status"} <= columns
+
+        row = migrated.connection.execute(
+            "SELECT consecutive_failures, http_status FROM fetch_capture WHERE resource_id = ?",
+            (resource_id,),
+        ).fetchone()
+        assert row["consecutive_failures"] == 0
+        assert row["http_status"] is None
+
+        # A minute old is nowhere near due by refresh_days=30 or by any real
+        # backoff -- only the migrated-row special case (a warning but no
+        # recorded failure count) makes this True.
+        assert migrated.should_fetch_resource(resource_id, refresh_days=30) is True
+    finally:
+        migrated.close()
 
 
 def test_should_fetch_resource_retries_a_migrated_failure_row_immediately(tmp_path) -> None:

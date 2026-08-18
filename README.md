@@ -236,6 +236,9 @@ The active provider and model are shown in the ingest preview and execution head
 | `fetch.comment_workers` | Parallel workers for Hatena comment retrieval. |
 | `fetch.star_refresh_days` | Default age for refreshing Hatena Star counts. |
 | `fetch.allow_private_hosts` | Explicit private/local hosts that page fetching may access. Empty by default. |
+| `fetch.retry_base_minutes` | Wait before retrying a page that failed once. Doubles with each further consecutive failure. |
+| `fetch.retry_max_days` | Ceiling on that growing wait. |
+| `fetch.terminal_http_statuses` | Statuses that are never retried, only `--force-fetch` gets past them. Defaults to `[404, 410]`; an empty list turns this off and lets the growing wait handle everything. |
 
 Unknown config fields are rejected instead of silently ignored.
 
@@ -272,7 +275,7 @@ Select an already initialized Vault as the user default.
 feedian status [--vault PATH]
 ```
 
-Show resolved paths, enabled providers, database integrity and schema version, record counts, and the latest sync status.
+Show resolved paths, enabled providers, database integrity and schema version, record counts, and the latest sync status. The `unreachable` count is how many pages Feedian has stopped retrying because they answered with a terminal status; `sync --full --force-fetch` tries them again.
 
 ### `migrate`
 

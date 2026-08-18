@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from feedian.canonical import CanonicalItem
@@ -126,6 +128,22 @@ def test_status_reports_unreachable_using_the_vaults_terminal_http_statuses(tmp_
 
     output = capsys.readouterr().out
     assert "unreachable: 1" in output
+
+
+def test_status_rejects_an_invalid_terminal_http_statuses_config(tmp_path, capsys) -> None:
+    root = tmp_path / "vault"
+    root.mkdir()
+    assert main(["init", "--vault", str(root)]) == 0
+
+    config_path = root / ".feedian" / "config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["fetch"]["terminal_http_statuses"] = [99]
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    assert main(["status", "--vault", str(root)]) == 1
+
+    error = capsys.readouterr().err
+    assert "fetch.terminal_http_statuses" in error
 
 
 def test_migrate_does_not_copy_existing_raw_markdown_into_sqlite(tmp_path, capsys) -> None:

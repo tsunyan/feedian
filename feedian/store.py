@@ -509,7 +509,12 @@ class VaultStore:
                         final_url = COALESCE(NULLIF(?, ''), final_url),
                         warning = ?, response_etag = ?, response_last_modified = ?,
                         consecutive_failures = consecutive_failures + 1,
-                        http_status = COALESCE(?, http_status), fetched_at = ?
+                        -- Not COALESCE: http_status describes the latest failure, not
+                        -- data worth preserving the way the payload ids are. Keeping a
+                        -- stale 404 after a later DNS or timeout failure would leave the
+                        -- terminal rule suppressing a resource whose current failure is
+                        -- transient, with no way back to the backoff.
+                        http_status = ?, fetched_at = ?
                     WHERE fetch_capture_id = ?
                     """,
                     (capture_revision_id, http_payload_id, rendered_payload_id, final_url, warning,
