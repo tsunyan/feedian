@@ -2010,14 +2010,19 @@ def _migrate_v7_to_v8(connection: sqlite3.Connection) -> None:
 
 
 def _migrate_v8_to_v9(connection: sqlite3.Connection) -> None:
-    """Add failure_kind and reset consecutive_failures under the terminal-kind rule.
+    """Add failure_kind and normalize consecutive_failures for the terminal-kind rule.
 
-    terminal_kind_failures is defined as "consecutive failures observed under
-    the new rule"; without a reset, rows that already carry a pre-existing
-    count from before this rule existed would reach it sooner than a resource
-    that starts failing today, and the same threshold would mean different
-    things depending on when a row started failing. This is independent of
-    adding the column, so it is not gated behind _column_exists.
+    Rows that have already failed several times earned that count before this
+    rule existed, and would reach terminal_kind_failures sooner than a resource
+    that starts failing today. The 1 they are reset to is a baseline, not an
+    observed failure: it takes two failures after migrating to reach the
+    default threshold of 3, so one resolver outage during the first run cannot
+    terminate hundreds of live hosts at once.
+
+    Not 0, which should_fetch_resource reads as "migrated from schema 7, fetch
+    once to acquire a count" -- that would make every failing row due at once
+    and pay the full cost in a single pass. The reset is independent of adding
+    the column, so it is not gated behind _column_exists.
     """
 
     with _transaction(connection):

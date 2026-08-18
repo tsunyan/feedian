@@ -56,4 +56,4 @@
 - `fetch_capture.failure_kind`に`"dns"`（ホスト解決不能）と`"timeout"`（接続・応答timeout）を記録する。SSL失敗や抽出失敗は種別を持たずNULLのままで、既存の指数backoffに任せる。
 - 抑制規則は「`failure_kind`が`terminal_failure_kinds`に含まれ、かつ`consecutive_failures`が`terminal_kind_failures`（既定3）以上」であり、種別は問わない連続失敗回数の条件である。終端ステータス（404/410）の規則と和集合で`should_fetch_resource`・`terminal_failure_count`の双方に効く。復旧は`--force-fetch`のみ。
 - 取得タイムアウトは`fetch.timeout_seconds`（既定5秒）で設定できる。browser fallback（401/403/406の代替取得、低品質HTMLの再描画）は別枠の`fetch.browser_timeout_seconds`（既定30秒）を使う。
-- SQLite schema version 9の`fetch_capture`は`failure_kind`列を持つ。移行時に`consecutive_failures >= 2`の既存行を1へ戻す。新規則の下で観測した連続失敗回数として閾値の意味を揃えるためであり、移行直後の一時的な失敗1回で終端化しないようにする。
+- SQLite schema version 9の`fetch_capture`は`failure_kind`列を持つ。移行時に`consecutive_failures >= 2`の既存行を1へ戻す。**1は観測値ではなく基準値である。** 旧規則の下で稼いだ回数を持ち込ませないための正規化であり、これにより移行後の失敗2回で既定の閾値3へ達する。移行直後の一時的な失敗1回では終端化しない。0にしないのは、`consecutive_failures = 0`が「schema 7からの移行行」を意味し、全件が即dueになるためである。
