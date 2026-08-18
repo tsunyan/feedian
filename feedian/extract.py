@@ -46,6 +46,7 @@ class PageFetchResult:
     rendered_html: str = ""
     payload_too_large: bool = False
     not_modified: bool = False
+    failure_kind: str | None = None
 
 
 @dataclass
@@ -66,6 +67,10 @@ class ContentImage:
 class TextCandidate:
     priority: int
     parts: list[str]
+
+
+class UnresolvableHostError(ValueError):
+    """The hostname does not resolve. Distinct from the SSRF guard's rejection."""
 
 
 class SafeRedirectHandler(HTTPRedirectHandler):
@@ -212,6 +217,7 @@ def fetch_page_text(
     allow_private_urls: bool = False,
     etag: str = "",
     last_modified: str = "",
+    browser_timeout_seconds: int = 30,
 ) -> PageFetchResult:
     # max_chars remains in the public call signature for compatibility. Extracted
     # text is stored in full; the limit is applied only when building an LLM prompt.
@@ -220,7 +226,8 @@ def fetch_page_text(
     try:
         validate_fetch_url(fetch_url, allow_private_urls=allow_private_urls)
     except ValueError as exc:
-        return PageFetchResult(url=url, text="", error=f"blocked URL: {exc}")
+        failure_kind = "dns" if isinstance(exc, UnresolvableHostError) else None
+        return PageFetchResult(url=url, text="", error=f"blocked URL: {exc}", failure_kind=failure_kind)
 
     headers = {
         "User-Agent": "feedian/0.1 (+https://github.com/) Python urllib",
@@ -268,7 +275,7 @@ def fetch_page_text(
                 return fetch_page_text_with_browser(
                     original_url=url,
                     fetch_url=fetch_url,
-                    timeout_seconds=timeout_seconds,
+                    timeout_seconds=browser_timeout_seconds,
                     allow_private_urls=allow_private_urls,
                     initial_error=f"HTTP {exc.code}",
                 )
@@ -281,9 +288,11 @@ def fetch_page_text(
                 )
         return PageFetchResult(url=url, text="", error=f"HTTP {exc.code}", http_status=exc.code)
     except URLError as exc:
-        return PageFetchResult(url=url, text="", error=str(exc.reason))
+        failure_kind = "timeout" if isinstance(exc.reason, TimeoutError) else None
+        return PageFetchResult(url=url, text="", error=str(exc.reason), failure_kind=failure_kind)
     except Exception as exc:
-        return PageFetchResult(url=url, text="", error=str(exc))
+        failure_kind = "timeout" if isinstance(exc, TimeoutError) else None
+        return PageFetchResult(url=url, text="", error=str(exc), failure_kind=failure_kind)
 
     too_large = len(raw) > limit
     if too_large and not is_html:
@@ -350,7 +359,7 @@ def fetch_page_text(
         try:
             rendered_html, rendered_url, rendered_title = render_html_with_browser(
                 fetch_url,
-                timeout_seconds=timeout_seconds,
+                timeout_seconds=browser_timeout_seconds,
                 allow_private_urls=allow_private_urls,
             )
             browser_parts = extract_page_parts(rendered_html, rendered_url)
@@ -781,7 +790,7 @@ def validate_fetch_url(url: str, allow_private_urls: bool = False) -> None:
     try:
         addresses = socket.getaddrinfo(parsed.hostname, parsed.port, type=socket.SOCK_STREAM)
     except socket.gaierror as exc:
-        raise ValueError(f"hostname could not be resolved: {parsed.hostname}") from exc
+        raise UnresolvableHostError(f"hostname could not be resolved: {parsed.hostname}") from exc
     for _, _, _, _, sockaddr in addresses:
         address = ipaddress.ip_address(sockaddr[0].split("%", 1)[0])
         if not address.is_global:

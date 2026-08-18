@@ -92,7 +92,7 @@ def test_init_migrate_and_status(tmp_path, capsys) -> None:
 
     output = capsys.readouterr().out
     assert "initialized:" in output
-    assert "migrated: schema_version=8" in output
+    assert "migrated: schema_version=9" in output
     assert "integrity: ok" in output
 
 
@@ -130,6 +130,59 @@ def test_status_reports_unreachable_using_the_vaults_terminal_http_statuses(tmp_
     assert "unreachable: 1" in output
 
 
+def test_status_reports_unreachable_using_the_vaults_terminal_failure_kinds(tmp_path, capsys) -> None:
+    """The count has to follow this vault's kinds and threshold, not the defaults.
+
+    Every seeded resource is deliberately classified differently by the vault's
+    settings than by terminal_failure_count's own defaults, so a status command
+    that forgets to pass the configured values reports 1 instead of 2 rather
+    than landing on the same answer by luck.
+    """
+
+    root = tmp_path / "vault"
+    root.mkdir()
+    assert main(["init", "--vault", str(root)]) == 0
+    assert main(["migrate", "--vault", str(root)]) == 0
+
+    # No terminal HTTP statuses at all, so whatever this counts comes from the
+    # failure-kind half of the rule -- the case that reports 0 if the two
+    # halves are treated as anything but a union.
+    config_path = root / ".feedian" / "config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["fetch"]["terminal_http_statuses"] = []
+    config["fetch"]["terminal_failure_kinds"] = ["dns"]
+    config["fetch"]["terminal_kind_failures"] = 2
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    store = VaultStore.open(root / ".feedian" / "feedian.sqlite3")
+
+    def seed(name: str, kind: str, times: int) -> None:
+        stored = store.upsert_canonical_item(
+            CanonicalItem(
+                source="hatena", source_id=name, content_key=f"url:{name}",
+                url=f"https://example.test/{name}", title=name,
+            )
+        )
+        for _ in range(times):
+            store.record_failed_fetch(stored.resource_id or "", warning=f"failed: {kind}", failure_kind=kind)
+
+    try:
+        # Terminal here (dns, 2 >= 2); below the default threshold of 3.
+        seed("dead-one", "dns", 2)
+        seed("dead-two", "dns", 2)
+        # Right kind, one failure short of this vault's threshold.
+        seed("early", "dns", 1)
+        # Past every threshold, but "timeout" is not among this vault's kinds --
+        # counted only if the defaults leak through.
+        seed("slow", "timeout", 3)
+    finally:
+        store.close()
+
+    assert main(["status", "--vault", str(root)]) == 0
+
+    assert "unreachable: 2" in capsys.readouterr().out
+
+
 def test_status_rejects_an_invalid_terminal_http_statuses_config(tmp_path, capsys) -> None:
     root = tmp_path / "vault"
     root.mkdir()
@@ -156,7 +209,7 @@ def test_migrate_does_not_copy_existing_raw_markdown_into_sqlite(tmp_path, capsy
 
     assert main(["migrate", "--vault", str(root)]) == 0
 
-    assert "migrated: schema_version=8" in capsys.readouterr().out
+    assert "migrated: schema_version=9" in capsys.readouterr().out
     store = VaultStore.open(root / ".feedian" / "feedian.sqlite3")
     try:
         assert not store.connection.execute(

@@ -20,7 +20,7 @@ from .hatena import (
 from .raindrop import RaindropClient
 from .rss import RssItem, fetch_rss_items, published_timestamp
 from .store import VaultStore, sha256_bytes, stable_json
-from .vault import VaultConfig, fetch_retry_settings, normalized_rss_feeds
+from .vault import FetchRetrySettings, VaultConfig, fetch_retry_settings, normalized_rss_feeds
 
 
 HATENA_COMMENT_LIMIT = 20
@@ -66,7 +66,7 @@ def sync_vault(
         if stop_after_known_pages < 1:
             raise ValueError("config.fetch.quick_stop_after_known_pages must be >= 1")
     refresh_days = int(config.fetch.get("refresh_days", 30))
-    retry_base_minutes, retry_max_days, terminal_http_statuses = fetch_retry_settings(config)
+    retry_settings = fetch_retry_settings(config)
     fingerprint = sha256_bytes(
         stable_json(
             {
@@ -132,9 +132,11 @@ def sync_vault(
                             stored.resource_id,
                             refresh_days=refresh_days,
                             force=force_fetch,
-                            retry_base_minutes=retry_base_minutes,
-                            retry_max_days=retry_max_days,
-                            terminal_http_statuses=terminal_http_statuses,
+                            retry_base_minutes=retry_settings.retry_base_minutes,
+                            retry_max_days=retry_settings.retry_max_days,
+                            terminal_http_statuses=retry_settings.terminal_http_statuses,
+                            terminal_failure_kinds=retry_settings.terminal_failure_kinds,
+                            terminal_kind_failures=retry_settings.terminal_kind_failures,
                         )
                     )
                     if should_fetch_page and stored.resource_id:
@@ -143,11 +145,12 @@ def sync_vault(
                             etag, last_modified = store.resource_fetch_validators(stored.resource_id)
                             page = fetch_page_text(
                                 item.url,
-                                timeout_seconds=30,
+                                timeout_seconds=retry_settings.timeout_seconds,
                                 max_chars=10_000,
                                 allow_private_urls=False,
                                 etag=etag,
                                 last_modified=last_modified,
+                                browser_timeout_seconds=retry_settings.browser_timeout_seconds,
                             )
                         except Exception as exc:
                             if item.embedded_content and not _resource_has_revision(store, stored.resource_id):
@@ -214,9 +217,7 @@ def sync_vault(
                     handled_resource_ids=handled_resource_ids,
                     refresh_days=refresh_days,
                     force_fetch=force_fetch,
-                    retry_base_minutes=retry_base_minutes,
-                    retry_max_days=retry_max_days,
-                    terminal_http_statuses=terminal_http_statuses,
+                    retry_settings=retry_settings,
                 )
                 retried += provider_retried
                 fetched += provider_fetched
@@ -392,6 +393,7 @@ def _store_page(store: VaultStore, resource_id: str, page: PageFetchResult) -> N
             rendered_payload_id=None,
             response_headers=page.response_headers,
             http_status=page.http_status,
+            failure_kind=page.failure_kind,
         )
         return
     resource_revision_id, _ = store.record_resource_revision(
@@ -431,9 +433,7 @@ def _run_quick_body_only_pass(
     handled_resource_ids: set[str],
     refresh_days: int,
     force_fetch: bool,
-    retry_base_minutes: int,
-    retry_max_days: int,
-    terminal_http_statuses: tuple[int, ...],
+    retry_settings: FetchRetrySettings,
 ) -> tuple[int, int, int]:
     """Retry resources that still have no body, without touching any provider.
 
@@ -451,9 +451,11 @@ def _run_quick_body_only_pass(
             resource_id,
             refresh_days=refresh_days,
             force=force_fetch,
-            retry_base_minutes=retry_base_minutes,
-            retry_max_days=retry_max_days,
-            terminal_http_statuses=terminal_http_statuses,
+            retry_base_minutes=retry_settings.retry_base_minutes,
+            retry_max_days=retry_settings.retry_max_days,
+            terminal_http_statuses=retry_settings.terminal_http_statuses,
+            terminal_failure_kinds=retry_settings.terminal_failure_kinds,
+            terminal_kind_failures=retry_settings.terminal_kind_failures,
         ):
             continue
         handled_resource_ids.add(resource_id)
@@ -468,11 +470,12 @@ def _run_quick_body_only_pass(
             etag, last_modified = store.resource_fetch_validators(resource_id)
             page = fetch_page_text(
                 url,
-                timeout_seconds=30,
+                timeout_seconds=retry_settings.timeout_seconds,
                 max_chars=10_000,
                 allow_private_urls=False,
                 etag=etag,
                 last_modified=last_modified,
+                browser_timeout_seconds=retry_settings.browser_timeout_seconds,
             )
             if page.not_modified:
                 store.record_not_modified_fetch(

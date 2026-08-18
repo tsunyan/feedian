@@ -71,6 +71,10 @@ class VaultConfig:
             "retry_base_minutes": 30,
             "retry_max_days": 30,
             "terminal_http_statuses": [404, 410],
+            "terminal_failure_kinds": ["dns", "timeout"],
+            "terminal_kind_failures": 3,
+            "timeout_seconds": 5,
+            "browser_timeout_seconds": 30,
         }
     )
     llm: LLMSettings = field(default_factory=LLMSettings)
@@ -460,9 +464,21 @@ def _render_rss_feed(feed: RssFeedSettings | str) -> object:
     }
 
 
-def fetch_retry_settings(config: VaultConfig) -> tuple[int, int, tuple[int, ...]]:
-    """(retry_base_minutes, retry_max_days, terminal_http_statuses)."""
+_KNOWN_FAILURE_KINDS = ("dns", "timeout")
 
+
+@dataclass(frozen=True)
+class FetchRetrySettings:
+    retry_base_minutes: int
+    retry_max_days: int
+    terminal_http_statuses: tuple[int, ...]
+    terminal_failure_kinds: tuple[str, ...]
+    terminal_kind_failures: int
+    timeout_seconds: int
+    browser_timeout_seconds: int
+
+
+def fetch_retry_settings(config: VaultConfig) -> FetchRetrySettings:
     defaults = VaultConfig().fetch
 
     base_minutes = config.fetch.get("retry_base_minutes", defaults["retry_base_minutes"])
@@ -479,12 +495,44 @@ def fetch_retry_settings(config: VaultConfig) -> tuple[int, int, tuple[int, ...]
         for status in statuses
     ):
         raise ValueError("fetch.terminal_http_statuses must be a list of HTTP status codes (100-599).")
-    deduplicated: list[int] = []
+    deduplicated_statuses: list[int] = []
     for status in statuses:
-        if status not in deduplicated:
-            deduplicated.append(status)
+        if status not in deduplicated_statuses:
+            deduplicated_statuses.append(status)
 
-    return base_minutes, max_days, tuple(deduplicated)
+    kinds = config.fetch.get("terminal_failure_kinds", defaults["terminal_failure_kinds"])
+    if not isinstance(kinds, list) or not all(kind in _KNOWN_FAILURE_KINDS for kind in kinds):
+        raise ValueError(f"fetch.terminal_failure_kinds must be a list containing only {_KNOWN_FAILURE_KINDS}.")
+    deduplicated_kinds: list[str] = []
+    for kind in kinds:
+        if kind not in deduplicated_kinds:
+            deduplicated_kinds.append(kind)
+
+    kind_failures = config.fetch.get("terminal_kind_failures", defaults["terminal_kind_failures"])
+    if isinstance(kind_failures, bool) or not isinstance(kind_failures, int) or kind_failures < 1:
+        raise ValueError("fetch.terminal_kind_failures must be an integer >= 1.")
+
+    timeout_seconds = config.fetch.get("timeout_seconds", defaults["timeout_seconds"])
+    if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, int) or timeout_seconds < 1:
+        raise ValueError("fetch.timeout_seconds must be an integer >= 1.")
+
+    browser_timeout_seconds = config.fetch.get("browser_timeout_seconds", defaults["browser_timeout_seconds"])
+    if (
+        isinstance(browser_timeout_seconds, bool)
+        or not isinstance(browser_timeout_seconds, int)
+        or browser_timeout_seconds < 1
+    ):
+        raise ValueError("fetch.browser_timeout_seconds must be an integer >= 1.")
+
+    return FetchRetrySettings(
+        retry_base_minutes=base_minutes,
+        retry_max_days=max_days,
+        terminal_http_statuses=tuple(deduplicated_statuses),
+        terminal_failure_kinds=tuple(deduplicated_kinds),
+        terminal_kind_failures=kind_failures,
+        timeout_seconds=timeout_seconds,
+        browser_timeout_seconds=browser_timeout_seconds,
+    )
 
 
 def normalized_rss_feeds(settings: ProviderSettings) -> list[RssFeedSettings]:

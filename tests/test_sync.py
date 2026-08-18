@@ -1194,3 +1194,106 @@ def test_quick_body_only_pass_does_not_charge_the_limit_budget_for_a_suppressed_
         assert report.retried == 1
     finally:
         store.close()
+
+
+def test_sync_passes_the_configured_timeout_seconds_to_fetch_page_text(monkeypatch, tmp_path) -> None:
+    item = CanonicalItem(source="hatena", source_id="one", content_key="url:one", url="https://example.test/one", title="A")
+    monkeypatch.setattr("feedian.sync._provider_items", lambda *_args, **_kwargs: iter([(item, b"{}")]))
+    captured_kwargs: dict[str, object] = {}
+    monkeypatch.setattr(
+        "feedian.sync.fetch_page_text",
+        lambda url, **kwargs: captured_kwargs.update(kwargs)
+        or PageFetchResult(url=url, final_url=url, text="body", media_type="text/html"),
+    )
+    config = VaultConfig(providers={"hatena": VaultConfig().providers["hatena"]})
+    config.fetch["timeout_seconds"] = 8
+    config.fetch["browser_timeout_seconds"] = 45
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        sync_vault(store, config, source="hatena", quick=False, fetch_comments=False)
+
+        assert captured_kwargs["timeout_seconds"] == 8
+        assert captured_kwargs["timeout_seconds"] != 30
+        assert captured_kwargs["browser_timeout_seconds"] == 45
+    finally:
+        store.close()
+
+
+def test_quick_body_only_pass_also_passes_the_configured_timeout_seconds(monkeypatch, tmp_path) -> None:
+    item = CanonicalItem(
+        source="hatena", source_id="one", content_key="url:one", url="https://example.test/one", title="A",
+    )
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        store.upsert_canonical_item(item)
+        monkeypatch.setattr("feedian.sync._provider_items", lambda *_args, **_kwargs: iter(()))
+        captured_kwargs: dict[str, object] = {}
+        monkeypatch.setattr(
+            "feedian.sync.fetch_page_text",
+            lambda url, **kwargs: captured_kwargs.update(kwargs)
+            or PageFetchResult(url=url, final_url=url, text="body", media_type="text/html"),
+        )
+        config = VaultConfig(providers={"hatena": VaultConfig().providers["hatena"]})
+        config.fetch["timeout_seconds"] = 9
+        config.fetch["browser_timeout_seconds"] = 41
+
+        sync_vault(store, config, source="hatena", quick=True, fetch_comments=False)
+
+        assert captured_kwargs["timeout_seconds"] == 9
+        assert captured_kwargs["browser_timeout_seconds"] == 41
+    finally:
+        store.close()
+
+
+def test_sync_records_the_dns_failure_kind_on_the_capture(monkeypatch, tmp_path) -> None:
+    """Wiring test for `_store_page`: without `failure_kind=page.failure_kind`,
+    `extract.py`'s classification never reaches the database and the terminal
+    mechanism has nothing to act on."""
+    item = CanonicalItem(source="hatena", source_id="one", content_key="url:one", url="https://example.test/one", title="A")
+    monkeypatch.setattr("feedian.sync._provider_items", lambda *_args, **_kwargs: iter([(item, b"{}")]))
+    monkeypatch.setattr(
+        "feedian.sync.fetch_page_text",
+        lambda *_args, **_kwargs: PageFetchResult(
+            url=item.url, text="", error="blocked URL: hostname could not be resolved", failure_kind="dns"
+        ),
+    )
+    config = VaultConfig(providers={"hatena": VaultConfig().providers["hatena"]})
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        sync_vault(store, config, source="hatena", quick=False, fetch_comments=False)
+
+        failure_kind = store.connection.execute(
+            "SELECT failure_kind FROM fetch_capture ORDER BY fetched_at DESC LIMIT 1"
+        ).fetchone()["failure_kind"]
+        assert failure_kind == "dns"
+    finally:
+        store.close()
+
+
+def test_full_sync_suppresses_a_resource_using_configured_terminal_kind_settings(monkeypatch, tmp_path) -> None:
+    """Uses non-default `terminal_failure_kinds`/`terminal_kind_failures` so a
+    match against the store's own defaults cannot pass this test by accident."""
+    item = CanonicalItem(source="hatena", source_id="one", content_key="url:one", url="https://example.test/one", title="A")
+    monkeypatch.setattr("feedian.sync._provider_items", lambda *_args, **_kwargs: iter([(item, b"{}")]))
+    calls: list[str] = []
+    monkeypatch.setattr(
+        "feedian.sync.fetch_page_text",
+        lambda url, **_kwargs: calls.append(url)
+        or PageFetchResult(url=url, final_url=url, text="body", media_type="text/html"),
+    )
+    config = VaultConfig(providers={"hatena": VaultConfig().providers["hatena"]})
+    config.fetch["terminal_failure_kinds"] = ["timeout"]
+    config.fetch["terminal_kind_failures"] = 1
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        stored = store.upsert_canonical_item(item)
+        # A single timeout failure. The default terminal_kind_failures (3)
+        # would not suppress this; the configured value (1) does.
+        store.record_failed_fetch(stored.resource_id or "", warning="timed out", failure_kind="timeout")
+
+        report = sync_vault(store, config, source="hatena", quick=False, fetch_comments=False)
+
+        assert calls == []
+        assert report.fetched == 0
+    finally:
+        store.close()

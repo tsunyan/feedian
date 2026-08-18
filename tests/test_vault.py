@@ -6,6 +6,7 @@ import unittest
 import pytest
 
 from feedian.vault import (
+    FetchRetrySettings,
     VaultConfig,
     fetch_retry_settings,
     find_vault_root,
@@ -161,36 +162,56 @@ class FetchRetrySettingsTests(unittest.TestCase):
     def test_defaults_when_keys_are_absent(self) -> None:
         settings = fetch_retry_settings(VaultConfig())
 
-        self.assertEqual(settings, (30, 30, (404, 410)))
+        self.assertEqual(
+            settings,
+            FetchRetrySettings(
+                retry_base_minutes=30,
+                retry_max_days=30,
+                terminal_http_statuses=(404, 410),
+                terminal_failure_kinds=("dns", "timeout"),
+                terminal_kind_failures=3,
+                timeout_seconds=5,
+                browser_timeout_seconds=30,
+            ),
+        )
 
-    def test_explicit_values_come_through_as_a_tuple(self) -> None:
+    def test_explicit_values_come_through_as_a_dataclass(self) -> None:
         config = VaultConfig()
         config.fetch["retry_base_minutes"] = 5
         config.fetch["retry_max_days"] = 7
         config.fetch["terminal_http_statuses"] = [404, 451]
+        config.fetch["terminal_failure_kinds"] = ["dns"]
+        config.fetch["terminal_kind_failures"] = 4
+        config.fetch["timeout_seconds"] = 8
+        config.fetch["browser_timeout_seconds"] = 45
 
-        base_minutes, max_days, statuses = fetch_retry_settings(config)
+        settings = fetch_retry_settings(config)
 
-        self.assertEqual(base_minutes, 5)
-        self.assertEqual(max_days, 7)
-        self.assertEqual(statuses, (404, 451))
-        self.assertIsInstance(statuses, tuple)
+        self.assertEqual(settings.retry_base_minutes, 5)
+        self.assertEqual(settings.retry_max_days, 7)
+        self.assertEqual(settings.terminal_http_statuses, (404, 451))
+        self.assertIsInstance(settings.terminal_http_statuses, tuple)
+        self.assertEqual(settings.terminal_failure_kinds, ("dns",))
+        self.assertIsInstance(settings.terminal_failure_kinds, tuple)
+        self.assertEqual(settings.terminal_kind_failures, 4)
+        self.assertEqual(settings.timeout_seconds, 8)
+        self.assertEqual(settings.browser_timeout_seconds, 45)
 
     def test_empty_terminal_http_statuses_disables_the_mechanism(self) -> None:
         config = VaultConfig()
         config.fetch["terminal_http_statuses"] = []
 
-        _, _, statuses = fetch_retry_settings(config)
+        settings = fetch_retry_settings(config)
 
-        self.assertEqual(statuses, ())
+        self.assertEqual(settings.terminal_http_statuses, ())
 
     def test_duplicate_terminal_http_statuses_are_deduplicated_in_order(self) -> None:
         config = VaultConfig()
         config.fetch["terminal_http_statuses"] = [410, 404, 410, 404]
 
-        _, _, statuses = fetch_retry_settings(config)
+        settings = fetch_retry_settings(config)
 
-        self.assertEqual(statuses, (410, 404))
+        self.assertEqual(settings.terminal_http_statuses, (410, 404))
 
     def test_retry_base_minutes_rejects_invalid_values(self) -> None:
         for invalid in (1.5, True, "2", 0, -1):
@@ -215,4 +236,56 @@ class FetchRetrySettingsTests(unittest.TestCase):
                 config.fetch["terminal_http_statuses"] = invalid
 
                 with self.assertRaisesRegex(ValueError, "terminal_http_statuses"):
+                    fetch_retry_settings(config)
+
+    def test_terminal_failure_kinds_accepts_an_empty_list(self) -> None:
+        config = VaultConfig()
+        config.fetch["terminal_failure_kinds"] = []
+
+        settings = fetch_retry_settings(config)
+
+        self.assertEqual(settings.terminal_failure_kinds, ())
+
+    def test_terminal_failure_kinds_deduplicates_in_order(self) -> None:
+        config = VaultConfig()
+        config.fetch["terminal_failure_kinds"] = ["timeout", "dns", "timeout", "dns"]
+
+        settings = fetch_retry_settings(config)
+
+        self.assertEqual(settings.terminal_failure_kinds, ("timeout", "dns"))
+
+    def test_terminal_failure_kinds_rejects_unknown_values(self) -> None:
+        for invalid in (["dns", "ssl"], ["unknown"], "dns", [1]):
+            with self.subTest(invalid=invalid):
+                config = VaultConfig()
+                config.fetch["terminal_failure_kinds"] = invalid
+
+                with self.assertRaisesRegex(ValueError, "terminal_failure_kinds"):
+                    fetch_retry_settings(config)
+
+    def test_terminal_kind_failures_rejects_invalid_values(self) -> None:
+        for invalid in (1.5, True, "2", 0, -1):
+            with self.subTest(invalid=invalid):
+                config = VaultConfig()
+                config.fetch["terminal_kind_failures"] = invalid
+
+                with self.assertRaisesRegex(ValueError, "terminal_kind_failures"):
+                    fetch_retry_settings(config)
+
+    def test_timeout_seconds_rejects_invalid_values(self) -> None:
+        for invalid in (1.5, True, "2", 0, -1):
+            with self.subTest(invalid=invalid):
+                config = VaultConfig()
+                config.fetch["timeout_seconds"] = invalid
+
+                with self.assertRaisesRegex(ValueError, "timeout_seconds"):
+                    fetch_retry_settings(config)
+
+    def test_browser_timeout_seconds_rejects_invalid_values(self) -> None:
+        for invalid in (1.5, True, "2", 0, -1):
+            with self.subTest(invalid=invalid):
+                config = VaultConfig()
+                config.fetch["browser_timeout_seconds"] = invalid
+
+                with self.assertRaisesRegex(ValueError, "browser_timeout_seconds"):
                     fetch_retry_settings(config)

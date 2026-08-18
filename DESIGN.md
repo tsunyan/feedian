@@ -43,8 +43,17 @@
 - 判定は`should_fetch_resource`にあり、**quickとfullの双方に効く**。`--full`は「既知itemも含めて全件処理する」という指示であって、「到達不能と分かっているURLを叩き直す」という指示ではない。復旧経路は`--force-fetch`のみで、新しいフラグは追加していない。
 - 404を永久に再試行しない根拠は実測にある。参照Vaultの404は1,885件で、2020年以前のブックマークは23.0%が404、2024年以降は13.1%だが**その95%が`x.com`**である。`x.com`はログインを要求して404を返すため、リンクが消えたのではなく構造的に取得できない。`x.com`を除くと直近の404率は0.7%であり、永久に再試行しない対象が日常運用で積み上がることはない。
 - **取得済みの本文は失われない。** 一度成功したresourceは、その後URLが404になっても本文を保持する。`record_failed_fetch`は非空の本文を持つrevisionに触れない。この保証の上に「取れた時のものが残るなら、後で404になっても構わない」という判断が成立する。
-- `fetch_page_text`はHTTP起因の失敗にも`http_status`を設定する。browser fallbackが失敗した場合は**元のstatus**（401/403/406）を残す。失敗の原因を示すのは元のstatusであり、fallback側の内部statusではない。DNS解決不能・タイムアウト・その他の例外はNULLのままとし、指数backoffが扱う。
+- `fetch_page_text`はHTTP起因の失敗にも`http_status`を設定する。browser fallbackが失敗した場合は**元のstatus**（401/403/406）を残す。失敗の原因を示すのは元のstatusであり、fallback側の内部statusではない。DNS解決不能・タイムアウト・その他の例外では`http_status`はNULLのままである。このうちDNS解決不能とタイムアウトは`failure_kind`として記録し、後述の終端規則が扱う。それ以外は指数backoffが扱う。
 - 状態遷移は3経路ある。失敗は`consecutive_failures`を加算し、非空本文の成功は0へ戻し、304も0へ戻す。304は「保持中の本文がサーバー上の最新と同じ」と確認できた成功であり、これを失敗として数えると、失敗していない回数が次回のbackoffへ持ち越される。成功時に呼び出し側のwarningを消さないのは、RSSフォールバックが本文とページ取得エラーを同時に記録し、その理由をraw noteの`## Fetch Warning`が示すためである。**この1点だけは確定仕様の状態遷移表と異なる。** 仕様は成功時に`warning`をNULLにすると定めたが、判定はいずれも本文長0を必須条件とするため機構上は不要であり、消すとフォールバックの由来が失われる。逸脱の経緯は [実装のコードレビュー](docs/reviews/20260818-fetch-retry-suppression-implementation.ja.md) にある。
 - SQLite schema version 8の`fetch_capture`は`consecutive_failures`と`http_status`を持つ。`retry_after`列は設けない。`fetched_at`と失敗回数から算出でき、列を持つと算出規則と保存値の二重管理になる。
 - 移行行（`consecutive_failures = 0`）は指数式の定義域外である。本文が無くwarningがある移行行は**即座にdue**とし、本文がある行は`refresh_days`に従う。移行後の最初の1回は従来どおり全件を取得し、その1回で`http_status`と失敗回数が記録される。既存warningからの解析によるbackfillは行わない。
-- `feedian status`は`unreachable:`として、現在のVault configの終端ステータスに該当し本文を持たないresource数を表示する。抑制されたresourceが黙って消えないようにするためである。
+- `feedian status`は`unreachable:`として、現在のVault configの終端規則（終端ステータス、または終端種別と連続失敗回数。後述のとおり両者の和集合）に該当し本文を持たないresource数を表示する。抑制されたresourceが黙って消えないようにするためである。
+
+## 到達不能ホストの取得コスト
+
+サービス終了したドメインと応答しないホストへの取得を日常の`feedian sync`から取り除く。判断理由と却下した代替案は [到達不能ホストの取得コスト](docs/specs/20260819-unreachable-host-cost.ja.md) を参照する。
+
+- `fetch_capture.failure_kind`に`"dns"`（ホスト解決不能）と`"timeout"`（接続・応答timeout）を記録する。SSL失敗や抽出失敗は種別を持たずNULLのままで、既存の指数backoffに任せる。
+- 抑制規則は「`failure_kind`が`terminal_failure_kinds`に含まれ、かつ`consecutive_failures`が`terminal_kind_failures`（既定3）以上」であり、種別は問わない連続失敗回数の条件である。終端ステータス（404/410）の規則と和集合で`should_fetch_resource`・`terminal_failure_count`の双方に効く。復旧は`--force-fetch`のみ。
+- 取得タイムアウトは`fetch.timeout_seconds`（既定5秒）で設定できる。browser fallback（401/403/406の代替取得、低品質HTMLの再描画）は別枠の`fetch.browser_timeout_seconds`（既定30秒）を使う。
+- SQLite schema version 9の`fetch_capture`は`failure_kind`列を持つ。移行時に`consecutive_failures >= 2`の既存行を1へ戻す。新規則の下で観測した連続失敗回数として閾値の意味を揃えるためであり、移行直後の一時的な失敗1回で終端化しないようにする。

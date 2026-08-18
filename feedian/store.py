@@ -13,7 +13,7 @@ from .canonical import CanonicalItem, canonicalize_url
 from .ids import uuid7
 
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 
 def utc_now() -> str:
@@ -162,6 +162,10 @@ class VaultStore:
             if current == 7:
                 _migrate_v7_to_v8(self.connection)
                 current = 8
+                continue
+            if current == 8:
+                _migrate_v8_to_v9(self.connection)
+                current = 9
                 continue
             raise RuntimeError(f"No migration path from database schema {current}.")
 
@@ -422,13 +426,13 @@ class VaultStore:
                     INSERT INTO fetch_capture(fetch_capture_id, resource_id, resource_revision_id, http_payload_id,
                                               rendered_payload_id, final_url, extracted_by, content_truncated,
                                               warning, response_etag, response_last_modified, consecutive_failures,
-                                              http_status, fetched_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                              http_status, failure_kind, fetched_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (uuid7(), resource_id, revision_id, http_payload_id, rendered_payload_id, final_url,
                      extracted_by, int(content_truncated), capture_warning,
                      _header_value(response_headers, "ETag"), _header_value(response_headers, "Last-Modified"),
-                     0, http_status, now),
+                     0, http_status, None, now),
                 )
             else:
                 connection.execute(
@@ -438,13 +442,15 @@ class VaultStore:
                         extracted_by = ?, content_truncated = ?, warning = ?, response_etag = ?,
                         response_last_modified = ?,
                         consecutive_failures = CASE WHEN ? THEN 0 ELSE consecutive_failures END,
-                        http_status = ?, fetched_at = ?
+                        http_status = ?,
+                        failure_kind = CASE WHEN ? THEN NULL ELSE failure_kind END,
+                        fetched_at = ?
                     WHERE fetch_capture_id = ?
                     """,
                     (revision_id, http_payload_id, rendered_payload_id, final_url, extracted_by,
                      int(content_truncated), capture_warning, _header_value(response_headers, "ETag"),
-                     _header_value(response_headers, "Last-Modified"), int(is_success), http_status, now,
-                     capture["fetch_capture_id"]),
+                     _header_value(response_headers, "Last-Modified"), int(is_success), http_status,
+                     int(is_success), now, capture["fetch_capture_id"]),
                 )
             if changed:
                 self._mark_search_dirty(connection)
@@ -461,6 +467,7 @@ class VaultStore:
         rendered_payload_id: str | None = None,
         response_headers: dict[str, str] | None = None,
         http_status: int | None = None,
+        failure_kind: str | None = None,
     ) -> None:
         """Record a failed page fetch without writing a resource_revision.
 
@@ -492,12 +499,13 @@ class VaultStore:
                     """
                     INSERT INTO fetch_capture(fetch_capture_id, resource_id, resource_revision_id, http_payload_id,
                                               rendered_payload_id, final_url, warning, response_etag,
-                                              response_last_modified, consecutive_failures, http_status, fetched_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                              response_last_modified, consecutive_failures, http_status,
+                                              failure_kind, fetched_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (uuid7(), resource_id, capture_revision_id, http_payload_id, rendered_payload_id, final_url,
                      warning, _header_value(response_headers, "ETag"),
-                     _header_value(response_headers, "Last-Modified"), 1, http_status, now),
+                     _header_value(response_headers, "Last-Modified"), 1, http_status, failure_kind, now),
                 )
             else:
                 connection.execute(
@@ -514,12 +522,17 @@ class VaultStore:
                         -- stale 404 after a later DNS or timeout failure would leave the
                         -- terminal rule suppressing a resource whose current failure is
                         -- transient, with no way back to the backoff.
-                        http_status = ?, fetched_at = ?
+                        http_status = ?,
+                        -- Not COALESCE either, and for the same reason: a stale "dns"
+                        -- surviving a later plain HTTP failure would keep the terminal
+                        -- rule suppressing a resource for a reason that no longer holds.
+                        failure_kind = ?,
+                        fetched_at = ?
                     WHERE fetch_capture_id = ?
                     """,
                     (capture_revision_id, http_payload_id, rendered_payload_id, final_url, warning,
                      _header_value(response_headers, "ETag"), _header_value(response_headers, "Last-Modified"),
-                     http_status, now, capture["fetch_capture_id"]),
+                     http_status, failure_kind, now, capture["fetch_capture_id"]),
                 )
             if current_id:
                 content_row = connection.execute(
@@ -816,7 +829,13 @@ class VaultStore:
         ).fetchall()
         return [(str(row["resource_id"]), str(row["url"])) for row in rows]
 
-    def terminal_failure_count(self, terminal_http_statuses: tuple[int, ...]) -> int:
+    def terminal_failure_count(
+        self,
+        terminal_http_statuses: tuple[int, ...],
+        *,
+        terminal_failure_kinds: tuple[str, ...] = ("dns", "timeout"),
+        terminal_kind_failures: int = 3,
+    ) -> int:
         """Resources the terminal rule has actually stopped retrying.
 
         Mirrors `should_fetch_resource`'s failure branch, payload conditions
@@ -825,10 +844,28 @@ class VaultStore:
         here would report a resource as given up on while sync goes on fetching
         it. Uses the same "latest capture" correlated-subquery shape as
         `unfetched_resources` so it hits `fetch_capture_resource_idx`.
+
+        The terminal condition is the union of the http_status rule and the
+        failure_kind rule: either setting alone must still be countable, so
+        `feedian status`'s unreachable count matches `should_fetch_resource`
+        even when one of the two mechanisms is configured empty. SQLite
+        rejects `IN ()`, so an empty tuple omits its half of the union rather
+        than contributing an always-false clause.
         """
-        if not terminal_http_statuses:
+        conditions: list[str] = []
+        params: list[Any] = []
+        if terminal_http_statuses:
+            placeholders = ",".join("?" for _ in terminal_http_statuses)
+            conditions.append(f"lfc.http_status IN ({placeholders})")
+            params.extend(terminal_http_statuses)
+        if terminal_failure_kinds:
+            placeholders = ",".join("?" for _ in terminal_failure_kinds)
+            conditions.append(f"(lfc.failure_kind IN ({placeholders}) AND lfc.consecutive_failures >= ?)")
+            params.extend(terminal_failure_kinds)
+            params.append(terminal_kind_failures)
+        if not conditions:
             return 0
-        placeholders = ",".join("?" for _ in terminal_http_statuses)
+        terminal_condition = " OR ".join(conditions)
         row = self.connection.execute(
             f"""
             SELECT COUNT(*) AS count
@@ -840,13 +877,13 @@ class VaultStore:
                 ORDER BY newest.fetched_at DESC LIMIT 1
             )
             WHERE r.removed_at IS NULL
-              AND lfc.http_status IN ({placeholders})
+              AND ({terminal_condition})
               AND lfc.warning IS NOT NULL AND lfc.warning <> ''
               AND lfc.http_payload_id IS NULL
               AND lfc.rendered_payload_id IS NULL
               AND length(trim(coalesce(rr.content_markdown, ''))) = 0
             """,
-            terminal_http_statuses,
+            params,
         ).fetchone()
         return int(row["count"])
 
@@ -870,13 +907,15 @@ class VaultStore:
         retry_base_minutes: int = 30,
         retry_max_days: int = 30,
         terminal_http_statuses: tuple[int, ...] = (404, 410),
+        terminal_failure_kinds: tuple[str, ...] = ("dns", "timeout"),
+        terminal_kind_failures: int = 3,
     ) -> bool:
         if force:
             return True
         latest = self.connection.execute(
             """
             SELECT fc.fetched_at, fc.warning, fc.http_payload_id, fc.rendered_payload_id,
-                   fc.http_status, fc.consecutive_failures,
+                   fc.http_status, fc.consecutive_failures, fc.failure_kind,
                    length(trim(coalesce(rr.content_markdown, ''))) AS content_length
             FROM fetch_capture AS fc
             LEFT JOIN resource_revision AS rr ON rr.resource_revision_id = fc.resource_revision_id
@@ -896,6 +935,12 @@ class VaultStore:
             if latest["http_status"] is not None and int(latest["http_status"]) in terminal_http_statuses:
                 return False
             consecutive_failures = int(latest["consecutive_failures"] or 0)
+            # The condition is "consecutive failures at or above the threshold,
+            # and the *latest* failure's kind is terminal" -- not a per-kind
+            # streak. A NULL failure_kind never matches, so SSL and extraction
+            # failures fall through to the ordinary backoff below.
+            if latest["failure_kind"] in terminal_failure_kinds and consecutive_failures >= terminal_kind_failures:
+                return False
             if consecutive_failures == 0:
                 # A row migrated from schema 7 carries a warning but no recorded
                 # failure count; retry it once so it acquires one.
@@ -947,7 +992,8 @@ class VaultStore:
                 UPDATE fetch_capture
                 SET final_url = ?, response_etag = COALESCE(?, response_etag),
                     response_last_modified = COALESCE(?, response_last_modified),
-                    consecutive_failures = 0, warning = NULL, http_status = 304, fetched_at = ?
+                    consecutive_failures = 0, warning = NULL, http_status = 304, failure_kind = NULL,
+                    fetched_at = ?
                 WHERE fetch_capture_id = ?
                 """,
                 (final_url, _header_value(response_headers, "ETag") or None,
@@ -1414,6 +1460,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             response_last_modified TEXT NOT NULL DEFAULT '',
             consecutive_failures INTEGER NOT NULL DEFAULT 0,
             http_status INTEGER,
+            failure_kind TEXT,
             fetched_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS comment (
@@ -1960,3 +2007,21 @@ def _migrate_v7_to_v8(connection: sqlite3.Connection) -> None:
         if not _column_exists(connection, "fetch_capture", "http_status"):
             connection.execute("ALTER TABLE fetch_capture ADD COLUMN http_status INTEGER")
         connection.execute("UPDATE schema_meta SET value = '8' WHERE key = 'schema_version'")
+
+
+def _migrate_v8_to_v9(connection: sqlite3.Connection) -> None:
+    """Add failure_kind and reset consecutive_failures under the terminal-kind rule.
+
+    terminal_kind_failures is defined as "consecutive failures observed under
+    the new rule"; without a reset, rows that already carry a pre-existing
+    count from before this rule existed would reach it sooner than a resource
+    that starts failing today, and the same threshold would mean different
+    things depending on when a row started failing. This is independent of
+    adding the column, so it is not gated behind _column_exists.
+    """
+
+    with _transaction(connection):
+        if not _column_exists(connection, "fetch_capture", "failure_kind"):
+            connection.execute("ALTER TABLE fetch_capture ADD COLUMN failure_kind TEXT")
+        connection.execute("UPDATE fetch_capture SET consecutive_failures = 1 WHERE consecutive_failures >= 2")
+        connection.execute("UPDATE schema_meta SET value = '9' WHERE key = 'schema_version'")
