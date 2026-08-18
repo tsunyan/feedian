@@ -1,3 +1,5 @@
+import socket
+import ssl
 import unittest
 from io import BytesIO
 from urllib.error import HTTPError, URLError
@@ -8,6 +10,7 @@ from pypdf import PdfWriter
 
 from feedian.extract import (
     TextExtractor,
+    UnresolvableHostError,
     clean_extracted_text,
     decode_html,
     extract_html,
@@ -274,6 +277,140 @@ class StagedExtractionTests(unittest.TestCase):
         result = fetch_page_text("https://example.com/article", 5, 1000)
 
         self.assertEqual(result.http_status, 200)
+
+    @patch("feedian.extract.socket.getaddrinfo")
+    def test_dns_unresolvable_host_sets_dns_failure_kind(self, getaddrinfo) -> None:
+        getaddrinfo.side_effect = socket.gaierror("not known")
+
+        result = fetch_page_text("https://dead.example.com/article", 5, 1000)
+
+        self.assertEqual(result.failure_kind, "dns")
+        self.assertIn("blocked URL", result.error or "")
+
+    def test_private_address_rejection_leaves_failure_kind_none(self) -> None:
+        # 127.0.0.1 resolves locally without a network call, so this exercises
+        # the SSRF guard's ValueError branch, not the DNS failure branch.
+        result = fetch_page_text("http://127.0.0.1/secret", 5, 1000)
+
+        self.assertIsNone(result.failure_kind)
+        self.assertIn("blocked URL", result.error or "")
+
+    def test_scheme_violation_leaves_failure_kind_none(self) -> None:
+        result = fetch_page_text("ftp://example.com/article", 5, 1000)
+
+        self.assertIsNone(result.failure_kind)
+
+    def test_missing_hostname_leaves_failure_kind_none(self) -> None:
+        result = fetch_page_text("https:///no-host", 5, 1000)
+
+        self.assertIsNone(result.failure_kind)
+
+    @patch("feedian.extract.build_opener")
+    @patch("feedian.extract.validate_fetch_url")
+    def test_redirect_destination_dns_failure_does_not_set_failure_kind(
+        self, validate_url, build_opener
+    ) -> None:
+        # Only the pre-validation check in fetch_page_text sets "dns". A DNS
+        # failure raised while following a redirect (SafeRedirectHandler,
+        # inside opener.open) must not resurrect the same failure_kind.
+        build_opener.return_value.open.side_effect = UnresolvableHostError(
+            "hostname could not be resolved: redirect.example.com"
+        )
+
+        result = fetch_page_text("https://example.com/article", 5, 1000)
+
+        self.assertIsNone(result.failure_kind)
+
+    @patch("feedian.extract.build_opener")
+    @patch("feedian.extract.validate_fetch_url")
+    def test_opener_open_timeout_sets_timeout_failure_kind(self, validate_url, build_opener) -> None:
+        build_opener.return_value.open.side_effect = URLError(TimeoutError("timed out"))
+
+        result = fetch_page_text("https://example.com/article", 5, 1000)
+
+        self.assertEqual(result.failure_kind, "timeout")
+
+    @patch("feedian.extract.build_opener")
+    @patch("feedian.extract.validate_fetch_url")
+    def test_response_read_timeout_sets_timeout_failure_kind(self, validate_url, build_opener) -> None:
+        response = build_opener.return_value.open.return_value.__enter__.return_value
+        response.headers.get.return_value = "text/html; charset=utf-8"
+        response.read.side_effect = TimeoutError("timed out")
+
+        result = fetch_page_text("https://example.com/article", 5, 1000)
+
+        self.assertEqual(result.failure_kind, "timeout")
+
+    @patch("feedian.extract.build_opener")
+    @patch("feedian.extract.validate_fetch_url")
+    def test_ssl_failure_leaves_failure_kind_none(self, validate_url, build_opener) -> None:
+        build_opener.return_value.open.side_effect = ssl.SSLError("bad handshake")
+
+        result = fetch_page_text("https://example.com/article", 5, 1000)
+
+        self.assertIsNone(result.failure_kind)
+
+    @patch("feedian.extract.build_opener")
+    @patch("feedian.extract.validate_fetch_url")
+    def test_http_error_leaves_failure_kind_none(self, validate_url, build_opener) -> None:
+        build_opener.return_value.open.side_effect = HTTPError(
+            "https://example.com/article", 500, "Server Error", {}, BytesIO()
+        )
+
+        result = fetch_page_text("https://example.com/article", 5, 1000)
+
+        self.assertIsNone(result.failure_kind)
+
+    @patch("feedian.extract.fetch_page_text_with_browser")
+    @patch("feedian.extract.build_opener")
+    @patch("feedian.extract.validate_fetch_url")
+    def test_browser_fallback_receives_browser_timeout_not_http_timeout(
+        self, validate_url, build_opener, browser_fetch
+    ) -> None:
+        build_opener.return_value.open.side_effect = HTTPError(
+            "https://example.com/article", 403, "Forbidden", {}, BytesIO()
+        )
+        browser_fetch.return_value = type("Result", (), {"text": "Browser article"})()
+
+        fetch_page_text("https://example.com/article", 5, 1000, browser_timeout_seconds=45)
+
+        self.assertEqual(browser_fetch.call_args.kwargs["timeout_seconds"], 45)
+
+    @patch("feedian.extract.fetch_page_text_with_browser")
+    @patch("feedian.extract.build_opener")
+    @patch("feedian.extract.validate_fetch_url")
+    def test_browser_fallback_defaults_to_30_second_timeout(
+        self, validate_url, build_opener, browser_fetch
+    ) -> None:
+        build_opener.return_value.open.side_effect = HTTPError(
+            "https://example.com/article", 403, "Forbidden", {}, BytesIO()
+        )
+        browser_fetch.return_value = type("Result", (), {"text": "Browser article"})()
+
+        fetch_page_text("https://example.com/article", 5, 1000)
+
+        self.assertEqual(browser_fetch.call_args.kwargs["timeout_seconds"], 30)
+
+    @patch("feedian.extract.render_html_with_browser")
+    @patch("feedian.extract.build_opener")
+    @patch("feedian.extract.validate_fetch_url")
+    def test_low_quality_html_render_receives_browser_timeout(
+        self, validate_url, build_opener, render_browser
+    ) -> None:
+        response = build_opener.return_value.open.return_value.__enter__.return_value
+        response.headers.get.return_value = "text/html; charset=utf-8"
+        response.read.return_value = b"<html><body><div id='app'></div></body></html>"
+        response.geturl.return_value = "https://example.com/article"
+        rendered_body = "Rendered article body. " * 30
+        render_browser.return_value = (
+            f"<html><head><title>Rendered</title></head><body><article>{rendered_body}</article></body></html>",
+            "https://example.com/article",
+            "Rendered",
+        )
+
+        fetch_page_text("https://example.com/article", 5, 1000, browser_timeout_seconds=45)
+
+        self.assertEqual(render_browser.call_args.kwargs["timeout_seconds"], 45)
 
 
 if __name__ == "__main__":

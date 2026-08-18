@@ -238,7 +238,7 @@ def main(argv: list[str]) -> int:
 def _status(explicit_vault: str | None) -> int:
     root = find_vault_root(explicit=explicit_vault)
     config = load_vault_config(root)
-    _, _, terminal_http_statuses = fetch_retry_settings(config)
+    retry_settings = fetch_retry_settings(config)
     paths = vault_paths(root)
     print(f"vault: {root}")
     print(f"config: {paths.config_path}")
@@ -258,7 +258,12 @@ def _status(explicit_vault: str | None) -> int:
         )
         for name, count in store.status_counts().items():
             print(f"{name}: {count}")
-        print(f"unreachable: {store.terminal_failure_count(terminal_http_statuses)}")
+        unreachable_count = store.terminal_failure_count(
+            retry_settings.terminal_http_statuses,
+            terminal_failure_kinds=retry_settings.terminal_failure_kinds,
+            terminal_kind_failures=retry_settings.terminal_kind_failures,
+        )
+        print(f"unreachable: {unreachable_count}")
         latest = store.latest_sync_run()
         if latest is not None:
             print(f"last_sync: {latest['status']} mode={latest['mode']} {latest['finished_at'] or latest['started_at']}")
