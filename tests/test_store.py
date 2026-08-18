@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -21,6 +22,40 @@ def _item(*, title: str = "Title", comment: str = "", url: str = "https://exampl
     )
 
 
+def _seed_failed_resource(
+    store: VaultStore,
+    *,
+    url: str,
+    warning: str = "HTTP 500",
+    http_status: int | None = None,
+    consecutive_failures: int | None = None,
+    age: timedelta | None = None,
+) -> str:
+    """Create a resource whose only capture records a failed fetch.
+
+    `consecutive_failures` and `age` override what `record_failed_fetch` itself
+    would produce, via raw SQL -- the same pattern `test_record_failed_fetch_
+    called_twice_advances_the_same_capture` already uses to backdate a capture.
+    """
+    item = store.upsert_canonical_item(
+        CanonicalItem(source="hatena", source_id=url, content_key=f"url:{url}", url=url, title="Title")
+    )
+    resource_id = item.resource_id or ""
+    store.record_failed_fetch(resource_id, warning=warning, http_status=http_status)
+    if consecutive_failures is not None:
+        store.connection.execute(
+            "UPDATE fetch_capture SET consecutive_failures = ? WHERE resource_id = ?",
+            (consecutive_failures, resource_id),
+        )
+    if age is not None:
+        fetched_at = (datetime.now(timezone.utc) - age).isoformat()
+        store.connection.execute(
+            "UPDATE fetch_capture SET fetched_at = ? WHERE resource_id = ?", (fetched_at, resource_id)
+        )
+    store.connection.commit()
+    return resource_id
+
+
 def test_store_creates_schema_and_deduplicates_payload(tmp_path) -> None:
     store = VaultStore.open(tmp_path / ".feedian" / "feedian.sqlite3")
     try:
@@ -28,7 +63,7 @@ def test_store_creates_schema_and_deduplicates_payload(tmp_path) -> None:
         second = store.put_payload(b"<html>same</html>", media_type="text/html")
 
         assert first == second
-        assert store.schema_version() == 7
+        assert store.schema_version() == 8
         assert store.quick_check() == "ok"
         assert store.integrity_check() == "ok"
     finally:
@@ -307,7 +342,7 @@ def test_v1_migration_prunes_history_images_and_inline_fts(tmp_path) -> None:
 
     migrated = VaultStore.open(path, allow_migration=True)
     try:
-        assert migrated.schema_version() == 7
+        assert migrated.schema_version() == 8
         assert migrated.status_counts()["source_item_revision"] == 1
         assert migrated.status_counts()["resource_revision"] == 1
         assert migrated.connection.execute("SELECT COUNT(*) FROM fetch_capture").fetchone()[0] == 1
@@ -433,7 +468,7 @@ def test_v4_migration_adds_fetch_validators_and_commits(tmp_path) -> None:
             str(row[1]) for row in migrated.connection.execute("PRAGMA table_info(fetch_capture)")
         }
         assert {"response_etag", "response_last_modified"} <= columns
-        assert migrated.schema_version() == 7
+        assert migrated.schema_version() == 8
     finally:
         migrated.close()
 
@@ -490,7 +525,7 @@ def test_v5_migration_backfills_llm_backend_audit_columns(tmp_path) -> None:
             """,
             (run_id,),
         ).fetchone()
-        assert migrated.schema_version() == 7
+        assert migrated.schema_version() == 8
         assert tuple(row) == (
             "openai-responses",
             "1",
@@ -543,7 +578,7 @@ def test_a_migrated_database_has_the_same_llm_run_columns_as_a_fresh_one(tmp_pat
     def llm_run_columns(path) -> dict[str, tuple]:
         store = VaultStore.open(path, allow_migration=True)
         try:
-            assert store.schema_version() == 7
+            assert store.schema_version() == 8
             rows = store.connection.execute("PRAGMA table_info(llm_run)").fetchall()
             return {row[1]: (row[2], row[3], row[5]) for row in rows}
         finally:
@@ -996,10 +1031,402 @@ def test_v6_migration_backfills_full_mode_on_existing_sync_runs(tmp_path) -> Non
 
     migrated = VaultStore.open(path, allow_migration=True)
     try:
-        assert migrated.schema_version() == 7
+        assert migrated.schema_version() == 8
         mode = migrated.connection.execute(
             "SELECT mode FROM sync_run WHERE sync_run_id = ?", (run_id,)
         ).fetchone()["mode"]
         assert mode == "full"
     finally:
         migrated.close()
+
+
+def test_should_fetch_resource_backoff_grows_with_consecutive_failures(tmp_path) -> None:
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        # n=1: threshold is retry_base_minutes * 2**0 = 30 minutes.
+        n1_not_due = _seed_failed_resource(
+            store, url="https://example.test/n1-not-due", consecutive_failures=1, age=timedelta(minutes=29)
+        )
+        n1_due = _seed_failed_resource(
+            store, url="https://example.test/n1-due", consecutive_failures=1, age=timedelta(minutes=31)
+        )
+        # n=3: threshold is retry_base_minutes * 2**2 = 120 minutes.
+        n3_not_due = _seed_failed_resource(
+            store, url="https://example.test/n3-not-due", consecutive_failures=3, age=timedelta(minutes=119)
+        )
+        n3_due = _seed_failed_resource(
+            store, url="https://example.test/n3-due", consecutive_failures=3, age=timedelta(minutes=121)
+        )
+
+        assert store.should_fetch_resource(n1_not_due, refresh_days=30) is False
+        assert store.should_fetch_resource(n1_due, refresh_days=30) is True
+        assert store.should_fetch_resource(n3_not_due, refresh_days=30) is False
+        assert store.should_fetch_resource(n3_due, refresh_days=30) is True
+    finally:
+        store.close()
+
+
+def test_should_fetch_resource_backoff_is_capped_at_retry_max_days(tmp_path) -> None:
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        # An uncapped exponent for n=40 would put the threshold decades away;
+        # the cap keeps it at retry_max_days regardless.
+        resource_id = _seed_failed_resource(
+            store, url="https://example.test/capped", consecutive_failures=40, age=timedelta(days=30, minutes=5)
+        )
+
+        assert store.should_fetch_resource(resource_id, refresh_days=30, retry_max_days=30) is True
+    finally:
+        store.close()
+
+
+def test_record_resource_revision_resets_consecutive_failures_on_success(tmp_path) -> None:
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        item = store.upsert_canonical_item(_item())
+        resource_id = item.resource_id or ""
+        store.record_failed_fetch(resource_id, warning="HTTP 500")
+        store.record_failed_fetch(resource_id, warning="HTTP 500")
+
+        store.record_resource_revision(resource_id, content_markdown="Recovered body")
+
+        consecutive_failures = store.connection.execute(
+            "SELECT consecutive_failures FROM fetch_capture WHERE resource_id = ?", (resource_id,)
+        ).fetchone()["consecutive_failures"]
+        assert consecutive_failures == 0
+    finally:
+        store.close()
+
+
+def test_record_resource_revision_keeps_the_callers_warning_on_a_recovered_body(tmp_path) -> None:
+    """The RSS fallback records a body alongside the page-fetch error it stood in for."""
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        item = store.upsert_canonical_item(_item())
+        resource_id = item.resource_id or ""
+
+        store.record_resource_revision(resource_id, content_markdown="RSS fallback body", warning="HTTP 503")
+
+        warning = store.connection.execute(
+            "SELECT warning FROM fetch_capture WHERE resource_id = ?", (resource_id,)
+        ).fetchone()["warning"]
+        assert warning == "HTTP 503"
+    finally:
+        store.close()
+
+
+def test_should_fetch_resource_force_overrides_a_terminal_status(tmp_path) -> None:
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        resource_id = _seed_failed_resource(
+            store, url="https://example.test/gone", http_status=404, consecutive_failures=99
+        )
+
+        assert store.should_fetch_resource(resource_id, refresh_days=30, force=True) is True
+    finally:
+        store.close()
+
+
+def test_should_fetch_resource_suppresses_a_terminal_status_regardless_of_age(tmp_path) -> None:
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        resource_id = _seed_failed_resource(
+            store, url="https://example.test/gone", http_status=404, consecutive_failures=1, age=timedelta(days=365)
+        )
+
+        assert store.should_fetch_resource(resource_id, refresh_days=30) is False
+    finally:
+        store.close()
+
+
+def test_record_failed_fetch_keeps_an_existing_body_after_a_terminal_status(tmp_path) -> None:
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        item = store.upsert_canonical_item(_item())
+        resource_id = item.resource_id or ""
+        store.record_resource_revision(resource_id, content_markdown="Existing body")
+
+        store.record_failed_fetch(resource_id, warning="HTTP 404", http_status=404)
+
+        content = store.connection.execute(
+            "SELECT content_markdown FROM resource_revision WHERE resource_id = ?", (resource_id,)
+        ).fetchone()["content_markdown"]
+        assert content == "Existing body"
+        current_revision_id = store.connection.execute(
+            "SELECT current_revision_id FROM resource WHERE resource_id = ?", (resource_id,)
+        ).fetchone()["current_revision_id"]
+        assert current_revision_id is not None
+    finally:
+        store.close()
+
+
+def test_record_failed_fetch_stores_null_http_status_when_none_and_no_prior_status(tmp_path) -> None:
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        item = store.upsert_canonical_item(_item())
+        resource_id = item.resource_id or ""
+
+        store.record_failed_fetch(resource_id, warning="timed out")
+
+        http_status = store.connection.execute(
+            "SELECT http_status FROM fetch_capture WHERE resource_id = ?", (resource_id,)
+        ).fetchone()["http_status"]
+        assert http_status is None
+    finally:
+        store.close()
+
+
+def test_record_failed_fetch_replaces_a_terminal_status_with_a_later_transient_one(tmp_path) -> None:
+    """http_status is the latest failure's state, not a value to preserve.
+
+    Keeping the 404 would leave the terminal rule suppressing a resource whose
+    current failure is a timeout, with no route back to the backoff.
+    """
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        item = store.upsert_canonical_item(_item())
+        resource_id = item.resource_id or ""
+
+        store.record_failed_fetch(resource_id, warning="not found", http_status=404)
+        assert store.connection.execute(
+            "SELECT http_status FROM fetch_capture WHERE resource_id = ?", (resource_id,)
+        ).fetchone()["http_status"] == 404
+
+        store.record_failed_fetch(resource_id, warning="timed out", http_status=None)
+
+        assert store.connection.execute(
+            "SELECT http_status FROM fetch_capture WHERE resource_id = ?", (resource_id,)
+        ).fetchone()["http_status"] is None
+    finally:
+        store.close()
+
+
+def test_a_transient_failure_after_a_terminal_one_becomes_due_again(tmp_path) -> None:
+    """404 -> --force-fetch -> a non-HTTP failure must return to the backoff."""
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        item = store.upsert_canonical_item(_item())
+        resource_id = item.resource_id or ""
+        store.record_failed_fetch(resource_id, warning="not found", http_status=404)
+        assert store.should_fetch_resource(resource_id, refresh_days=30) is False
+
+        store.record_failed_fetch(resource_id, warning="DNS failure", http_status=None)
+        store.connection.execute(
+            "UPDATE fetch_capture SET fetched_at = ? WHERE resource_id = ?",
+            ("2000-01-01T00:00:00+00:00", resource_id),
+        )
+        store.connection.commit()
+
+        assert store.should_fetch_resource(resource_id, refresh_days=30) is True
+    finally:
+        store.close()
+
+def test_record_not_modified_fetch_clears_failure_state_and_sets_304(tmp_path) -> None:
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        item = store.upsert_canonical_item(_item())
+        resource_id = item.resource_id or ""
+        store.record_resource_revision(resource_id, content_markdown="Body")
+        store.record_failed_fetch(resource_id, warning="HTTP 500", http_status=500)
+
+        store.record_not_modified_fetch(resource_id, final_url="https://example.test/article")
+
+        row = store.connection.execute(
+            "SELECT consecutive_failures, warning, http_status FROM fetch_capture WHERE resource_id = ?",
+            (resource_id,),
+        ).fetchone()
+        assert row["consecutive_failures"] == 0
+        assert row["warning"] is None
+        assert row["http_status"] == 304
+    finally:
+        store.close()
+
+
+def test_consecutive_failures_after_a_success_failure_not_modified_failure_sequence(tmp_path) -> None:
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        item = store.upsert_canonical_item(_item())
+        resource_id = item.resource_id or ""
+
+        store.record_resource_revision(resource_id, content_markdown="Body")  # success
+        store.record_failed_fetch(resource_id, warning="HTTP 500")  # failure: 1
+        store.record_not_modified_fetch(resource_id, final_url="https://example.test/article")  # 304: resets to 0
+        store.record_failed_fetch(resource_id, warning="HTTP 500 again")  # failure: 1
+
+        consecutive_failures = store.connection.execute(
+            "SELECT consecutive_failures FROM fetch_capture WHERE resource_id = ?", (resource_id,)
+        ).fetchone()["consecutive_failures"]
+        assert consecutive_failures == 1
+    finally:
+        store.close()
+
+
+def _downgrade_to_v7(path) -> None:
+    connection = sqlite3.connect(path)
+    try:
+        connection.executescript(
+            """
+            ALTER TABLE fetch_capture DROP COLUMN consecutive_failures;
+            ALTER TABLE fetch_capture DROP COLUMN http_status;
+            UPDATE schema_meta SET value = '7' WHERE key = 'schema_version';
+            """
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def test_v7_migration_backfills_retry_state_on_a_failed_capture(tmp_path) -> None:
+    path = tmp_path / "feedian.sqlite3"
+    store = VaultStore.open(path)
+    try:
+        item = store.upsert_canonical_item(_item())
+        resource_id = item.resource_id or ""
+        # A resource with no body, left behind by a failed fetch before
+        # consecutive_failures/http_status tracking existed.
+        store.record_failed_fetch(resource_id, warning="HTTP 500")
+        store.connection.execute(
+            "UPDATE fetch_capture SET fetched_at = ? WHERE resource_id = ?",
+            ((datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(), resource_id),
+        )
+        store.connection.commit()
+    finally:
+        store.close()
+    _downgrade_to_v7(path)
+
+    migrated = VaultStore.open(path, allow_migration=True)
+    try:
+        assert migrated.schema_version() == 8
+        columns = {
+            str(row[1]) for row in migrated.connection.execute("PRAGMA table_info(fetch_capture)")
+        }
+        assert {"consecutive_failures", "http_status"} <= columns
+
+        row = migrated.connection.execute(
+            "SELECT consecutive_failures, http_status FROM fetch_capture WHERE resource_id = ?",
+            (resource_id,),
+        ).fetchone()
+        assert row["consecutive_failures"] == 0
+        assert row["http_status"] is None
+
+        # A minute old is nowhere near due by refresh_days=30 or by any real
+        # backoff -- only the migrated-row special case (a warning but no
+        # recorded failure count) makes this True.
+        assert migrated.should_fetch_resource(resource_id, refresh_days=30) is True
+    finally:
+        migrated.close()
+
+
+def test_should_fetch_resource_retries_a_migrated_failure_row_immediately(tmp_path) -> None:
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        item = store.upsert_canonical_item(_item())
+        resource_id = item.resource_id or ""
+        store.record_failed_fetch(resource_id, warning="HTTP 500")
+        # Simulate a capture written before consecutive_failures tracking existed:
+        # a warning but no counter, aged only a minute.
+        store.connection.execute(
+            "UPDATE fetch_capture SET consecutive_failures = 0, fetched_at = ? WHERE resource_id = ?",
+            ((datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(), resource_id),
+        )
+        store.connection.commit()
+
+        assert store.should_fetch_resource(resource_id, refresh_days=30) is True
+    finally:
+        store.close()
+
+
+def test_should_fetch_resource_migrated_row_with_a_body_follows_refresh_days(tmp_path) -> None:
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        item = store.upsert_canonical_item(_item())
+        resource_id = item.resource_id or ""
+        store.record_resource_revision(resource_id, content_markdown="Body", warning="stale warning")
+        store.connection.execute(
+            "UPDATE fetch_capture SET consecutive_failures = 0, fetched_at = ? WHERE resource_id = ?",
+            ((datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(), resource_id),
+        )
+        store.connection.commit()
+
+        # A minute old and refresh_days=30: due only if the failure/backoff path
+        # were wrongly applied instead of the held-body refresh_days rule.
+        assert store.should_fetch_resource(resource_id, refresh_days=30) is False
+    finally:
+        store.close()
+
+
+def test_terminal_failure_count_counts_only_matching_bodyless_resources(tmp_path) -> None:
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        _seed_failed_resource(store, url="https://example.test/gone", http_status=404)
+        recovered = store.upsert_canonical_item(
+            CanonicalItem(
+                source="hatena", source_id="recovered", content_key="url:recovered",
+                url="https://example.test/recovered", title="Recovered",
+            )
+        )
+        store.record_resource_revision(
+            recovered.resource_id or "", content_markdown="Body", warning="HTTP 404", http_status=404
+        )
+        _seed_failed_resource(store, url="https://example.test/other", http_status=500)
+
+        assert store.terminal_failure_count((404, 410)) == 1
+    finally:
+        store.close()
+
+
+def test_terminal_failure_count_agrees_with_should_fetch_resource_on_a_payload_capture(tmp_path) -> None:
+    """A capture holding raw bytes is still refetched, so it is not "given up on".
+
+    A PDF that later 404s keeps the payload an earlier attempt stored, which
+    sends should_fetch_resource down the refresh_days branch. Counting it as
+    unreachable would have `feedian status` claim Feedian stopped retrying a URL
+    it goes on fetching every refresh_days.
+    """
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        item = store.upsert_canonical_item(_item())
+        resource_id = item.resource_id or ""
+        payload_id = store.put_payload(b"%PDF-1.4", media_type="application/pdf")
+        store.record_failed_fetch(
+            resource_id, warning="unsupported content type", http_payload_id=payload_id, http_status=200
+        )
+        store.record_failed_fetch(resource_id, warning="HTTP 404", http_status=404)
+        store.connection.execute(
+            "UPDATE fetch_capture SET fetched_at = ? WHERE resource_id = ?",
+            ("2000-01-01T00:00:00+00:00", resource_id),
+        )
+        store.connection.commit()
+
+        assert store.should_fetch_resource(resource_id, refresh_days=30) is True
+        assert store.terminal_failure_count((404, 410)) == 0
+    finally:
+        store.close()
+
+
+def test_terminal_failure_count_returns_zero_for_an_empty_status_tuple(tmp_path) -> None:
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        _seed_failed_resource(store, url="https://example.test/gone", http_status=404)
+
+        assert store.terminal_failure_count(()) == 0
+    finally:
+        store.close()
+
+
+def test_should_fetch_resource_with_no_terminal_statuses_falls_through_to_backoff(tmp_path) -> None:
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        not_due = _seed_failed_resource(
+            store, url="https://example.test/gone-1", http_status=404, consecutive_failures=1,
+            age=timedelta(minutes=1),
+        )
+        due = _seed_failed_resource(
+            store, url="https://example.test/gone-2", http_status=404, consecutive_failures=1,
+            age=timedelta(minutes=31),
+        )
+
+        assert store.should_fetch_resource(not_due, refresh_days=30, terminal_http_statuses=()) is False
+        assert store.should_fetch_resource(due, refresh_days=30, terminal_http_statuses=()) is True
+    finally:
+        store.close()

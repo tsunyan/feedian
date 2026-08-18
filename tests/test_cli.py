@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from feedian.canonical import CanonicalItem
@@ -90,8 +92,58 @@ def test_init_migrate_and_status(tmp_path, capsys) -> None:
 
     output = capsys.readouterr().out
     assert "initialized:" in output
-    assert "migrated: schema_version=7" in output
+    assert "migrated: schema_version=8" in output
     assert "integrity: ok" in output
+
+
+def test_status_reports_unreachable_using_the_vaults_terminal_http_statuses(tmp_path, capsys) -> None:
+    root = tmp_path / "vault"
+    root.mkdir()
+    assert main(["init", "--vault", str(root)]) == 0
+    assert main(["migrate", "--vault", str(root)]) == 0
+
+    store = VaultStore.open(root / ".feedian" / "feedian.sqlite3")
+    try:
+        # Terminal by the vault's default terminal_http_statuses (404, 410):
+        # counted.
+        gone = store.upsert_canonical_item(
+            CanonicalItem(
+                source="hatena", source_id="gone", content_key="url:gone",
+                url="https://example.test/gone", title="Gone",
+            )
+        )
+        store.record_failed_fetch(gone.resource_id or "", warning="HTTP 404", http_status=404)
+        # Not a terminal status: not counted.
+        alive = store.upsert_canonical_item(
+            CanonicalItem(
+                source="hatena", source_id="alive", content_key="url:alive",
+                url="https://example.test/alive", title="Alive",
+            )
+        )
+        store.record_failed_fetch(alive.resource_id or "", warning="HTTP 500", http_status=500)
+    finally:
+        store.close()
+
+    assert main(["status", "--vault", str(root)]) == 0
+
+    output = capsys.readouterr().out
+    assert "unreachable: 1" in output
+
+
+def test_status_rejects_an_invalid_terminal_http_statuses_config(tmp_path, capsys) -> None:
+    root = tmp_path / "vault"
+    root.mkdir()
+    assert main(["init", "--vault", str(root)]) == 0
+
+    config_path = root / ".feedian" / "config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["fetch"]["terminal_http_statuses"] = [99]
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    assert main(["status", "--vault", str(root)]) == 1
+
+    error = capsys.readouterr().err
+    assert "fetch.terminal_http_statuses" in error
 
 
 def test_migrate_does_not_copy_existing_raw_markdown_into_sqlite(tmp_path, capsys) -> None:
@@ -104,7 +156,7 @@ def test_migrate_does_not_copy_existing_raw_markdown_into_sqlite(tmp_path, capsy
 
     assert main(["migrate", "--vault", str(root)]) == 0
 
-    assert "migrated: schema_version=7" in capsys.readouterr().out
+    assert "migrated: schema_version=8" in capsys.readouterr().out
     store = VaultStore.open(root / ".feedian" / "feedian.sqlite3")
     try:
         assert not store.connection.execute(

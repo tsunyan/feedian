@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import unittest
 
 import pytest
 
 from feedian.vault import (
+    VaultConfig,
+    fetch_retry_settings,
     find_vault_root,
     initialize_vault,
     load_vault_config,
@@ -152,3 +155,64 @@ def test_enabled_fallback_requires_both_a_backend_and_a_model(tmp_path) -> None:
     assert config.llm.fallback.enabled
     assert config.llm.fallback.backend == "openai-responses"
     assert config.llm.fallback.model == "gpt-5.6-terra"
+
+
+class FetchRetrySettingsTests(unittest.TestCase):
+    def test_defaults_when_keys_are_absent(self) -> None:
+        settings = fetch_retry_settings(VaultConfig())
+
+        self.assertEqual(settings, (30, 30, (404, 410)))
+
+    def test_explicit_values_come_through_as_a_tuple(self) -> None:
+        config = VaultConfig()
+        config.fetch["retry_base_minutes"] = 5
+        config.fetch["retry_max_days"] = 7
+        config.fetch["terminal_http_statuses"] = [404, 451]
+
+        base_minutes, max_days, statuses = fetch_retry_settings(config)
+
+        self.assertEqual(base_minutes, 5)
+        self.assertEqual(max_days, 7)
+        self.assertEqual(statuses, (404, 451))
+        self.assertIsInstance(statuses, tuple)
+
+    def test_empty_terminal_http_statuses_disables_the_mechanism(self) -> None:
+        config = VaultConfig()
+        config.fetch["terminal_http_statuses"] = []
+
+        _, _, statuses = fetch_retry_settings(config)
+
+        self.assertEqual(statuses, ())
+
+    def test_duplicate_terminal_http_statuses_are_deduplicated_in_order(self) -> None:
+        config = VaultConfig()
+        config.fetch["terminal_http_statuses"] = [410, 404, 410, 404]
+
+        _, _, statuses = fetch_retry_settings(config)
+
+        self.assertEqual(statuses, (410, 404))
+
+    def test_retry_base_minutes_rejects_invalid_values(self) -> None:
+        for invalid in (1.5, True, "2", 0, -1):
+            with self.subTest(invalid=invalid):
+                config = VaultConfig()
+                config.fetch["retry_base_minutes"] = invalid
+
+                with self.assertRaisesRegex(ValueError, "retry_base_minutes"):
+                    fetch_retry_settings(config)
+
+    def test_retry_max_days_rejects_zero(self) -> None:
+        config = VaultConfig()
+        config.fetch["retry_max_days"] = 0
+
+        with self.assertRaisesRegex(ValueError, "retry_max_days"):
+            fetch_retry_settings(config)
+
+    def test_terminal_http_statuses_rejects_invalid_values(self) -> None:
+        for invalid in (404, [True], [99], [600], ["404"]):
+            with self.subTest(invalid=invalid):
+                config = VaultConfig()
+                config.fetch["terminal_http_statuses"] = invalid
+
+                with self.assertRaisesRegex(ValueError, "terminal_http_statuses"):
+                    fetch_retry_settings(config)

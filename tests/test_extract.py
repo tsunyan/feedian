@@ -1,6 +1,6 @@
 import unittest
 from io import BytesIO
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 
 from unittest.mock import patch
 
@@ -215,6 +215,65 @@ class StagedExtractionTests(unittest.TestCase):
 
         self.assertEqual(result.text, "Browser article")
         browser_fetch.assert_called_once()
+
+    @patch("feedian.extract.build_opener")
+    @patch("feedian.extract.validate_fetch_url")
+    def test_http_404_reports_status_and_error(self, validate_url, build_opener) -> None:
+        build_opener.return_value.open.side_effect = HTTPError(
+            "https://example.com/article", 404, "Not Found", {}, BytesIO()
+        )
+
+        result = fetch_page_text("https://example.com/article", 5, 1000)
+
+        self.assertEqual(result.http_status, 404)
+        self.assertTrue(result.error)
+
+    @patch("feedian.extract.fetch_page_text_with_browser")
+    @patch("feedian.extract.build_opener")
+    @patch("feedian.extract.validate_fetch_url")
+    def test_http_403_with_failed_browser_fallback_reports_origin_status(
+        self, validate_url, build_opener, browser_fetch
+    ) -> None:
+        build_opener.return_value.open.side_effect = HTTPError(
+            "https://example.com/article", 403, "Forbidden", {}, BytesIO()
+        )
+        browser_fetch.side_effect = Exception("browser boom")
+
+        result = fetch_page_text("https://example.com/article", 5, 1000)
+
+        self.assertEqual(result.http_status, 403)
+        self.assertIn("browser fallback failed", result.error or "")
+
+    @patch("feedian.extract.validate_fetch_url")
+    def test_blocked_url_leaves_status_unset(self, validate_url) -> None:
+        validate_url.side_effect = ValueError("private address")
+
+        result = fetch_page_text("https://example.com/article", 5, 1000)
+
+        self.assertIsNone(result.http_status)
+        self.assertIn("blocked URL", result.error or "")
+
+    @patch("feedian.extract.build_opener")
+    @patch("feedian.extract.validate_fetch_url")
+    def test_connection_failure_leaves_status_unset(self, validate_url, build_opener) -> None:
+        build_opener.return_value.open.side_effect = URLError("Name or service not known")
+
+        result = fetch_page_text("https://example.com/article", 5, 1000)
+
+        self.assertIsNone(result.http_status)
+
+    @patch("feedian.extract.build_opener")
+    @patch("feedian.extract.validate_fetch_url")
+    def test_successful_fetch_still_reports_status(self, validate_url, build_opener) -> None:
+        response = build_opener.return_value.open.return_value.__enter__.return_value
+        response.headers.get.return_value = "text/html; charset=utf-8"
+        response.read.return_value = b"<html><body><article><p>Some article body text.</p></article></body></html>"
+        response.geturl.return_value = "https://example.com/article"
+        response.status = 200
+
+        result = fetch_page_text("https://example.com/article", 5, 1000)
+
+        self.assertEqual(result.http_status, 200)
 
 
 if __name__ == "__main__":

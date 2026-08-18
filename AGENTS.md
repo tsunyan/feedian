@@ -1,3 +1,23 @@
+## What Feedian is for
+
+Feedian is built for everyday usefulness, not for completeness. It keeps a working archive of what
+someone actually reads — not an academic dataset, and not a full snapshot service like archive.today.
+
+Reach for this when a decision is otherwise a coin flip:
+
+- **Prefer what makes a daily run better** over what makes a rare case correct.
+- **A gap that costs a person nothing is not a bug.** A page whose body never extracts, a bookmark
+  whose site is gone, a feed entry that aged out — record what happened and move on.
+- **Do not build machinery to close the last few percent.** A simple rule that handles the common
+  case beats an exact one that needs new state, a new schema, or free-text parsing to stay exact.
+- **This never licenses losing or corrupting stored data.** The principle bounds how far we chase
+  completeness, not whether what we do store is correct. Dropping a body we already had, or writing
+  a wrong one, is always a bug.
+- **It does not override a stated requirement, a finalized specification, or a data-integrity rule.**
+  Use it for the trade-offs those leave open, never as grounds to overrule them.
+
+If a question is still open after applying this, it is a real question — ask rather than guess.
+
 ## Specifications (`docs/specs/`)
 
 For substantial changes, write a specification and reach agreement on it before implementation.
@@ -60,6 +80,13 @@ If `DESIGN.md` contains only a summary without a link to the specification, read
 3. **Finalize it** — A human inserts the `最終案` section before the draft and changes the status to `確定`.
    Only at this point, commit the specification **by itself with the `docs:` type**.
 4. **Implement it** — Include both the code and the `DESIGN.md` summary update in the same commit, in accordance with the commit conventions.
+
+**Steps 3 and 4 are claims about commit topology, so check them with `git log` on the branch —
+never against a pull request diff.** A pull request presents its changes as one squashed object
+whose parent is the base branch tip, which erases the very boundary these steps create: the
+specification and the implementation always appear together there, and always will, however
+correctly they were committed. A finding that they were combined is only real if
+`git show --stat <spec commit>` lists the specification alone.
 
 Before finalization, **append rather than rewrite**. Only the status line may be rewritten.
 
@@ -130,6 +157,10 @@ git history already records that.
 2. **Apply the fixes** — Squash them into one commit so that `対象` stays exactly one commit behind.
 3. **Complete it** — Fill in `採否` and `検証`, set the status to `完了`, and commit the document
    **in the same commit as the fixes**.
+
+**Verify `対象` with `git rev-parse <fix commit>^`, not against a pull request diff** — for the same
+reason step 2 of the specification lifecycle gives. From a pull request's squashed view the parent
+of everything is the base branch tip, so a correctly recorded `対象` looks detached there every time.
 
 - Reviews are published. Never place `docs/reviews/` in `.gitignore`.
 - When a review changes no code, commit the document by itself with the `docs:` type.

@@ -34,3 +34,17 @@
 - (B1)はproviderの新着列挙から分離したDB駆動のpassであり、provider APIへのリクエストを要さない。本文取得だけを行い、provider metadata更新とコメント照会は伴わない。1つのresourceを複数のsource itemが共有する（同じ記事をRaindropとHatenaでブックマークした場合）ため、取得は1回だけ行い`sync_run_item`は全参照元へ記録する。`--limit`は(A)と(B1)の共有予算とし(A)を優先する。候補は最新`fetch_capture.fetched_at`の昇順で処理し、予算内で同じ先頭群だけが選ばれ続けることを防ぐ。
 - SQLite schema version 7の`sync_run`は`mode`を保存する。`_due_providers`は`mode='full'`のrunだけを見るため、quickを繰り返しても`feedian run`の完全同期がdueでなくなることはない。
 - quickだけを実行し続けると、provider側のmetadata差分、Hatenaコメントの増減、`refresh_days`到達による再取得、取得失敗本文の復旧が反映されない。これらは自動補正せず、完全同期の定期実行を案内する。
+
+## 本文取得の再試行抑制
+
+取得に失敗し続けるresourceは、再試行の間隔が伸びるか、まったく再試行されなくなる。判断理由と却下した代替案は [本文取得の再試行抑制](docs/specs/20260818-fetch-retry-suppression.ja.md) を参照する。
+
+- 機構は2つある。**指数backoff**は連続失敗回数`n`に応じて`min(retry_base_minutes * 2^(n-1), retry_max_days)`まで待機を伸ばし、一時的な障害を自動的に復帰させる。**終端ステータス**（既定`[404, 410]`）は経過時間によらず再試行しない。
+- 判定は`should_fetch_resource`にあり、**quickとfullの双方に効く**。`--full`は「既知itemも含めて全件処理する」という指示であって、「到達不能と分かっているURLを叩き直す」という指示ではない。復旧経路は`--force-fetch`のみで、新しいフラグは追加していない。
+- 404を永久に再試行しない根拠は実測にある。参照Vaultの404は1,885件で、2020年以前のブックマークは23.0%が404、2024年以降は13.1%だが**その95%が`x.com`**である。`x.com`はログインを要求して404を返すため、リンクが消えたのではなく構造的に取得できない。`x.com`を除くと直近の404率は0.7%であり、永久に再試行しない対象が日常運用で積み上がることはない。
+- **取得済みの本文は失われない。** 一度成功したresourceは、その後URLが404になっても本文を保持する。`record_failed_fetch`は非空の本文を持つrevisionに触れない。この保証の上に「取れた時のものが残るなら、後で404になっても構わない」という判断が成立する。
+- `fetch_page_text`はHTTP起因の失敗にも`http_status`を設定する。browser fallbackが失敗した場合は**元のstatus**（401/403/406）を残す。失敗の原因を示すのは元のstatusであり、fallback側の内部statusではない。DNS解決不能・タイムアウト・その他の例外はNULLのままとし、指数backoffが扱う。
+- 状態遷移は3経路ある。失敗は`consecutive_failures`を加算し、非空本文の成功は0へ戻し、304も0へ戻す。304は「保持中の本文がサーバー上の最新と同じ」と確認できた成功であり、これを失敗として数えると、失敗していない回数が次回のbackoffへ持ち越される。成功時に呼び出し側のwarningを消さないのは、RSSフォールバックが本文とページ取得エラーを同時に記録し、その理由をraw noteの`## Fetch Warning`が示すためである。**この1点だけは確定仕様の状態遷移表と異なる。** 仕様は成功時に`warning`をNULLにすると定めたが、判定はいずれも本文長0を必須条件とするため機構上は不要であり、消すとフォールバックの由来が失われる。逸脱の経緯は [実装のコードレビュー](docs/reviews/20260818-fetch-retry-suppression-implementation.ja.md) にある。
+- SQLite schema version 8の`fetch_capture`は`consecutive_failures`と`http_status`を持つ。`retry_after`列は設けない。`fetched_at`と失敗回数から算出でき、列を持つと算出規則と保存値の二重管理になる。
+- 移行行（`consecutive_failures = 0`）は指数式の定義域外である。本文が無くwarningがある移行行は**即座にdue**とし、本文がある行は`refresh_days`に従う。移行後の最初の1回は従来どおり全件を取得し、その1回で`http_status`と失敗回数が記録される。既存warningからの解析によるbackfillは行わない。
+- `feedian status`は`unreachable:`として、現在のVault configの終端ステータスに該当し本文を持たないresource数を表示する。抑制されたresourceが黙って消えないようにするためである。

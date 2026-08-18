@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
 from feedian.canonical import CanonicalItem
@@ -1100,5 +1102,95 @@ def test_quick_accepts_an_integer_stop_after_known_pages(monkeypatch, tmp_path) 
         report = sync_vault(store, config, source="hatena", quick=True, fetch_comments=False)
 
         assert report.processed == 0
+    finally:
+        store.close()
+
+
+def test_full_sync_suppresses_a_resource_with_a_terminal_capture(monkeypatch, tmp_path) -> None:
+    item = CanonicalItem(source="hatena", source_id="one", content_key="url:one", url="https://example.test/one", title="A")
+    monkeypatch.setattr("feedian.sync._provider_items", lambda *_args, **_kwargs: iter([(item, b"{}")]))
+    calls: list[str] = []
+    monkeypatch.setattr(
+        "feedian.sync.fetch_page_text",
+        lambda url, **_kwargs: calls.append(url)
+        or PageFetchResult(url=url, final_url=url, text="body", media_type="text/html"),
+    )
+    config = VaultConfig(providers={"hatena": VaultConfig().providers["hatena"]})
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        stored = store.upsert_canonical_item(item)
+        store.record_failed_fetch(stored.resource_id or "", warning="HTTP 404", http_status=404)
+
+        report = sync_vault(store, config, source="hatena", quick=False, fetch_comments=False)
+
+        assert calls == []
+        assert report.fetched == 0
+    finally:
+        store.close()
+
+
+def test_sync_stores_a_terminal_http_status_on_the_capture(monkeypatch, tmp_path) -> None:
+    item = CanonicalItem(source="hatena", source_id="one", content_key="url:one", url="https://example.test/one", title="A")
+    monkeypatch.setattr("feedian.sync._provider_items", lambda *_args, **_kwargs: iter([(item, b"{}")]))
+    monkeypatch.setattr(
+        "feedian.sync.fetch_page_text",
+        lambda *_args, **_kwargs: PageFetchResult(
+            url=item.url, text="", error="HTTP 404", fetch_method="http", http_status=404
+        ),
+    )
+    config = VaultConfig(providers={"hatena": VaultConfig().providers["hatena"]})
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        sync_vault(store, config, source="hatena", quick=False, fetch_comments=False)
+
+        http_status = store.connection.execute(
+            "SELECT http_status FROM fetch_capture ORDER BY fetched_at DESC LIMIT 1"
+        ).fetchone()["http_status"]
+        assert http_status == 404
+    finally:
+        store.close()
+
+
+def test_quick_body_only_pass_does_not_charge_the_limit_budget_for_a_suppressed_resource(monkeypatch, tmp_path) -> None:
+    suppressed_item = CanonicalItem(
+        source="hatena", source_id="suppressed", content_key="url:suppressed", url="https://example.test/suppressed",
+    )
+    fetchable_item = CanonicalItem(
+        source="hatena", source_id="fetchable", content_key="url:fetchable", url="https://example.test/fetchable",
+    )
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        # unfetched_resources orders never-fetched resources (NULL fetched_at)
+        # first, so both resources here carry a real, aged capture -- the
+        # suppressed one older -- to make sure the suppressed one is evaluated
+        # (and skipped without spending the budget) before the fetchable one.
+        suppressed_stored = store.upsert_canonical_item(suppressed_item)
+        store.record_failed_fetch(suppressed_stored.resource_id or "", warning="HTTP 404", http_status=404)
+        store.connection.execute(
+            "UPDATE fetch_capture SET fetched_at = ? WHERE resource_id = ?",
+            ((datetime.now(timezone.utc) - timedelta(days=400)).isoformat(), suppressed_stored.resource_id),
+        )
+        store.connection.commit()
+        fetchable_stored = store.upsert_canonical_item(fetchable_item)
+        store.record_failed_fetch(fetchable_stored.resource_id or "", warning="HTTP 500")
+        store.connection.execute(
+            "UPDATE fetch_capture SET fetched_at = ? WHERE resource_id = ?",
+            ((datetime.now(timezone.utc) - timedelta(minutes=40)).isoformat(), fetchable_stored.resource_id),
+        )
+        store.connection.commit()
+
+        monkeypatch.setattr("feedian.sync._provider_items", lambda *_args, **_kwargs: iter(()))
+        fetch_calls: list[str] = []
+        monkeypatch.setattr(
+            "feedian.sync.fetch_page_text",
+            lambda url, **_kwargs: fetch_calls.append(url)
+            or PageFetchResult(url=url, final_url=url, text="body", media_type="text/html"),
+        )
+        config = VaultConfig(providers={"hatena": VaultConfig().providers["hatena"]})
+
+        report = sync_vault(store, config, source="hatena", quick=True, limit=1, fetch_comments=False)
+
+        assert fetch_calls == [fetchable_item.url]
+        assert report.retried == 1
     finally:
         store.close()
