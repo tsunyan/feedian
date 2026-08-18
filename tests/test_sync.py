@@ -933,6 +933,70 @@ def test_raindrop_quick_collection_continues_past_a_mixed_known_and_new_page(mon
     assert stopped == []
 
 
+def test_a_raising_should_fetch_resource_fails_the_item_not_the_run(monkeypatch, tmp_path) -> None:
+    item = CanonicalItem(source="hatena", source_id="one", content_key="url:one", url="https://example.test/one")
+    monkeypatch.setattr(
+        "feedian.sync._provider_items",
+        lambda *_args, **_kwargs: iter([(item, b"{}")]),
+    )
+    config = VaultConfig(providers={"hatena": VaultConfig().providers["hatena"]})
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        def explode(*_args, **_kwargs):
+            raise RuntimeError("corrupt fetched_at")
+
+        monkeypatch.setattr(store, "should_fetch_resource", explode)
+
+        report = sync_vault(store, config, source="hatena", fetch_comments=False)
+
+        assert report.failed == 1
+        assert store.latest_sync_run()["status"] == "partial"
+        row = store.connection.execute("SELECT status, error FROM sync_run_item").fetchone()
+        assert row["status"] == "failed"
+        assert "corrupt fetched_at" in row["error"]
+    finally:
+        store.close()
+
+
+def test_quick_body_only_pass_records_a_capture_when_the_fetch_raises(monkeypatch, tmp_path) -> None:
+    item = CanonicalItem(source="hatena", source_id="one", content_key="url:one", url="https://example.test/one")
+    monkeypatch.setattr(
+        "feedian.sync._provider_items",
+        lambda *_args, **_kwargs: iter([(item, b"{}")]),
+    )
+    config = VaultConfig(providers={"hatena": VaultConfig().providers["hatena"]})
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        # Store the item without a body, so the next run sees it as a (B1) candidate.
+        sync_vault(store, config, source="hatena", quick=True, fetch_pages=False, fetch_comments=False)
+        resource_id = store.connection.execute("SELECT resource_id FROM resource").fetchone()[0]
+        assert store.connection.execute(
+            "SELECT COUNT(*) FROM fetch_capture WHERE resource_id = ?", (resource_id,)
+        ).fetchone()[0] == 0
+
+        def explode(*_args, **_kwargs):
+            raise RuntimeError("decode blew up")
+
+        monkeypatch.setattr("feedian.sync.fetch_page_text", explode)
+
+        report = sync_vault(store, config, source="hatena", quick=True, fetch_comments=False)
+
+        assert report.failed == 1
+        capture = store.connection.execute(
+            "SELECT warning, fetched_at FROM fetch_capture WHERE resource_id = ?", (resource_id,)
+        ).fetchone()
+        # Without the capture the resource keeps a NULL fetched_at and sorts first
+        # for every later run, taking the budget from everything behind it.
+        assert capture is not None
+        assert "decode blew up" in capture["warning"]
+        assert capture["fetched_at"]
+        assert store.connection.execute(
+            "SELECT current_revision_id FROM resource WHERE resource_id = ?", (resource_id,)
+        ).fetchone()[0] is None
+    finally:
+        store.close()
+
+
 def test_raindrop_quick_collection_stops_at_limit_new_items_even_without_a_fetch(monkeypatch) -> None:
     """`--limit` bounds items collected, not body fetches.
 

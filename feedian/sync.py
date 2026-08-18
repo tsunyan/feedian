@@ -118,6 +118,10 @@ def sync_vault(
                 stored = store.upsert_canonical_item(item, source_payload=raw_payload)
                 if quick and stored.resource_id:
                     handled_resource_ids.add(stored.resource_id)
+                # Bound before the try: should_fetch_resource reads fetch_capture and
+                # parses its timestamp, so it can raise, and the handler below reads
+                # this to decide whose audit rows to write.
+                should_fetch_page = False
                 try:
                     should_fetch_page = bool(
                         stored.resource_id
@@ -459,12 +463,23 @@ def _run_quick_body_only_pass(
                 )
             else:
                 _store_page(store, resource_id, page)
-            retried += 1
             fetched += 1
+            # retried answers "is the backlog draining?", so only a resource that
+            # came away with a body counts. fetched stays an attempt count, as it
+            # is in the item loop.
+            if page.text.strip():
+                retried += 1
             for source_item_id in source_item_ids:
                 store.record_sync_item(run_id, source_item_id, "completed")
         except Exception as exc:
             failed += 1
+            try:
+                # Without a capture the resource keeps a NULL fetched_at, so the
+                # oldest-attempt-first ordering hands it the budget again on every
+                # run and the resources behind it never get a turn.
+                store.record_failed_fetch(resource_id, warning=str(exc))
+            except Exception:
+                pass
             for source_item_id in source_item_ids:
                 store.record_sync_item(run_id, source_item_id, "failed", str(exc))
     return retried, fetched, failed

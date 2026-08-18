@@ -772,13 +772,11 @@ class VaultStore:
             JOIN source_item AS si ON si.resource_id = r.resource_id
                 AND si.provider IN ({placeholders}) AND si.account = ?
             LEFT JOIN resource_revision AS rr ON rr.resource_revision_id = r.current_revision_id
-            LEFT JOIN (
-                SELECT resource_id, fetched_at, warning FROM (
-                    SELECT resource_id, fetched_at, warning,
-                           ROW_NUMBER() OVER (PARTITION BY resource_id ORDER BY fetched_at DESC) AS row_number
-                    FROM fetch_capture
-                ) WHERE row_number = 1
-            ) AS lfc ON lfc.resource_id = r.resource_id
+            LEFT JOIN fetch_capture AS lfc ON lfc.fetch_capture_id = (
+                SELECT newest.fetch_capture_id FROM fetch_capture AS newest
+                WHERE newest.resource_id = r.resource_id
+                ORDER BY newest.fetched_at DESC LIMIT 1
+            )
             WHERE r.removed_at IS NULL
               AND (
                   r.current_revision_id IS NULL
