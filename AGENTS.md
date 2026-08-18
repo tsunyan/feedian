@@ -1,3 +1,23 @@
+## What Feedian is for
+
+Feedian is built for everyday usefulness, not for completeness. It keeps a working archive of what
+someone actually reads — not an academic dataset, and not a full snapshot service like archive.today.
+
+Reach for this when a decision is otherwise a coin flip:
+
+- **Prefer what makes a daily run better** over what makes a rare case correct.
+- **A gap that costs a person nothing is not a bug.** A page whose body never extracts, a bookmark
+  whose site is gone, a feed entry that aged out — record what happened and move on.
+- **Do not build machinery to close the last few percent.** A simple rule that handles the common
+  case beats an exact one that needs new state, a new schema, or free-text parsing to stay exact.
+- **This never licenses losing or corrupting stored data.** The principle bounds how far we chase
+  completeness, not whether what we do store is correct. Dropping a body we already had, or writing
+  a wrong one, is always a bug.
+- **It does not override a stated requirement, a finalized specification, or a data-integrity rule.**
+  Use it for the trade-offs those leave open, never as grounds to overrule them.
+
+If a question is still open after applying this, it is a real question — ask rather than guess.
+
 ## Specifications (`docs/specs/`)
 
 For substantial changes, write a specification and reach agreement on it before implementation.

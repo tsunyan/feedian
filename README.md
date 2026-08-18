@@ -8,6 +8,13 @@ Feedian collects bookmarks and feeds into a per-Obsidian-vault SQLite archive, r
 
 Supported providers are Raindrop.io, Hatena Bookmark, and RSS/Atom. Public Hatena comments can be attached to URLs collected from **any** provider.
 
+## Scope
+
+Feedian aims at everyday usefulness rather than completeness. It keeps a working archive of what you
+actually read — not an academic dataset, and not a full snapshot service like archive.today. Pages
+that cannot be fetched or extracted are recorded as such and set aside, so that a routine run stays
+fast and worth running.
+
 ## How it works
 
 ```text

@@ -20,7 +20,7 @@ from .hatena import (
 from .raindrop import RaindropClient
 from .rss import RssItem, fetch_rss_items, published_timestamp
 from .store import VaultStore, sha256_bytes, stable_json
-from .vault import VaultConfig, normalized_rss_feeds
+from .vault import VaultConfig, fetch_retry_settings, normalized_rss_feeds
 
 
 HATENA_COMMENT_LIMIT = 20
@@ -65,6 +65,8 @@ def sync_vault(
             raise ValueError("config.fetch.quick_stop_after_known_pages must be an integer")
         if stop_after_known_pages < 1:
             raise ValueError("config.fetch.quick_stop_after_known_pages must be >= 1")
+    refresh_days = int(config.fetch.get("refresh_days", 30))
+    retry_base_minutes, retry_max_days, terminal_http_statuses = fetch_retry_settings(config)
     fingerprint = sha256_bytes(
         stable_json(
             {
@@ -85,7 +87,6 @@ def sync_vault(
     provider_errors: list[str] = []
     stopped_early_providers: list[str] = []
     handled_resource_ids: set[str] = set()
-    refresh_days = int(config.fetch.get("refresh_days", 30))
 
     def record_provider_error(provider: str, source_name: str, error: Exception) -> None:
         nonlocal failed
@@ -131,6 +132,9 @@ def sync_vault(
                             stored.resource_id,
                             refresh_days=refresh_days,
                             force=force_fetch,
+                            retry_base_minutes=retry_base_minutes,
+                            retry_max_days=retry_max_days,
+                            terminal_http_statuses=terminal_http_statuses,
                         )
                     )
                     if should_fetch_page and stored.resource_id:
@@ -210,6 +214,9 @@ def sync_vault(
                     handled_resource_ids=handled_resource_ids,
                     refresh_days=refresh_days,
                     force_fetch=force_fetch,
+                    retry_base_minutes=retry_base_minutes,
+                    retry_max_days=retry_max_days,
+                    terminal_http_statuses=terminal_http_statuses,
                 )
                 retried += provider_retried
                 fetched += provider_fetched
@@ -384,6 +391,7 @@ def _store_page(store: VaultStore, resource_id: str, page: PageFetchResult) -> N
             http_payload_id=http_payload_id,
             rendered_payload_id=None,
             response_headers=page.response_headers,
+            http_status=page.http_status,
         )
         return
     resource_revision_id, _ = store.record_resource_revision(
@@ -398,6 +406,7 @@ def _store_page(store: VaultStore, resource_id: str, page: PageFetchResult) -> N
         content_truncated=page.content_truncated,
         warning=page.error,
         response_headers=page.response_headers,
+        http_status=page.http_status,
     )
     html = page.rendered_html
     if not html and page.raw_body is not None and "html" in page.media_type.lower():
@@ -422,6 +431,9 @@ def _run_quick_body_only_pass(
     handled_resource_ids: set[str],
     refresh_days: int,
     force_fetch: bool,
+    retry_base_minutes: int,
+    retry_max_days: int,
+    terminal_http_statuses: tuple[int, ...],
 ) -> tuple[int, int, int]:
     """Retry resources that still have no body, without touching any provider.
 
@@ -435,7 +447,14 @@ def _run_quick_body_only_pass(
             continue
         if remaining is not None and remaining <= 0:
             break
-        if not store.should_fetch_resource(resource_id, refresh_days=refresh_days, force=force_fetch):
+        if not store.should_fetch_resource(
+            resource_id,
+            refresh_days=refresh_days,
+            force=force_fetch,
+            retry_base_minutes=retry_base_minutes,
+            retry_max_days=retry_max_days,
+            terminal_http_statuses=terminal_http_statuses,
+        ):
             continue
         handled_resource_ids.add(resource_id)
         if remaining is not None:

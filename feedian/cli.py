@@ -38,6 +38,7 @@ from .snapshots import create_snapshot
 from .search import rebuild_search_index, search_index_generation
 from .store import SCHEMA_VERSION
 from .vault import (
+    fetch_retry_settings,
     find_vault_root,
     initialize_vault,
     load_vault_config,
@@ -237,6 +238,10 @@ def main(argv: list[str]) -> int:
 def _status(explicit_vault: str | None) -> int:
     root = find_vault_root(explicit=explicit_vault)
     config = load_vault_config(root)
+    try:
+        _, _, terminal_http_statuses = fetch_retry_settings(config)
+    except ValueError:
+        terminal_http_statuses = None
     paths = vault_paths(root)
     print(f"vault: {root}")
     print(f"config: {paths.config_path}")
@@ -256,6 +261,8 @@ def _status(explicit_vault: str | None) -> int:
         )
         for name, count in store.status_counts().items():
             print(f"{name}: {count}")
+        if terminal_http_statuses is not None:
+            print(f"unreachable: {store.terminal_failure_count(terminal_http_statuses)}")
         latest = store.latest_sync_run()
         if latest is not None:
             print(f"last_sync: {latest['status']} mode={latest['mode']} {latest['finished_at'] or latest['started_at']}")

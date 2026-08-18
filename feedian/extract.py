@@ -277,8 +277,9 @@ def fetch_page_text(
                     url=url,
                     text="",
                     error=f"HTTP {exc.code}; browser fallback failed: {browser_exc}",
+                    http_status=exc.code,
                 )
-        return PageFetchResult(url=url, text="", error=f"HTTP {exc.code}")
+        return PageFetchResult(url=url, text="", error=f"HTTP {exc.code}", http_status=exc.code)
     except URLError as exc:
         return PageFetchResult(url=url, text="", error=str(exc.reason))
     except Exception as exc:

@@ -68,6 +68,9 @@ class VaultConfig:
             "comment_workers": 8,
             "star_refresh_days": 30,
             "allow_private_hosts": [],
+            "retry_base_minutes": 30,
+            "retry_max_days": 30,
+            "terminal_http_statuses": [404, 410],
         }
     )
     llm: LLMSettings = field(default_factory=LLMSettings)
@@ -455,6 +458,33 @@ def _render_rss_feed(feed: RssFeedSettings | str) -> object:
         **({"route": feed.route} if feed.route else {}),
         **({"enabled": False} if not feed.enabled else {}),
     }
+
+
+def fetch_retry_settings(config: VaultConfig) -> tuple[int, int, tuple[int, ...]]:
+    """(retry_base_minutes, retry_max_days, terminal_http_statuses)."""
+
+    defaults = VaultConfig().fetch
+
+    base_minutes = config.fetch.get("retry_base_minutes", defaults["retry_base_minutes"])
+    if isinstance(base_minutes, bool) or not isinstance(base_minutes, int) or base_minutes < 1:
+        raise ValueError("fetch.retry_base_minutes must be an integer >= 1.")
+
+    max_days = config.fetch.get("retry_max_days", defaults["retry_max_days"])
+    if isinstance(max_days, bool) or not isinstance(max_days, int) or max_days < 1:
+        raise ValueError("fetch.retry_max_days must be an integer >= 1.")
+
+    statuses = config.fetch.get("terminal_http_statuses", defaults["terminal_http_statuses"])
+    if not isinstance(statuses, list) or not all(
+        isinstance(status, int) and not isinstance(status, bool) and 100 <= status <= 599
+        for status in statuses
+    ):
+        raise ValueError("fetch.terminal_http_statuses must be a list of HTTP status codes (100-599).")
+    deduplicated: list[int] = []
+    for status in statuses:
+        if status not in deduplicated:
+            deduplicated.append(status)
+
+    return base_minutes, max_days, tuple(deduplicated)
 
 
 def normalized_rss_feeds(settings: ProviderSettings) -> list[RssFeedSettings]:

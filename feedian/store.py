@@ -13,7 +13,7 @@ from .canonical import CanonicalItem, canonicalize_url
 from .ids import uuid7
 
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 def utc_now() -> str:
@@ -158,6 +158,10 @@ class VaultStore:
             if current == 6:
                 _migrate_v6_to_v7(self.connection)
                 current = 7
+                continue
+            if current == 7:
+                _migrate_v7_to_v8(self.connection)
+                current = 8
                 continue
             raise RuntimeError(f"No migration path from database schema {current}.")
 
@@ -354,7 +358,15 @@ class VaultStore:
         content_truncated: bool = False,
         warning: str | None = None,
         response_headers: dict[str, str] | None = None,
+        http_status: int | None = None,
     ) -> tuple[str, bool]:
+        is_success = bool(content_markdown.strip())
+        # The caller's warning is stored as it always was. Clearing it on success
+        # would erase why a body is what it is: the RSS fallback records a body
+        # *and* the page-fetch error that made it stand in, and the raw note shows
+        # that under ## Fetch Warning. A clean fetch passes warning=None anyway, so
+        # a stale one is already overwritten. Only the failure counter needs reset.
+        capture_warning = warning
         content_hash = sha256_bytes(
             stable_json(
                 {"title": title, "content_markdown": content_markdown, "discussion_text": discussion_text}
@@ -409,12 +421,14 @@ class VaultStore:
                     """
                     INSERT INTO fetch_capture(fetch_capture_id, resource_id, resource_revision_id, http_payload_id,
                                               rendered_payload_id, final_url, extracted_by, content_truncated,
-                                              warning, response_etag, response_last_modified, fetched_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                              warning, response_etag, response_last_modified, consecutive_failures,
+                                              http_status, fetched_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (uuid7(), resource_id, revision_id, http_payload_id, rendered_payload_id, final_url,
-                     extracted_by, int(content_truncated), warning,
-                     _header_value(response_headers, "ETag"), _header_value(response_headers, "Last-Modified"), now),
+                     extracted_by, int(content_truncated), capture_warning,
+                     _header_value(response_headers, "ETag"), _header_value(response_headers, "Last-Modified"),
+                     0, http_status, now),
                 )
             else:
                 connection.execute(
@@ -422,12 +436,15 @@ class VaultStore:
                     UPDATE fetch_capture
                     SET resource_revision_id = ?, http_payload_id = ?, rendered_payload_id = ?, final_url = ?,
                         extracted_by = ?, content_truncated = ?, warning = ?, response_etag = ?,
-                        response_last_modified = ?, fetched_at = ?
+                        response_last_modified = ?,
+                        consecutive_failures = CASE WHEN ? THEN 0 ELSE consecutive_failures END,
+                        http_status = ?, fetched_at = ?
                     WHERE fetch_capture_id = ?
                     """,
                     (revision_id, http_payload_id, rendered_payload_id, final_url, extracted_by,
-                     int(content_truncated), warning, _header_value(response_headers, "ETag"),
-                     _header_value(response_headers, "Last-Modified"), now, capture["fetch_capture_id"]),
+                     int(content_truncated), capture_warning, _header_value(response_headers, "ETag"),
+                     _header_value(response_headers, "Last-Modified"), int(is_success), http_status, now,
+                     capture["fetch_capture_id"]),
                 )
             if changed:
                 self._mark_search_dirty(connection)
@@ -443,6 +460,7 @@ class VaultStore:
         http_payload_id: str | None = None,
         rendered_payload_id: str | None = None,
         response_headers: dict[str, str] | None = None,
+        http_status: int | None = None,
     ) -> None:
         """Record a failed page fetch without writing a resource_revision.
 
@@ -474,12 +492,12 @@ class VaultStore:
                     """
                     INSERT INTO fetch_capture(fetch_capture_id, resource_id, resource_revision_id, http_payload_id,
                                               rendered_payload_id, final_url, warning, response_etag,
-                                              response_last_modified, fetched_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                              response_last_modified, consecutive_failures, http_status, fetched_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (uuid7(), resource_id, capture_revision_id, http_payload_id, rendered_payload_id, final_url,
                      warning, _header_value(response_headers, "ETag"),
-                     _header_value(response_headers, "Last-Modified"), now),
+                     _header_value(response_headers, "Last-Modified"), 1, http_status, now),
                 )
             else:
                 connection.execute(
@@ -489,12 +507,14 @@ class VaultStore:
                         http_payload_id = COALESCE(?, http_payload_id),
                         rendered_payload_id = COALESCE(?, rendered_payload_id),
                         final_url = COALESCE(NULLIF(?, ''), final_url),
-                        warning = ?, response_etag = ?, response_last_modified = ?, fetched_at = ?
+                        warning = ?, response_etag = ?, response_last_modified = ?,
+                        consecutive_failures = consecutive_failures + 1,
+                        http_status = COALESCE(?, http_status), fetched_at = ?
                     WHERE fetch_capture_id = ?
                     """,
                     (capture_revision_id, http_payload_id, rendered_payload_id, final_url, warning,
                      _header_value(response_headers, "ETag"), _header_value(response_headers, "Last-Modified"),
-                     now, capture["fetch_capture_id"]),
+                     http_status, now, capture["fetch_capture_id"]),
                 )
             if current_id:
                 content_row = connection.execute(
@@ -791,6 +811,33 @@ class VaultStore:
         ).fetchall()
         return [(str(row["resource_id"]), str(row["url"])) for row in rows]
 
+    def terminal_failure_count(self, terminal_http_statuses: tuple[int, ...]) -> int:
+        """Resources whose latest fetch ended in a terminal HTTP status and hold no body.
+
+        Uses the same "latest capture" correlated-subquery shape as
+        `unfetched_resources` so it hits `fetch_capture_resource_idx`.
+        """
+        if not terminal_http_statuses:
+            return 0
+        placeholders = ",".join("?" for _ in terminal_http_statuses)
+        row = self.connection.execute(
+            f"""
+            SELECT COUNT(*) AS count
+            FROM resource AS r
+            LEFT JOIN resource_revision AS rr ON rr.resource_revision_id = r.current_revision_id
+            LEFT JOIN fetch_capture AS lfc ON lfc.fetch_capture_id = (
+                SELECT newest.fetch_capture_id FROM fetch_capture AS newest
+                WHERE newest.resource_id = r.resource_id
+                ORDER BY newest.fetched_at DESC LIMIT 1
+            )
+            WHERE r.removed_at IS NULL
+              AND lfc.http_status IN ({placeholders})
+              AND length(trim(coalesce(rr.content_markdown, ''))) = 0
+            """,
+            terminal_http_statuses,
+        ).fetchone()
+        return int(row["count"])
+
     def source_items_for_resource(self, resource_id: str, providers: list[str]) -> list[str]:
         """source_item_id values referencing this resource, limited to these providers."""
         if not providers:
@@ -802,12 +849,22 @@ class VaultStore:
         ).fetchall()
         return [str(row["source_item_id"]) for row in rows]
 
-    def should_fetch_resource(self, resource_id: str, *, refresh_days: int, force: bool = False) -> bool:
+    def should_fetch_resource(
+        self,
+        resource_id: str,
+        *,
+        refresh_days: int,
+        force: bool = False,
+        retry_base_minutes: int = 30,
+        retry_max_days: int = 30,
+        terminal_http_statuses: tuple[int, ...] = (404, 410),
+    ) -> bool:
         if force:
             return True
         latest = self.connection.execute(
             """
             SELECT fc.fetched_at, fc.warning, fc.http_payload_id, fc.rendered_payload_id,
+                   fc.http_status, fc.consecutive_failures,
                    length(trim(coalesce(rr.content_markdown, ''))) AS content_length
             FROM fetch_capture AS fc
             LEFT JOIN resource_revision AS rr ON rr.resource_revision_id = fc.resource_revision_id
@@ -824,7 +881,20 @@ class VaultStore:
             and not latest["rendered_payload_id"]
             and int(latest["content_length"] or 0) == 0
         ):
-            return datetime.now(timezone.utc) - fetched_at >= timedelta(minutes=30)
+            if latest["http_status"] is not None and int(latest["http_status"]) in terminal_http_statuses:
+                return False
+            consecutive_failures = int(latest["consecutive_failures"] or 0)
+            if consecutive_failures == 0:
+                # A row migrated from schema 7 carries a warning but no recorded
+                # failure count; retry it once so it acquires one.
+                return True
+            # Clamp the exponent rather than 2**(n-1) itself: retry_base_minutes
+            # already dwarfs retry_max_days long before n grows large, and an
+            # unclamped exponent on a very stale row could take a long time to
+            # compute for no benefit.
+            exponent = min(consecutive_failures - 1, 62)
+            backoff_minutes = min(retry_base_minutes * (2**exponent), retry_max_days * 24 * 60)
+            return datetime.now(timezone.utc) - fetched_at >= timedelta(minutes=backoff_minutes)
         return datetime.now(timezone.utc) - fetched_at >= timedelta(days=max(1, refresh_days))
 
     def resource_fetch_validators(self, resource_id: str) -> tuple[str, str]:
@@ -864,7 +934,8 @@ class VaultStore:
                 """
                 UPDATE fetch_capture
                 SET final_url = ?, response_etag = COALESCE(?, response_etag),
-                    response_last_modified = COALESCE(?, response_last_modified), fetched_at = ?
+                    response_last_modified = COALESCE(?, response_last_modified),
+                    consecutive_failures = 0, warning = NULL, http_status = 304, fetched_at = ?
                 WHERE fetch_capture_id = ?
                 """,
                 (final_url, _header_value(response_headers, "ETag") or None,
@@ -1329,6 +1400,8 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             warning TEXT,
             response_etag TEXT NOT NULL DEFAULT '',
             response_last_modified TEXT NOT NULL DEFAULT '',
+            consecutive_failures INTEGER NOT NULL DEFAULT 0,
+            http_status INTEGER,
             fetched_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS comment (
@@ -1862,3 +1935,16 @@ def _migrate_v6_to_v7(connection: sqlite3.Connection) -> None:
         if not _column_exists(connection, "sync_run", "mode"):
             connection.execute("ALTER TABLE sync_run ADD COLUMN mode TEXT NOT NULL DEFAULT 'full'")
         connection.execute("UPDATE schema_meta SET value = '7' WHERE key = 'schema_version'")
+
+
+def _migrate_v7_to_v8(connection: sqlite3.Connection) -> None:
+    """Add fetch retry state so failed fetches back off instead of retrying forever."""
+
+    with _transaction(connection):
+        if not _column_exists(connection, "fetch_capture", "consecutive_failures"):
+            connection.execute(
+                "ALTER TABLE fetch_capture ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0"
+            )
+        if not _column_exists(connection, "fetch_capture", "http_status"):
+            connection.execute("ALTER TABLE fetch_capture ADD COLUMN http_status INTEGER")
+        connection.execute("UPDATE schema_meta SET value = '8' WHERE key = 'schema_version'")
