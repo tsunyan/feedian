@@ -817,9 +817,13 @@ class VaultStore:
         return [(str(row["resource_id"]), str(row["url"])) for row in rows]
 
     def terminal_failure_count(self, terminal_http_statuses: tuple[int, ...]) -> int:
-        """Resources whose latest fetch ended in a terminal HTTP status and hold no body.
+        """Resources the terminal rule has actually stopped retrying.
 
-        Uses the same "latest capture" correlated-subquery shape as
+        Mirrors `should_fetch_resource`'s failure branch, payload conditions
+        included: a capture that kept raw bytes from an earlier attempt falls
+        through to the refresh_days rule and is still refetched, so counting it
+        here would report a resource as given up on while sync goes on fetching
+        it. Uses the same "latest capture" correlated-subquery shape as
         `unfetched_resources` so it hits `fetch_capture_resource_idx`.
         """
         if not terminal_http_statuses:
@@ -837,6 +841,9 @@ class VaultStore:
             )
             WHERE r.removed_at IS NULL
               AND lfc.http_status IN ({placeholders})
+              AND lfc.warning IS NOT NULL AND lfc.warning <> ''
+              AND lfc.http_payload_id IS NULL
+              AND lfc.rendered_payload_id IS NULL
               AND length(trim(coalesce(rr.content_markdown, ''))) = 0
             """,
             terminal_http_statuses,

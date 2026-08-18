@@ -1375,6 +1375,35 @@ def test_terminal_failure_count_counts_only_matching_bodyless_resources(tmp_path
         store.close()
 
 
+def test_terminal_failure_count_agrees_with_should_fetch_resource_on_a_payload_capture(tmp_path) -> None:
+    """A capture holding raw bytes is still refetched, so it is not "given up on".
+
+    A PDF that later 404s keeps the payload an earlier attempt stored, which
+    sends should_fetch_resource down the refresh_days branch. Counting it as
+    unreachable would have `feedian status` claim Feedian stopped retrying a URL
+    it goes on fetching every refresh_days.
+    """
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        item = store.upsert_canonical_item(_item())
+        resource_id = item.resource_id or ""
+        payload_id = store.put_payload(b"%PDF-1.4", media_type="application/pdf")
+        store.record_failed_fetch(
+            resource_id, warning="unsupported content type", http_payload_id=payload_id, http_status=200
+        )
+        store.record_failed_fetch(resource_id, warning="HTTP 404", http_status=404)
+        store.connection.execute(
+            "UPDATE fetch_capture SET fetched_at = ? WHERE resource_id = ?",
+            ("2000-01-01T00:00:00+00:00", resource_id),
+        )
+        store.connection.commit()
+
+        assert store.should_fetch_resource(resource_id, refresh_days=30) is True
+        assert store.terminal_failure_count((404, 410)) == 0
+    finally:
+        store.close()
+
+
 def test_terminal_failure_count_returns_zero_for_an_empty_status_tuple(tmp_path) -> None:
     store = VaultStore.open(tmp_path / "feedian.sqlite3")
     try:

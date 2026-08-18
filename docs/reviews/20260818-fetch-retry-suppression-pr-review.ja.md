@@ -61,6 +61,22 @@ ancestor
 
 **影響:** 将来の実装者が確定仕様に従い、フォールバック由来の情報を消す変更を入れ得る。
 
+### 5. payloadを持つ終端失敗で`status`と実際の挙動が食い違う（CodeRabbit, Major） — 重大度: 中
+
+**根拠:** `feedian/store.py`の`should_fetch_resource`と`terminal_failure_count`
+
+**現象:** `should_fetch_resource`の失敗分岐は`not http_payload_id`を条件に含むため、payloadを持つcaptureは終端判定に到達せず`refresh_days`側へ回る。一方`terminal_failure_count`はpayloadを除外していなかった。最小再現:
+
+```
+capture: {'http_status': 404, 'has_payload': 1, 'warning': 'HTTP 404'}
+should_fetch_resource   -> True    （30日ごとに再取得する）
+terminal_failure_count  -> 1       （statusは「再試行をやめた」と表示する）
+```
+
+非HTMLの本文（PDF等）を一度取得したresourceのURLが後に404化すると、`record_failed_fetch`のCOALESCEが以前のpayload idを保持するためこの状態になる。
+
+**影響:** `feedian status`の`unreachable:`が実際の挙動と食い違う。利用者は再試行が止まったと読むが、`sync`は`refresh_days`ごとに取得し続ける。
+
 ## 採否
 
 | # | 指摘 | 重大度 | 採否 | 状態 |
@@ -69,6 +85,7 @@ ancestor
 | 2 | `対象`が直前でない | 高（主張） | 不採用 | 事実誤認。`git rev-parse f758fcb^`で反証 |
 | 3 | レビュー文書をコミットしない | 低 | 不採用 | 規約の読み違い。手順3が明示的にコミットを求める |
 | 4 | 仕様と実装の`warning`不一致 | 中 | 修正して採用 | 本コミットで`DESIGN.md`へ逸脱を明記 |
+| 5 | payload持ち終端失敗の`status`不一致 | 中 | 修正して採用 | 本コミットで`terminal_failure_count`を実挙動へ揃えた |
 
 ### 指摘1・2の原因 — レビュー対象が実際の履歴ではない
 
@@ -102,15 +119,26 @@ Codexが「実際の親」と述べた`ed74e3c`は、この合成コミットの
 
 **採ったのは指摘の背後にある懸念、すなわち発見可能性である。** 逸脱がレビュー文書にしか無いと、仕様だけを読んだ実装者が気づけない。`DESIGN.md`の該当行へ、この1点が確定仕様と異なること、その理由、レビュー文書へのリンクを追記した。`DESIGN.md`は「現在どう動いているか」を扱う可変の文書であり、仕様は「なぜそう決めたか」を扱う不変のADRである。読者が実装に従う経路は`DESIGN.md`であり、そこに逸脱を書けば懸念は解消する。
 
+### 指摘5を修正して採用した理由
+
+不一致の指摘は正しい。ただし提案された「payloadの有無に関係なく終端を先に抑制する」は採らない。
+
+確定事項3が「既存の失敗分岐の条件は変更しない。payloadを伴う失敗は従来どおり`refresh_days`側へ回る」と明示し、範囲外の4番目にも同じ判断が記されている。理由は`refresh_days`が30日であり日常の実行を圧迫しないことである。`AGENTS.md`の判断の指針も「確定した仕様を上書きしない」と定めている。
+
+**したがって直すのは`terminal_failure_count`側である。** `unreachable:`は「再試行をやめたresource数」を意味すべきであり、実際に再試行が続いているものを数えてはならない。`should_fetch_resource`の失敗分岐と同じ条件（warningあり、payload無し、本文長0）へ揃えた。
+
+なお、payloadを持つ終端resourceを完全に抑制するかどうかは、確定仕様の範囲外事項の見直しにあたる。必要になれば別仕様とする。
+
 ## 検証
 
-- [x] `./.venv/Scripts/python.exe -m pytest -q` → 343 passed。
+- [x] `./.venv/Scripts/python.exe -m pytest -q` → 344 passed。
 - [x] `./.venv/Scripts/python.exe -m ruff check feedian tests` → All checks passed!
 - [x] 指摘1: `git show --stat --format= 7a3249a`が仕様書1ファイルのみであることを確認した。
 - [x] 指摘2: `git rev-parse --short f758fcb^`が`859c6bb`を返すことを確認した。
 - [x] 指摘1・2の原因: `refs/pull/16/merge`が`Merge f758fcb into ed74e3c`であり、Codexの言う「実際の親」がその第1親であることを確認した。
 - [x] 指摘3: `AGENTS.md`のライフサイクル手順3が、レビュー文書を修正と同一コミットでコミットすると定めていることを確認した。
 - [x] 指摘4: `DESIGN.md`へ逸脱・理由・レビュー文書へのリンクを追記した。仕様と実装は変更していない。
+- [x] 指摘5: 最小再現で`should_fetch_resource=True`かつ`terminal_failure_count=1`を確認し、修正後に両者が一致することを確認した。`test_terminal_failure_count_agrees_with_should_fetch_resource_on_a_payload_capture`で固定し、修正を差し戻すと落ちることも確認した。
 
 ## 規約化した項目
 
