@@ -29,15 +29,13 @@ class RaindropClient:
         self.request_interval_seconds = max(0.0, request_interval_seconds)
         self._next_request_at = 0.0
 
-    def iter_raindrops(
+    def iter_raindrop_pages(
         self,
         collection_id: int,
         per_page: int,
         nested: bool,
-        limit: int | None = None,
-    ) -> Iterator[dict[str, Any]]:
+    ) -> Iterator[list[dict[str, Any]]]:
         page = 0
-        yielded = 0
         while True:
             params = {
                 "page": page,
@@ -49,14 +47,25 @@ class RaindropClient:
             items = data.get("items") or []
             if not items:
                 break
-            for item in items:
+            yield items
+            if len(items) < params["perpage"]:
+                break
+            page += 1
+
+    def iter_raindrops(
+        self,
+        collection_id: int,
+        per_page: int,
+        nested: bool,
+        limit: int | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        yielded = 0
+        for page_items in self.iter_raindrop_pages(collection_id, per_page, nested):
+            for item in page_items:
                 yield item
                 yielded += 1
                 if limit is not None and yielded >= limit:
                     return
-            if len(items) < params["perpage"]:
-                break
-            page += 1
 
     def get_root_collections(self) -> list[dict[str, Any]]:
         data = self._get("/collections", {})

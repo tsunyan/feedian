@@ -13,7 +13,7 @@ from .canonical import CanonicalItem, canonicalize_url
 from .ids import uuid7
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 def utc_now() -> str:
@@ -154,6 +154,10 @@ class VaultStore:
             if current == 5:
                 _migrate_v5_to_v6(self.connection)
                 current = 6
+                continue
+            if current == 6:
+                _migrate_v6_to_v7(self.connection)
+                current = 7
                 continue
             raise RuntimeError(f"No migration path from database schema {current}.")
 
@@ -430,6 +434,84 @@ class VaultStore:
         self.delete_orphan_payloads()
         return revision_id, changed
 
+    def record_failed_fetch(
+        self,
+        resource_id: str,
+        *,
+        warning: str,
+        final_url: str = "",
+        http_payload_id: str | None = None,
+        rendered_payload_id: str | None = None,
+        response_headers: dict[str, str] | None = None,
+    ) -> None:
+        """Record a failed page fetch without writing a resource_revision.
+
+        The capture still keeps ``http_payload_id``/``rendered_payload_id`` so
+        raw bytes obtained before extraction failed (e.g. a fetched page that
+        yielded no readable text) survive `delete_orphan_payloads`, which
+        treats any payload referenced from `fetch_capture` as live.
+
+        A failure carries no new payload, so omitted ids and an empty
+        ``final_url`` leave whatever an earlier successful fetch stored rather
+        than clearing it -- otherwise `delete_orphan_payloads` would collect the
+        bytes `reextract` re-extracts from.
+        """
+        now = utc_now()
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT current_revision_id FROM resource WHERE resource_id = ?", (resource_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Unknown resource: {resource_id}")
+            current_id = row["current_revision_id"]
+            capture_revision_id = str(current_id) if current_id else None
+            capture = connection.execute(
+                "SELECT fetch_capture_id FROM fetch_capture WHERE resource_id = ? ORDER BY fetched_at DESC LIMIT 1",
+                (resource_id,),
+            ).fetchone()
+            if capture is None:
+                connection.execute(
+                    """
+                    INSERT INTO fetch_capture(fetch_capture_id, resource_id, resource_revision_id, http_payload_id,
+                                              rendered_payload_id, final_url, warning, response_etag,
+                                              response_last_modified, fetched_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (uuid7(), resource_id, capture_revision_id, http_payload_id, rendered_payload_id, final_url,
+                     warning, _header_value(response_headers, "ETag"),
+                     _header_value(response_headers, "Last-Modified"), now),
+                )
+            else:
+                connection.execute(
+                    """
+                    UPDATE fetch_capture
+                    SET resource_revision_id = ?,
+                        http_payload_id = COALESCE(?, http_payload_id),
+                        rendered_payload_id = COALESCE(?, rendered_payload_id),
+                        final_url = COALESCE(NULLIF(?, ''), final_url),
+                        warning = ?, response_etag = ?, response_last_modified = ?, fetched_at = ?
+                    WHERE fetch_capture_id = ?
+                    """,
+                    (capture_revision_id, http_payload_id, rendered_payload_id, final_url, warning,
+                     _header_value(response_headers, "ETag"), _header_value(response_headers, "Last-Modified"),
+                     now, capture["fetch_capture_id"]),
+                )
+            if current_id:
+                content_row = connection.execute(
+                    "SELECT content_markdown FROM resource_revision WHERE resource_revision_id = ?", (current_id,)
+                ).fetchone()
+                if content_row is not None and not str(content_row["content_markdown"] or "").strip():
+                    # Never delete the resource_revision row itself: fetch_capture,
+                    # asset, resource_image, and llm_run all carry a foreign key to
+                    # it and the connection runs with PRAGMA foreign_keys=ON, so an
+                    # llm_run row may still reference this revision.
+                    connection.execute(
+                        "UPDATE resource SET current_revision_id = NULL, updated_at = ? WHERE resource_id = ?",
+                        (now, resource_id),
+                    )
+                    self._mark_search_dirty(connection)
+        self.delete_orphan_payloads()
+
     def upsert_comment(
         self,
         *,
@@ -595,15 +677,17 @@ class VaultStore:
                 self._mark_search_dirty(connection)
         return [result for result in results if result is not None]
 
-    def create_sync_run(self, providers: list[str], settings_fingerprint: str) -> str:
+    def create_sync_run(self, providers: list[str], settings_fingerprint: str, mode: str = "full") -> str:
+        if mode not in {"full", "quick"}:
+            raise ValueError(f"Unsupported sync run mode: {mode}")
         run_id = uuid7()
         with self.transaction() as connection:
             connection.execute(
                 """
-                INSERT INTO sync_run(sync_run_id, providers_json, settings_fingerprint, status, started_at)
-                VALUES (?, ?, ?, 'running', ?)
+                INSERT INTO sync_run(sync_run_id, providers_json, settings_fingerprint, status, mode, started_at)
+                VALUES (?, ?, ?, 'running', ?, ?)
                 """,
-                (run_id, stable_json(providers), settings_fingerprint, utc_now()),
+                (run_id, stable_json(providers), settings_fingerprint, mode, utc_now()),
             )
         return run_id
 
@@ -653,15 +737,70 @@ class VaultStore:
     def latest_sync_run(self) -> sqlite3.Row | None:
         return self.connection.execute("SELECT * FROM sync_run ORDER BY started_at DESC LIMIT 1").fetchone()
 
-    def latest_provider_sync_run(self, provider: str) -> sqlite3.Row | None:
+    def latest_provider_sync_run(self, provider: str, *, mode: str = "full") -> sqlite3.Row | None:
         return self.connection.execute(
             """
             SELECT * FROM sync_run
-            WHERE status = 'completed' AND providers_json LIKE ?
+            WHERE status = 'completed' AND providers_json LIKE ? AND mode = ?
             ORDER BY finished_at DESC LIMIT 1
             """,
-            (f'%"{provider}"%',),
+            (f'%"{provider}"%', mode),
         ).fetchone()
+
+    def known_native_ids(self, provider: str, *, account: str = "default") -> set[str]:
+        """Every native_id already stored for this provider/account, including removed ones."""
+        rows = self.connection.execute(
+            "SELECT native_id FROM source_item WHERE provider = ? AND account = ?",
+            (provider, account),
+        ).fetchall()
+        return {str(row["native_id"]) for row in rows}
+
+    def unfetched_resources(self, providers: list[str], *, account: str = "default") -> list[tuple[str, str]]:
+        """(resource_id, url) for resources whose body was never obtained.
+
+        Ordered by the resource's latest fetch_capture.fetched_at ascending, with
+        resources that have no fetch_capture row first.
+        """
+        if not providers:
+            return []
+        placeholders = ",".join("?" for _ in providers)
+        rows = self.connection.execute(
+            f"""
+            SELECT DISTINCT r.resource_id AS resource_id, ri.value AS url, lfc.fetched_at AS latest_fetched_at
+            FROM resource AS r
+            JOIN resource_identifier AS ri ON ri.resource_id = r.resource_id AND ri.namespace = 'url'
+            JOIN source_item AS si ON si.resource_id = r.resource_id
+                AND si.provider IN ({placeholders}) AND si.account = ?
+            LEFT JOIN resource_revision AS rr ON rr.resource_revision_id = r.current_revision_id
+            LEFT JOIN fetch_capture AS lfc ON lfc.fetch_capture_id = (
+                SELECT newest.fetch_capture_id FROM fetch_capture AS newest
+                WHERE newest.resource_id = r.resource_id
+                ORDER BY newest.fetched_at DESC LIMIT 1
+            )
+            WHERE r.removed_at IS NULL
+              AND (
+                  r.current_revision_id IS NULL
+                  OR (
+                      length(trim(coalesce(rr.content_markdown, ''))) = 0
+                      AND coalesce(lfc.warning, '') <> ''
+                  )
+              )
+            ORDER BY (lfc.fetched_at IS NULL) DESC, lfc.fetched_at ASC
+            """,
+            (*providers, account),
+        ).fetchall()
+        return [(str(row["resource_id"]), str(row["url"])) for row in rows]
+
+    def source_items_for_resource(self, resource_id: str, providers: list[str]) -> list[str]:
+        """source_item_id values referencing this resource, limited to these providers."""
+        if not providers:
+            return []
+        placeholders = ",".join("?" for _ in providers)
+        rows = self.connection.execute(
+            f"SELECT source_item_id FROM source_item WHERE resource_id = ? AND provider IN ({placeholders})",
+            (resource_id, *providers),
+        ).fetchall()
+        return [str(row["source_item_id"]) for row in rows]
 
     def should_fetch_resource(self, resource_id: str, *, refresh_days: int, force: bool = False) -> bool:
         if force:
@@ -689,16 +828,25 @@ class VaultStore:
         return datetime.now(timezone.utc) - fetched_at >= timedelta(days=max(1, refresh_days))
 
     def resource_fetch_validators(self, resource_id: str) -> tuple[str, str]:
+        """Conditional-request validators, but only while a body is actually held.
+
+        A failed fetch still records the response's ETag. Replaying it for a
+        resource with no body invites a 304, and 304 writes no revision -- the
+        resource would stay bodyless until the far end happens to change.
+        """
         row = self.connection.execute(
             """
-            SELECT response_etag, response_last_modified
-            FROM fetch_capture
-            WHERE resource_id = ?
-            ORDER BY fetched_at DESC LIMIT 1
+            SELECT fc.response_etag, fc.response_last_modified,
+                   length(trim(coalesce(rr.content_markdown, ''))) AS content_length
+            FROM fetch_capture AS fc
+            JOIN resource AS r ON r.resource_id = fc.resource_id
+            LEFT JOIN resource_revision AS rr ON rr.resource_revision_id = r.current_revision_id
+            WHERE fc.resource_id = ?
+            ORDER BY fc.fetched_at DESC LIMIT 1
             """,
             (resource_id,),
         ).fetchone()
-        if row is None:
+        if row is None or int(row["content_length"] or 0) == 0:
             return "", ""
         return str(row["response_etag"] or ""), str(row["response_last_modified"] or "")
 
@@ -1252,6 +1400,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             providers_json TEXT NOT NULL,
             settings_fingerprint TEXT NOT NULL,
             status TEXT NOT NULL,
+            mode TEXT NOT NULL DEFAULT 'full',
             error TEXT,
             started_at TEXT NOT NULL,
             finished_at TEXT
@@ -1704,3 +1853,12 @@ def _migrate_v5_to_v6(connection: sqlite3.Connection) -> None:
             """
         )
         connection.execute("UPDATE schema_meta SET value = '6' WHERE key = 'schema_version'")
+
+
+def _migrate_v6_to_v7(connection: sqlite3.Connection) -> None:
+    """Add the sync run mode so quick syncs can be told apart from full ones."""
+
+    with _transaction(connection):
+        if not _column_exists(connection, "sync_run", "mode"):
+            connection.execute("ALTER TABLE sync_run ADD COLUMN mode TEXT NOT NULL DEFAULT 'full'")
+        connection.execute("UPDATE schema_meta SET value = '7' WHERE key = 'schema_version'")

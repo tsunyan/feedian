@@ -78,17 +78,36 @@ def build_parser() -> argparse.ArgumentParser:
         subparser = subparsers.add_parser(command, help=help_text)
         subparser.add_argument("--vault", help="Vault root. Defaults to the current or configured Vault.")
 
-    sync = subparsers.add_parser("sync", help="Collect providers into SQLite without calling an LLM.")
+    sync = subparsers.add_parser(
+        "sync",
+        help="Collect providers into SQLite without calling an LLM.",
+        description=(
+            "Collect providers into SQLite without calling an LLM. Quick mode (the default) does not "
+            "detect provider-side edits, comment changes, or refresh_days refreshes, and a Raindrop bulk "
+            "import carrying past created dates is not detected by the early stop."
+        ),
+    )
+    sync.set_defaults(_parser=sync)
     sync.add_argument("--vault", help="Vault root. Defaults to the current or configured Vault.")
     sync.add_argument(
         "--source", choices=("all", "raindrop", "hatena", "rss"), default="all",
         help="Provider to sync (default: all).",
     )
     sync.add_argument("--limit", type=int, help="Maximum items per provider.")
+    sync.add_argument("--full", action="store_true", help="Sync every item, including ones already stored.")
+    sync.add_argument(
+        "--quick", action="store_true",
+        help=(
+            "Only sync new items and bodies never fetched (default). Does not detect provider-side edits, "
+            "comment changes, or refresh_days refreshes; a Raindrop bulk import carrying past created dates "
+            "is not detected by the early stop. For --source rss there is almost no difference from --full, "
+            "because a feed only ever exposes a bounded recent window."
+        ),
+    )
     sync.add_argument("--skip-page-fetch", action="store_true", help="Store provider data only.")
     sync.add_argument("--skip-comments", action="store_true", help="Do not request public Hatena comments.")
-    sync.add_argument("--force-fetch", action="store_true", help="Check pages now, ignoring refresh_days; unchanged pages use conditional HTTP.")
-    sync.add_argument("--force-comments", action="store_true", help="Refetch Hatena comments even when bookmark counts are unchanged.")
+    sync.add_argument("--force-fetch", action="store_true", help="Check pages now, ignoring refresh_days; unchanged pages use conditional HTTP. Requires --full.")
+    sync.add_argument("--force-comments", action="store_true", help="Refetch Hatena comments even when bookmark counts are unchanged. Requires --full.")
     sync.add_argument("--progress", choices=PROGRESS_MODES, default="auto", help="Progress display mode.")
     sync.add_argument("--verbose", action="store_true", help="Show each processed source item title.")
 
@@ -186,6 +205,10 @@ def main(argv: list[str]) -> int:
         if args.command == "migrate":
             return _migrate(args.vault)
         if args.command == "sync":
+            if args.full and args.quick:
+                args._parser.error("--full and --quick are mutually exclusive.")
+            if not args.full and (args.force_fetch or args.force_comments):
+                args._parser.error("--force-fetch and --force-comments require --full.")
             return _sync(args)
         if args.command == "reextract":
             return _reextract(args)
@@ -235,7 +258,7 @@ def _status(explicit_vault: str | None) -> int:
             print(f"{name}: {count}")
         latest = store.latest_sync_run()
         if latest is not None:
-            print(f"last_sync: {latest['status']} {latest['finished_at'] or latest['started_at']}")
+            print(f"last_sync: {latest['status']} mode={latest['mode']} {latest['finished_at'] or latest['started_at']}")
     finally:
         store.close()
     return 0
@@ -362,6 +385,7 @@ def _sync(args: argparse.Namespace) -> int:
                     config,
                     source=args.source,
                     limit=args.limit,
+                    quick=not args.full,
                     fetch_pages=not args.skip_page_fetch,
                     fetch_comments=not args.skip_comments,
                     force_fetch=args.force_fetch,
@@ -373,10 +397,14 @@ def _sync(args: argparse.Namespace) -> int:
                 reporter.finish_task(comments_reported if comments_started else report.processed)
                 reporter.retain_final()
                 rebuild_search_index(store, paths.search_database_path)
-        print(
-            f"sync: run={report.run_id} processed={report.processed} changed={report.changed} "
-            f"fetched={report.fetched} failed={report.failed}"
+        mode = "quick" if report.quick else "full"
+        line = (
+            f"sync: run={report.run_id} mode={mode} processed={report.processed} changed={report.changed} "
+            f"skipped={report.skipped} fetched={report.fetched} retried={report.retried} failed={report.failed}"
         )
+        if report.stopped_early:
+            line += f" stopped_early={','.join(report.stopped_early)}"
+        print(line)
         return 1 if report.failed else 0
     finally:
         store.close()

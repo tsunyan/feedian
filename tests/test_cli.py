@@ -90,7 +90,7 @@ def test_init_migrate_and_status(tmp_path, capsys) -> None:
 
     output = capsys.readouterr().out
     assert "initialized:" in output
-    assert "migrated: schema_version=6" in output
+    assert "migrated: schema_version=7" in output
     assert "integrity: ok" in output
 
 
@@ -104,7 +104,7 @@ def test_migrate_does_not_copy_existing_raw_markdown_into_sqlite(tmp_path, capsy
 
     assert main(["migrate", "--vault", str(root)]) == 0
 
-    assert "migrated: schema_version=6" in capsys.readouterr().out
+    assert "migrated: schema_version=7" in capsys.readouterr().out
     store = VaultStore.open(root / ".feedian" / "feedian.sqlite3")
     try:
         assert not store.connection.execute(
@@ -165,3 +165,75 @@ def test_set_default_vault_requires_initialized_vault(tmp_path, monkeypatch) -> 
     assert main(["init", "--vault", str(root)]) == 0
 
     assert main(["config", "set-default-vault", str(root)]) == 0
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["sync", "--force-fetch"],
+        ["sync", "--quick", "--force-fetch"],
+        ["sync", "--quick", "--force-comments"],
+        ["sync", "--full", "--quick"],
+    ],
+)
+def test_sync_flag_combinations_that_conflict_with_quick_mode_exit_with_code_two(argv) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        main(argv)
+    assert exc_info.value.code == 2
+
+
+def test_full_with_force_fetch_passes_argument_validation(tmp_path, monkeypatch) -> None:
+    from feedian.sync import SyncReport
+
+    root = tmp_path / "vault"
+    root.mkdir()
+    assert main(["init", "--vault", str(root)]) == 0
+    assert main(["migrate", "--vault", str(root)]) == 0
+
+    captured: list[dict] = []
+
+    def fake_sync_vault(store, config, **kwargs):
+        captured.append(kwargs)
+        return SyncReport(run_id="run", processed=0, changed=0, failed=0, fetched=0)
+
+    monkeypatch.setattr("feedian.cli.sync_vault", fake_sync_vault)
+
+    assert main(["sync", "--vault", str(root), "--full", "--force-fetch", "--progress", "off"]) == 0
+    assert captured[0]["force_fetch"] is True
+
+
+def test_run_pipeline_still_syncs_full_after_the_cli_default_flipped_to_quick(tmp_path, monkeypatch) -> None:
+    import argparse
+
+    from feedian.cli import _run_pipeline
+    from feedian.renderer import RenderReport
+    from feedian.stars import StarEnrichmentReport
+    from feedian.sync import SyncReport
+
+    root = tmp_path / "vault"
+    root.mkdir()
+    assert main(["init", "--vault", str(root)]) == 0
+    assert main(["migrate", "--vault", str(root)]) == 0
+
+    captured: list[dict] = []
+
+    def fake_sync_vault(store, config, **kwargs):
+        captured.append(kwargs)
+        return SyncReport(run_id="run", processed=0, changed=0, failed=0, fetched=0)
+
+    monkeypatch.setattr("feedian.cli.sync_vault", fake_sync_vault)
+    monkeypatch.setattr("feedian.cli._due_providers", lambda _store, _config: ["hatena"])
+    monkeypatch.setattr("feedian.cli._snapshot_is_due", lambda _store: False)
+    monkeypatch.setattr("feedian.cli.enrich_hatena_stars", lambda *_args, **_kwargs: StarEnrichmentReport())
+    monkeypatch.setattr("feedian.cli.rebuild_search_index", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        "feedian.cli.render_raw_views",
+        lambda *_args, **_kwargs: RenderReport(written=0, skipped=0, conflicts=0, comments_written=0, output_root=root),
+    )
+    monkeypatch.setattr("feedian.cli.notify_windows", lambda *_args, **_kwargs: None)
+
+    args = argparse.Namespace(vault=str(root), if_due=False, skip_snapshot=True)
+
+    assert _run_pipeline(args) == 0
+    assert captured
+    assert not captured[0].get("quick", False)

@@ -28,7 +28,7 @@ def test_store_creates_schema_and_deduplicates_payload(tmp_path) -> None:
         second = store.put_payload(b"<html>same</html>", media_type="text/html")
 
         assert first == second
-        assert store.schema_version() == 6
+        assert store.schema_version() == 7
         assert store.quick_check() == "ok"
         assert store.integrity_check() == "ok"
     finally:
@@ -221,6 +221,40 @@ def test_store_skips_recent_resource_fetch_unless_forced(tmp_path) -> None:
         store.close()
 
 
+def test_resource_fetch_validators_stay_blank_until_a_body_is_held(tmp_path) -> None:
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        item = store.upsert_canonical_item(_item())
+        resource_id = item.resource_id or ""
+
+        # A failed fetch still records the response's ETag, but the resource
+        # never held a body: current_revision_id stays NULL.
+        store.record_failed_fetch(resource_id, warning="HTTP 500", response_headers={"ETag": "stale-etag"})
+        assert (
+            store.connection.execute(
+                "SELECT current_revision_id FROM resource WHERE resource_id = ?", (resource_id,)
+            ).fetchone()["current_revision_id"]
+            is None
+        )
+        assert store.resource_fetch_validators(resource_id) == ("", "")
+
+        # current_revision_id is set, but the revision itself is blank.
+        store.record_resource_revision(
+            resource_id, content_markdown="   ", response_headers={"ETag": "blank-etag"}
+        )
+        assert store.resource_fetch_validators(resource_id) == ("", "")
+
+        # A real body: the validators are now the latest capture's.
+        store.record_resource_revision(
+            resource_id,
+            content_markdown="Real body",
+            response_headers={"ETag": "real-etag", "Last-Modified": "real-last-modified"},
+        )
+        assert store.resource_fetch_validators(resource_id) == ("real-etag", "real-last-modified")
+    finally:
+        store.close()
+
+
 def test_v1_migration_prunes_history_images_and_inline_fts(tmp_path) -> None:
     path = tmp_path / "feedian.sqlite3"
     store = VaultStore.open(path)
@@ -273,7 +307,7 @@ def test_v1_migration_prunes_history_images_and_inline_fts(tmp_path) -> None:
 
     migrated = VaultStore.open(path, allow_migration=True)
     try:
-        assert migrated.schema_version() == 6
+        assert migrated.schema_version() == 7
         assert migrated.status_counts()["source_item_revision"] == 1
         assert migrated.status_counts()["resource_revision"] == 1
         assert migrated.connection.execute("SELECT COUNT(*) FROM fetch_capture").fetchone()[0] == 1
@@ -399,7 +433,7 @@ def test_v4_migration_adds_fetch_validators_and_commits(tmp_path) -> None:
             str(row[1]) for row in migrated.connection.execute("PRAGMA table_info(fetch_capture)")
         }
         assert {"response_etag", "response_last_modified"} <= columns
-        assert migrated.schema_version() == 6
+        assert migrated.schema_version() == 7
     finally:
         migrated.close()
 
@@ -456,7 +490,7 @@ def test_v5_migration_backfills_llm_backend_audit_columns(tmp_path) -> None:
             """,
             (run_id,),
         ).fetchone()
-        assert migrated.schema_version() == 6
+        assert migrated.schema_version() == 7
         assert tuple(row) == (
             "openai-responses",
             "1",
@@ -509,7 +543,7 @@ def test_a_migrated_database_has_the_same_llm_run_columns_as_a_fresh_one(tmp_pat
     def llm_run_columns(path) -> dict[str, tuple]:
         store = VaultStore.open(path, allow_migration=True)
         try:
-            assert store.schema_version() == 6
+            assert store.schema_version() == 7
             rows = store.connection.execute("PRAGMA table_info(llm_run)").fetchall()
             return {row[1]: (row[2], row[3], row[5]) for row in rows}
         finally:
@@ -534,3 +568,438 @@ def test_a_migrated_database_has_the_same_llm_run_columns_as_a_fresh_one(tmp_pat
         connection.close()
 
     assert llm_run_columns(migrated_path) == fresh_columns
+
+
+def test_record_failed_fetch_without_a_revision_leaves_it_absent(tmp_path) -> None:
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        item = store.upsert_canonical_item(_item())
+        resource_id = item.resource_id or ""
+
+        store.record_failed_fetch(resource_id, warning="fetch timed out")
+
+        capture = store.connection.execute(
+            "SELECT warning FROM fetch_capture WHERE resource_id = ?", (resource_id,)
+        ).fetchone()
+        assert capture is not None
+        assert capture["warning"] == "fetch timed out"
+        current_revision_id = store.connection.execute(
+            "SELECT current_revision_id FROM resource WHERE resource_id = ?", (resource_id,)
+        ).fetchone()["current_revision_id"]
+        assert current_revision_id is None
+        assert store.connection.execute(
+            "SELECT COUNT(*) FROM resource_revision WHERE resource_id = ?", (resource_id,)
+        ).fetchone()[0] == 0
+    finally:
+        store.close()
+
+
+def test_record_failed_fetch_nulls_current_revision_but_keeps_the_row(tmp_path) -> None:
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        item = store.upsert_canonical_item(_item())
+        resource_id = item.resource_id or ""
+        revision_id, _ = store.record_resource_revision(resource_id, content_markdown="   ")
+
+        store.record_failed_fetch(resource_id, warning="empty extraction")
+
+        current_revision_id = store.connection.execute(
+            "SELECT current_revision_id FROM resource WHERE resource_id = ?", (resource_id,)
+        ).fetchone()["current_revision_id"]
+        assert current_revision_id is None
+        still_there = store.connection.execute(
+            "SELECT resource_revision_id FROM resource_revision WHERE resource_revision_id = ?", (revision_id,)
+        ).fetchone()
+        assert still_there is not None
+    finally:
+        store.close()
+
+
+def test_record_failed_fetch_on_a_good_revision_leaves_it_untouched(tmp_path) -> None:
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        item = store.upsert_canonical_item(_item())
+        resource_id = item.resource_id or ""
+        revision_id, _ = store.record_resource_revision(resource_id, content_markdown="Real content")
+
+        store.record_failed_fetch(resource_id, warning="refresh failed")
+
+        row = store.connection.execute(
+            "SELECT current_revision_id FROM resource WHERE resource_id = ?", (resource_id,)
+        ).fetchone()
+        assert row["current_revision_id"] == revision_id
+        content = store.connection.execute(
+            "SELECT content_markdown FROM resource_revision WHERE resource_revision_id = ?", (revision_id,)
+        ).fetchone()["content_markdown"]
+        assert content == "Real content"
+    finally:
+        store.close()
+
+
+def test_record_failed_fetch_called_twice_advances_the_same_capture(tmp_path) -> None:
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        item = store.upsert_canonical_item(_item())
+        resource_id = item.resource_id or ""
+
+        store.record_failed_fetch(resource_id, warning="first failure")
+        store.connection.execute(
+            "UPDATE fetch_capture SET fetched_at = ? WHERE resource_id = ?",
+            ("2000-01-01T00:00:00+00:00", resource_id),
+        )
+        store.connection.commit()
+
+        store.record_failed_fetch(resource_id, warning="second failure")
+
+        rows = store.connection.execute(
+            "SELECT fetched_at, warning FROM fetch_capture WHERE resource_id = ?", (resource_id,)
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0]["warning"] == "second failure"
+        assert rows[0]["fetched_at"] > "2000-01-01T00:00:00+00:00"
+    finally:
+        store.close()
+
+
+def test_record_failed_fetch_keeps_the_http_payload_alive(tmp_path) -> None:
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        item = store.upsert_canonical_item(_item())
+        resource_id = item.resource_id or ""
+        payload_id = store.put_payload(b"raw bytes", media_type="text/html")
+
+        store.record_failed_fetch(resource_id, warning="extraction failed", http_payload_id=payload_id)
+        store.delete_orphan_payloads()
+
+        assert store.connection.execute(
+            "SELECT 1 FROM payload WHERE payload_id = ?", (payload_id,)
+        ).fetchone() is not None
+    finally:
+        store.close()
+
+
+def test_record_failed_fetch_raises_for_an_unknown_resource(tmp_path) -> None:
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        with pytest.raises(KeyError):
+            store.record_failed_fetch("does-not-exist", warning="unreachable")
+    finally:
+        store.close()
+
+
+def test_record_failed_fetch_survives_an_llm_run_referencing_the_revision(tmp_path) -> None:
+    """`foreign_keys=ON` means a stray DELETE of resource_revision would raise here."""
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        item = store.upsert_canonical_item(_item())
+        resource_id = item.resource_id or ""
+        revision_id, _ = store.record_resource_revision(resource_id, content_markdown="")
+        run_id = store.start_llm_run(
+            resource_id=resource_id, resource_revision_id=revision_id, operation="source-note",
+            model="model", prompt_version="v1", input_fingerprint="fp", request={"input": "x"},
+        )
+
+        store.record_failed_fetch(resource_id, warning="refresh failed")
+
+        assert store.connection.execute(
+            "SELECT 1 FROM llm_run WHERE llm_run_id = ?", (run_id,)
+        ).fetchone() is not None
+        assert store.connection.execute(
+            "SELECT 1 FROM resource_revision WHERE resource_revision_id = ?", (revision_id,)
+        ).fetchone() is not None
+    finally:
+        store.close()
+
+
+def test_unfetched_resources_includes_null_revision_and_excludes_real_content(tmp_path) -> None:
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        missing = store.upsert_canonical_item(
+            CanonicalItem(
+                source="hatena", source_id="missing", content_key="url:missing",
+                url="https://example.test/missing", title="Missing",
+            )
+        )
+        present = store.upsert_canonical_item(
+            CanonicalItem(
+                source="hatena", source_id="present", content_key="url:present",
+                url="https://example.test/present", title="Present",
+            )
+        )
+        store.record_resource_revision(present.resource_id or "", content_markdown="Real content")
+
+        results = store.unfetched_resources(["hatena"])
+
+        resource_ids = {resource_id for resource_id, _ in results}
+        assert missing.resource_id in resource_ids
+        assert present.resource_id not in resource_ids
+    finally:
+        store.close()
+
+
+def test_unfetched_resources_includes_the_legacy_blank_plus_warning_case(tmp_path) -> None:
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        item = store.upsert_canonical_item(
+            CanonicalItem(
+                source="hatena", source_id="legacy", content_key="url:legacy",
+                url="https://example.test/legacy", title="Legacy",
+            )
+        )
+        resource_id = item.resource_id or ""
+        store.record_resource_revision(resource_id, content_markdown="   ")
+        # Simulate a row written before record_failed_fetch existed: the capture
+        # carries a warning but current_revision_id was never cleared.
+        store.connection.execute(
+            "UPDATE fetch_capture SET warning = 'stale warning' WHERE resource_id = ?", (resource_id,)
+        )
+        store.connection.commit()
+        assert store.connection.execute(
+            "SELECT current_revision_id FROM resource WHERE resource_id = ?", (resource_id,)
+        ).fetchone()["current_revision_id"] is not None
+
+        results = store.unfetched_resources(["hatena"])
+
+        assert resource_id in {rid for rid, _ in results}
+    finally:
+        store.close()
+
+
+def test_unfetched_resources_excludes_a_resource_without_a_url_identifier(tmp_path) -> None:
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        item = store.upsert_canonical_item(
+            CanonicalItem(source="hatena", source_id="no-url", content_key="no-url", url="", title="No URL")
+        )
+        resource_id = item.resource_id or ""
+        assert store.connection.execute(
+            "SELECT current_revision_id FROM resource WHERE resource_id = ?", (resource_id,)
+        ).fetchone()["current_revision_id"] is None
+
+        results = store.unfetched_resources(["hatena"])
+
+        assert resource_id not in {rid for rid, _ in results}
+    finally:
+        store.close()
+
+
+def test_unfetched_resources_orders_never_fetched_first_then_oldest_capture(tmp_path) -> None:
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        never = store.upsert_canonical_item(
+            CanonicalItem(
+                source="hatena", source_id="never", content_key="url:never",
+                url="https://example.test/never", title="Never",
+            )
+        )
+        older = store.upsert_canonical_item(
+            CanonicalItem(
+                source="hatena", source_id="older", content_key="url:older",
+                url="https://example.test/older", title="Older",
+            )
+        )
+        newer = store.upsert_canonical_item(
+            CanonicalItem(
+                source="hatena", source_id="newer", content_key="url:newer",
+                url="https://example.test/newer", title="Newer",
+            )
+        )
+        store.record_failed_fetch(older.resource_id or "", warning="w")
+        store.record_failed_fetch(newer.resource_id or "", warning="w")
+        store.connection.execute(
+            "UPDATE fetch_capture SET fetched_at = ? WHERE resource_id = ?",
+            ("2020-01-01T00:00:00+00:00", older.resource_id),
+        )
+        store.connection.execute(
+            "UPDATE fetch_capture SET fetched_at = ? WHERE resource_id = ?",
+            ("2020-06-01T00:00:00+00:00", newer.resource_id),
+        )
+        store.connection.commit()
+
+        results = store.unfetched_resources(["hatena"])
+
+        assert [resource_id for resource_id, _ in results] == [
+            never.resource_id, older.resource_id, newer.resource_id,
+        ]
+    finally:
+        store.close()
+
+
+def test_unfetched_resources_filters_by_provider(tmp_path) -> None:
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        wanted = store.upsert_canonical_item(
+            CanonicalItem(
+                source="hatena", source_id="wanted", content_key="url:wanted",
+                url="https://example.test/wanted", title="Wanted",
+            )
+        )
+        other = store.upsert_canonical_item(
+            CanonicalItem(
+                source="pocket", source_id="other", content_key="url:other",
+                url="https://example.test/other", title="Other",
+            )
+        )
+
+        results = store.unfetched_resources(["hatena"])
+
+        resource_ids = {resource_id for resource_id, _ in results}
+        assert wanted.resource_id in resource_ids
+        assert other.resource_id not in resource_ids
+    finally:
+        store.close()
+
+
+def test_unfetched_resources_dedupes_a_resource_shared_by_two_providers(tmp_path) -> None:
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        first = store.upsert_canonical_item(
+            CanonicalItem(
+                source="hatena", source_id="shared", content_key="url:shared",
+                url="https://example.test/shared", title="Shared",
+            )
+        )
+        second = store.upsert_canonical_item(
+            CanonicalItem(
+                source="raindrop", source_id="shared", content_key="url:shared",
+                url="https://example.test/shared", title="Shared",
+            )
+        )
+        assert first.resource_id == second.resource_id
+
+        results = store.unfetched_resources(["hatena", "raindrop"])
+
+        assert [resource_id for resource_id, _ in results].count(first.resource_id) == 1
+    finally:
+        store.close()
+
+
+def test_known_native_ids_is_scoped_to_provider(tmp_path) -> None:
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        store.upsert_canonical_item(
+            CanonicalItem(
+                source="hatena", source_id="hatena-a", content_key="url:a",
+                url="https://example.test/a", title="A",
+            )
+        )
+        store.upsert_canonical_item(
+            CanonicalItem(
+                source="hatena", source_id="hatena-b", content_key="url:b",
+                url="https://example.test/b", title="B",
+            )
+        )
+        store.upsert_canonical_item(
+            CanonicalItem(
+                source="raindrop", source_id="raindrop-a", content_key="url:c",
+                url="https://example.test/c", title="C",
+            )
+        )
+
+        hatena_ids = store.known_native_ids("hatena")
+
+        assert hatena_ids == {"hatena-a", "hatena-b"}
+        assert "raindrop-a" not in hatena_ids
+    finally:
+        store.close()
+
+
+def test_source_items_for_resource_filters_by_provider(tmp_path) -> None:
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        hatena_item = store.upsert_canonical_item(
+            CanonicalItem(
+                source="hatena", source_id="hatena-1", content_key="url:shared",
+                url="https://example.test/shared", title="Shared",
+            )
+        )
+        raindrop_item = store.upsert_canonical_item(
+            CanonicalItem(
+                source="raindrop", source_id="raindrop-1", content_key="url:shared",
+                url="https://example.test/shared", title="Shared",
+            )
+        )
+        store.upsert_canonical_item(
+            CanonicalItem(
+                source="pocket", source_id="pocket-1", content_key="url:shared",
+                url="https://example.test/shared", title="Shared",
+            )
+        )
+        resource_id = hatena_item.resource_id or ""
+
+        result = store.source_items_for_resource(resource_id, ["hatena", "raindrop"])
+
+        assert set(result) == {hatena_item.source_item_id, raindrop_item.source_item_id}
+    finally:
+        store.close()
+
+
+def test_create_sync_run_persists_mode_and_rejects_unknown_modes(tmp_path) -> None:
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        run_id = store.create_sync_run(["hatena"], "fingerprint", mode="quick")
+
+        mode = store.connection.execute(
+            "SELECT mode FROM sync_run WHERE sync_run_id = ?", (run_id,)
+        ).fetchone()["mode"]
+        assert mode == "quick"
+
+        with pytest.raises(ValueError):
+            store.create_sync_run(["hatena"], "fingerprint", mode="partial")
+    finally:
+        store.close()
+
+
+def test_latest_provider_sync_run_defaults_to_full_mode(tmp_path) -> None:
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        full_run = store.create_sync_run(["hatena"], "fp", mode="full")
+        store.finish_sync_run(full_run, status="completed")
+        quick_run = store.create_sync_run(["hatena"], "fp", mode="quick")
+        store.finish_sync_run(quick_run, status="completed")
+
+        default_row = store.latest_provider_sync_run("hatena")
+        assert default_row is not None
+        assert default_row["sync_run_id"] == full_run
+        assert default_row["mode"] == "full"
+
+        quick_row = store.latest_provider_sync_run("hatena", mode="quick")
+        assert quick_row is not None
+        assert quick_row["sync_run_id"] == quick_run
+    finally:
+        store.close()
+
+
+def _downgrade_to_v6(path) -> None:
+    connection = sqlite3.connect(path)
+    try:
+        connection.executescript(
+            """
+            ALTER TABLE sync_run DROP COLUMN mode;
+            UPDATE schema_meta SET value = '6' WHERE key = 'schema_version';
+            """
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def test_v6_migration_backfills_full_mode_on_existing_sync_runs(tmp_path) -> None:
+    path = tmp_path / "feedian.sqlite3"
+    store = VaultStore.open(path)
+    try:
+        run_id = store.create_sync_run(["hatena"], "fp")
+        store.finish_sync_run(run_id, status="completed")
+    finally:
+        store.close()
+    _downgrade_to_v6(path)
+
+    migrated = VaultStore.open(path, allow_migration=True)
+    try:
+        assert migrated.schema_version() == 7
+        mode = migrated.connection.execute(
+            "SELECT mode FROM sync_run WHERE sync_run_id = ?", (run_id,)
+        ).fetchone()["mode"]
+        assert mode == "full"
+    finally:
+        migrated.close()
