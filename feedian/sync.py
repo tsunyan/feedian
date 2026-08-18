@@ -58,7 +58,11 @@ def sync_vault(
     providers = _selected_providers(config, source)
     stop_after_known_pages = 1
     if quick:
-        stop_after_known_pages = int(config.fetch.get("quick_stop_after_known_pages", 1))
+        stop_after_known_pages = config.fetch.get("quick_stop_after_known_pages", 1)
+        # Coercing first would silently turn 1.5 into 1 and true into 1, cutting
+        # collection shorter than the value the user wrote.
+        if isinstance(stop_after_known_pages, bool) or not isinstance(stop_after_known_pages, int):
+            raise ValueError("config.fetch.quick_stop_after_known_pages must be an integer")
         if stop_after_known_pages < 1:
             raise ValueError("config.fetch.quick_stop_after_known_pages must be >= 1")
     fingerprint = sha256_bytes(
@@ -91,7 +95,7 @@ def sync_vault(
     try:
         for provider in providers:
             known = store.known_native_ids(provider) if quick else None
-            provider_processed = 0
+            provider_fetch_attempts = 0
             for item, raw_payload in _provider_items(
                 config,
                 provider,
@@ -111,7 +115,6 @@ def sync_vault(
                         progress(processed + skipped, item)
                     continue
                 processed += 1
-                provider_processed += 1
                 stored = store.upsert_canonical_item(item, source_payload=raw_payload)
                 if quick and stored.resource_id:
                     handled_resource_ids.add(stored.resource_id)
@@ -127,6 +130,7 @@ def sync_vault(
                         )
                     )
                     if should_fetch_page and stored.resource_id:
+                        provider_fetch_attempts += 1
                         try:
                             etag, last_modified = store.resource_fetch_validators(stored.resource_id)
                             page = fetch_page_text(
@@ -177,16 +181,22 @@ def sync_vault(
                         comment_targets.setdefault(
                             stored.resource_id, (stored.source_item_id, stored.resource_id, item.url)
                         )
-                    store.record_sync_item(run_id, stored.source_item_id, "completed")
+                    for source_item_id in _audited_source_items(
+                        store, stored, providers, quick=quick, fetched_body=should_fetch_page
+                    ):
+                        store.record_sync_item(run_id, source_item_id, "completed")
                     changed += int(stored.changed)
                 except Exception as exc:
                     failed += 1
-                    store.record_sync_item(run_id, stored.source_item_id, "failed", str(exc))
+                    for source_item_id in _audited_source_items(
+                        store, stored, providers, quick=quick, fetched_body=should_fetch_page
+                    ):
+                        store.record_sync_item(run_id, source_item_id, "failed", str(exc))
                 finally:
                     if progress is not None:
                         progress(processed + skipped, item)
             if quick and fetch_pages:
-                budget = None if limit is None else max(0, limit - provider_processed)
+                budget = None if limit is None else max(0, limit - provider_fetch_attempts)
                 provider_retried, provider_fetched, provider_failed = _run_quick_body_only_pass(
                     store,
                     run_id,
@@ -458,6 +468,24 @@ def _run_quick_body_only_pass(
             for source_item_id in source_item_ids:
                 store.record_sync_item(run_id, source_item_id, "failed", str(exc))
     return retried, fetched, failed
+
+
+def _audited_source_items(
+    store: VaultStore, stored, providers: list[str], *, quick: bool, fetched_body: bool
+) -> list[str]:
+    """Source items this item's outcome should be recorded against.
+
+    Normally just the item's own. But when quick fetches a body for a resource
+    that other source items share, those items are skipped as known and the
+    body-only pass can no longer reach them -- the resource has a body now. The
+    fetch happened on the resource's behalf, so every reference gets the result;
+    recording only the one that triggered it is the representative-single-item
+    audit the specification rejected.
+    """
+    if not quick or not fetched_body or not stored.resource_id:
+        return [stored.source_item_id]
+    shared = store.source_items_for_resource(stored.resource_id, providers)
+    return shared or [stored.source_item_id]
 
 
 def _resource_has_revision(store: VaultStore, resource_id: str) -> bool:

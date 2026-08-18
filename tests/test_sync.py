@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from feedian.canonical import CanonicalItem
 from feedian.extract import PageFetchResult
 from feedian.hatena import HatenaEntryDiscussion, HatenaPublicComment
@@ -592,6 +594,58 @@ def test_quick_body_only_pass_fetches_a_resource_left_without_a_revision(monkeyp
         store.close()
 
 
+def test_quick_body_only_pass_replays_no_validators_for_a_resource_with_a_stale_etag(monkeypatch, tmp_path) -> None:
+    item = CanonicalItem(source="hatena", source_id="one", content_key="url:one", url="https://example.test/one")
+    monkeypatch.setattr(
+        "feedian.sync._provider_items",
+        lambda *_args, **_kwargs: iter([(item, b"{}")]),
+    )
+    monkeypatch.setattr(
+        "feedian.sync.fetch_page_text",
+        lambda url, **_kwargs: PageFetchResult(
+            url=url, text="", error="HTTP 500", fetch_method="http", response_headers={"ETag": "stale-etag"}
+        ),
+    )
+    config = VaultConfig(providers={"hatena": VaultConfig().providers["hatena"]})
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        sync_vault(store, config, source="hatena", quick=True, fetch_comments=False)
+        resource_row = store.connection.execute(
+            """
+            SELECT r.resource_id, r.current_revision_id FROM resource AS r
+            JOIN resource_identifier AS ri ON ri.resource_id = r.resource_id
+            WHERE ri.namespace = 'url' AND ri.value = ?
+            """,
+            (item.url,),
+        ).fetchone()
+        assert resource_row["current_revision_id"] is None
+        assert store.connection.execute(
+            "SELECT response_etag FROM fetch_capture WHERE resource_id = ?", (resource_row["resource_id"],)
+        ).fetchone()[0] == "stale-etag"
+        # The failed capture is fresh, so should_fetch_resource's 30-minute
+        # cooldown would otherwise skip the retry below.
+        store.connection.execute(
+            "UPDATE fetch_capture SET fetched_at = ? WHERE resource_id = ?",
+            ("2000-01-01T00:00:00+00:00", resource_row["resource_id"]),
+        )
+        store.connection.commit()
+        calls: list[dict] = []
+        monkeypatch.setattr(
+            "feedian.sync.fetch_page_text",
+            lambda url, **kwargs: calls.append(kwargs)
+            or PageFetchResult(url=url, final_url=url, text="fresh body", media_type="text/html"),
+        )
+
+        report = sync_vault(store, config, source="hatena", quick=True, fetch_comments=False)
+
+        assert report.retried == 1
+        assert len(calls) == 1
+        assert calls[0]["etag"] == ""
+        assert calls[0]["last_modified"] == ""
+    finally:
+        store.close()
+
+
 def test_failed_page_fetch_records_fetch_capture_without_a_resource_revision(monkeypatch, tmp_path) -> None:
     item = CanonicalItem(source="hatena", source_id="one", content_key="url:one", url="https://example.test/one")
     monkeypatch.setattr(
@@ -687,6 +741,63 @@ def test_quick_body_only_pass_records_sync_run_item_for_every_provider_sharing_a
         store.close()
 
 
+def test_quick_item_loop_body_fetch_records_outcome_for_every_source_item_sharing_a_resource(
+    monkeypatch, tmp_path
+) -> None:
+    # The Hatena item is already known (registered by an earlier run) but its
+    # resource never got a body. The Raindrop item is new and shares the same
+    # URL/resource, so it is the one that reaches the item loop's own fetch.
+    hatena_item = CanonicalItem(source="hatena", source_id="ht-1", content_key="url:shared", url="https://example.test/shared")
+    raindrop_item = CanonicalItem(source="raindrop", source_id="rd-1", content_key="url:shared", url="https://example.test/shared")
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        hatena_stored = store.upsert_canonical_item(hatena_item)
+
+        def fake_provider_items(config, provider, limit, **_kwargs):
+            if provider == "raindrop":
+                return iter([(raindrop_item, b"{}")])
+            if provider == "hatena":
+                return iter([(hatena_item, b"{}")])
+            return iter(())
+
+        monkeypatch.setattr("feedian.sync._provider_items", fake_provider_items)
+        fetch_calls: list[str] = []
+        monkeypatch.setattr(
+            "feedian.sync.fetch_page_text",
+            lambda url, **_kwargs: fetch_calls.append(url)
+            or PageFetchResult(url=url, final_url=url, text="shared body", media_type="text/html"),
+        )
+        # Raindrop first: its item-loop pass fetches the shared resource's body
+        # before Hatena's own body-only pass gets a chance to do it instead.
+        config = VaultConfig(
+            providers={
+                "raindrop": VaultConfig().providers["raindrop"],
+                "hatena": VaultConfig().providers["hatena"],
+            }
+        )
+
+        report = sync_vault(store, config, source="all", quick=True, fetch_comments=False)
+
+        assert fetch_calls == [raindrop_item.url]
+
+        recorded = {
+            (row["provider"], row["native_id"])
+            for row in store.connection.execute(
+                """
+                SELECT si.provider AS provider, si.native_id AS native_id
+                FROM sync_run_item AS sri
+                JOIN source_item AS si ON si.source_item_id = sri.source_item_id
+                WHERE sri.sync_run_id = ?
+                """,
+                (report.run_id,),
+            ).fetchall()
+        }
+        assert recorded == {("hatena", "ht-1"), ("raindrop", "rd-1")}
+        assert hatena_stored.resource_id
+    finally:
+        store.close()
+
+
 def test_quick_limit_is_a_shared_budget_across_item_loop_and_body_only_pass(monkeypatch, tmp_path) -> None:
     pending_item = CanonicalItem(source="hatena", source_id="pending", content_key="url:pending", url="https://example.test/pending")
     new_item = CanonicalItem(source="hatena", source_id="new", content_key="url:new", url="https://example.test/new")
@@ -707,6 +818,42 @@ def test_quick_limit_is_a_shared_budget_across_item_loop_and_body_only_pass(monk
 
         assert report.processed == 1
         assert report.retried == 0
+    finally:
+        store.close()
+
+
+def test_quick_limit_budget_is_fetch_attempts_not_items_processed(monkeypatch, tmp_path) -> None:
+    # The new item's resource already holds a body (as if fetched by an earlier
+    # run), so the item loop processes it but makes no HTTP request for it. The
+    # limit=1 budget must still be available to the body-only pass, which has a
+    # bodyless resource of its own waiting.
+    existing_item = CanonicalItem(
+        source="hatena", source_id="existing", content_key="url:shared", url="https://example.test/shared"
+    )
+    new_item = CanonicalItem(source="hatena", source_id="new", content_key="url:shared", url="https://example.test/shared")
+    pending_item = CanonicalItem(source="hatena", source_id="pending", content_key="url:pending", url="https://example.test/pending")
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        existing_stored = store.upsert_canonical_item(existing_item)
+        store.record_resource_revision(existing_stored.resource_id or "", content_markdown="already fetched")
+        store.upsert_canonical_item(pending_item)
+        monkeypatch.setattr(
+            "feedian.sync._provider_items",
+            lambda *_args, **_kwargs: iter([(new_item, b"{}")]),
+        )
+        fetch_calls: list[str] = []
+        monkeypatch.setattr(
+            "feedian.sync.fetch_page_text",
+            lambda url, **_kwargs: fetch_calls.append(url)
+            or PageFetchResult(url=url, final_url=url, text="body", media_type="text/html"),
+        )
+        config = VaultConfig(providers={"hatena": VaultConfig().providers["hatena"]})
+
+        report = sync_vault(store, config, source="hatena", quick=True, limit=1, fetch_comments=False)
+
+        assert report.processed == 1
+        assert fetch_calls == [pending_item.url]
+        assert report.retried == 1
     finally:
         store.close()
 
@@ -786,6 +933,43 @@ def test_raindrop_quick_collection_continues_past_a_mixed_known_and_new_page(mon
     assert stopped == []
 
 
+def test_raindrop_quick_collection_stops_at_limit_new_items_even_without_a_fetch(monkeypatch) -> None:
+    """`--limit` bounds items collected, not body fetches.
+
+    A deliberate divergence from a literal reading of the specification's
+    "count the budget by items actually fetched". That sentence governs the
+    body-only pass, whose candidates may be gated out by should_fetch_resource.
+    Applying it to collection would unbound `--limit` whenever nothing needs
+    fetching: a second provider bookmarking URLs another provider already
+    stored yields new source items whose resources all hold bodies, so no
+    fetch ever occurs and the whole collection would be paged and upserted.
+    See docs/reviews/20260818-sync-quick-mode-implementation.ja.md.
+    """
+    page = _raindrop_raw_items([f"n{index}" for index in range(50)])
+
+    class _StubClient:
+        def __init__(self, token: str) -> None:
+            self.token = token
+
+        def iter_raindrop_pages(self, collection_id: int, per_page: int, nested: bool):
+            yield page
+
+    monkeypatch.setattr("feedian.sync._required_env", lambda _name: "token")
+    monkeypatch.setattr("feedian.sync.RaindropClient", _StubClient)
+    stopped: list[str] = []
+    config = VaultConfig(providers={"raindrop": VaultConfig().providers["raindrop"]})
+
+    rows = list(
+        _provider_items(
+            config, "raindrop", 1, quick=True, known=set(),
+            stop_after_known_pages=1, on_stopped_early=stopped.append,
+        )
+    )
+
+    assert len(rows) == 1
+    assert stopped == []
+
+
 def test_raindrop_quick_collection_ends_on_a_short_page_without_stopping_early(monkeypatch) -> None:
     known_ids = [f"r{index}" for index in range(10)]
     page = _raindrop_raw_items(known_ids)
@@ -826,5 +1010,31 @@ def test_settings_fingerprint_differs_between_quick_and_full_runs(monkeypatch, t
             for row in store.connection.execute("SELECT sync_run_id, settings_fingerprint FROM sync_run").fetchall()
         }
         assert fingerprints[full_report.run_id] != fingerprints[quick_report.run_id]
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("value", [1.5, True, "2", 0, -1])
+def test_quick_rejects_a_non_integer_or_out_of_range_stop_after_known_pages(monkeypatch, tmp_path, value) -> None:
+    monkeypatch.setattr("feedian.sync._provider_items", lambda *_args, **_kwargs: iter(()))
+    config = VaultConfig(providers={"hatena": VaultConfig().providers["hatena"]})
+    config.fetch["quick_stop_after_known_pages"] = value
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        with pytest.raises(ValueError):
+            sync_vault(store, config, source="hatena", quick=True, fetch_comments=False)
+    finally:
+        store.close()
+
+
+def test_quick_accepts_an_integer_stop_after_known_pages(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr("feedian.sync._provider_items", lambda *_args, **_kwargs: iter(()))
+    config = VaultConfig(providers={"hatena": VaultConfig().providers["hatena"]})
+    config.fetch["quick_stop_after_known_pages"] = 2
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        report = sync_vault(store, config, source="hatena", quick=True, fetch_comments=False)
+
+        assert report.processed == 0
     finally:
         store.close()

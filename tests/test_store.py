@@ -221,6 +221,40 @@ def test_store_skips_recent_resource_fetch_unless_forced(tmp_path) -> None:
         store.close()
 
 
+def test_resource_fetch_validators_stay_blank_until_a_body_is_held(tmp_path) -> None:
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        item = store.upsert_canonical_item(_item())
+        resource_id = item.resource_id or ""
+
+        # A failed fetch still records the response's ETag, but the resource
+        # never held a body: current_revision_id stays NULL.
+        store.record_failed_fetch(resource_id, warning="HTTP 500", response_headers={"ETag": "stale-etag"})
+        assert (
+            store.connection.execute(
+                "SELECT current_revision_id FROM resource WHERE resource_id = ?", (resource_id,)
+            ).fetchone()["current_revision_id"]
+            is None
+        )
+        assert store.resource_fetch_validators(resource_id) == ("", "")
+
+        # current_revision_id is set, but the revision itself is blank.
+        store.record_resource_revision(
+            resource_id, content_markdown="   ", response_headers={"ETag": "blank-etag"}
+        )
+        assert store.resource_fetch_validators(resource_id) == ("", "")
+
+        # A real body: the validators are now the latest capture's.
+        store.record_resource_revision(
+            resource_id,
+            content_markdown="Real body",
+            response_headers={"ETag": "real-etag", "Last-Modified": "real-last-modified"},
+        )
+        assert store.resource_fetch_validators(resource_id) == ("real-etag", "real-last-modified")
+    finally:
+        store.close()
+
+
 def test_v1_migration_prunes_history_images_and_inline_fts(tmp_path) -> None:
     path = tmp_path / "feedian.sqlite3"
     store = VaultStore.open(path)

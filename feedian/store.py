@@ -830,16 +830,25 @@ class VaultStore:
         return datetime.now(timezone.utc) - fetched_at >= timedelta(days=max(1, refresh_days))
 
     def resource_fetch_validators(self, resource_id: str) -> tuple[str, str]:
+        """Conditional-request validators, but only while a body is actually held.
+
+        A failed fetch still records the response's ETag. Replaying it for a
+        resource with no body invites a 304, and 304 writes no revision -- the
+        resource would stay bodyless until the far end happens to change.
+        """
         row = self.connection.execute(
             """
-            SELECT response_etag, response_last_modified
-            FROM fetch_capture
-            WHERE resource_id = ?
-            ORDER BY fetched_at DESC LIMIT 1
+            SELECT fc.response_etag, fc.response_last_modified,
+                   length(trim(coalesce(rr.content_markdown, ''))) AS content_length
+            FROM fetch_capture AS fc
+            JOIN resource AS r ON r.resource_id = fc.resource_id
+            LEFT JOIN resource_revision AS rr ON rr.resource_revision_id = r.current_revision_id
+            WHERE fc.resource_id = ?
+            ORDER BY fc.fetched_at DESC LIMIT 1
             """,
             (resource_id,),
         ).fetchone()
-        if row is None:
+        if row is None or int(row["content_length"] or 0) == 0:
             return "", ""
         return str(row["response_etag"] or ""), str(row["response_last_modified"] or "")
 
