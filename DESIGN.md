@@ -35,6 +35,17 @@
 - SQLite schema version 7の`sync_run`は`mode`を保存する。`_due_providers`は`mode='full'`のrunだけを見るため、quickを繰り返しても`feedian run`の完全同期がdueでなくなることはない。
 - quickだけを実行し続けると、provider側のmetadata差分、Hatenaコメントの増減、`refresh_days`到達による再取得、取得失敗本文の復旧が反映されない。これらは自動補正せず、完全同期の定期実行を案内する。
 
+## 並列処理
+
+外部I/Oだけをworkerへ出し、判断と書き込みはmain threadに残す。判断理由と却下した代替案は [syncとingestのスループット](docs/specs/20260819-sync-ingest-throughput.ja.md) を参照する。
+
+- 並列化は**保存される状態を意味的に変えない**。同じ入力と同じ外部応答に対して、本文・HTTP payload・`http_status`・response header・切り詰め情報・RSS fallbackの適用有無・監査内容・外部への取得回数・`--limit` の消費量が直列実行と一致する。UUID、timestamp、所要時間、独立したresource間の完了順は比較対象外である。正しい実装でも実行ごとに変わるためである。
+- 動かせない制約が2つある。**DBはmain thread専用**である（`sqlite3.connect` を既定の `check_same_thread=True` で開くため）。**playwrightは生成したthreadに束縛される**ため、browser描画もmain threadで行う。browser経由の抽出は全取得の1.0%（9,877件中99件）であり、workerごとにchromiumを立てる費用に見合わない。
+- `fetch_page_text` の `allow_browser=False` はworkerが使う。browser描画が必要な場合は結果に `browser_pending` を立てて返し、main threadが `complete_browser_fallback` で描画して合成する。**合成規則は `_merge_html_result` の1箇所にあり、直列経路と並列経路が同じ実装を通る。** HTTP抽出とbrowser抽出は `text_quality_score` で比較し、良い方を残す。browserが失敗してもHTTP本文は残り、警告だけが連結される。HTTP原本・status・headerは合成後も保持する。`http_status` は終端ステータス規則（404/410）の入力である。
+- 取得はitem単位ではなく**resource単位**で行う。同一resourceを指すitemは同じchunkへ入れず後続chunkへ繰り延べ、先行itemの結果が保存された後に通常の `should_fetch_resource` で再評価する。直列実行が暗黙に持っていた重複抑止をchunk化が壊すためである。結果を合流させないのは、取得失敗時に後続itemのauditが `completed` であること、`--force-fetch` ではitemごとに取得して予算を消費することが、合流では再現できないためである。resourceは正規化URLで束ねられる一方、`source_id` はRSSがfeed識別子由来、Raindropが `_id` 由来なので、同一URLが複数itemとして現れる。
+- 取得後処理は全てmain threadで、例外 → `not_modified` → browser合成 → 空本文の `embedded_content` fallback → `_store_page` → audit の順に行う。この順序を変えるとRSSの本文fallbackを失う。
+- 並列度は対象ごとに別の設定を持つ。`fetch.workers`（本文取得、既定8）、`fetch.comment_workers`（Hatenaコメント、既定8）、`llm.workers`（ingest、既定8）。同一ホストへの同時取得は制限しない。通常のWebブラウザはHTML本文以外のリソースを同時に要求するため、8本は極端な数ではない。
+
 ## 本文取得の再試行抑制
 
 取得に失敗し続けるresourceは、再試行の間隔が伸びるか、まったく再試行されなくなる。判断理由と却下した代替案は [本文取得の再試行抑制](docs/specs/20260818-fetch-retry-suppression.ja.md) を参照する。

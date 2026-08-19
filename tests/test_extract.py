@@ -9,7 +9,9 @@ from unittest.mock import patch
 from pypdf import PdfWriter
 
 from feedian.extract import (
+    PageFetchResult,
     TextExtractor,
+    complete_browser_fallback,
     UnresolvableHostError,
     clean_extracted_text,
     decode_html,
@@ -415,3 +417,127 @@ class StagedExtractionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DeferredBrowserMergeTests(unittest.TestCase):
+    """Spec 20260819-sync-ingest-throughput: one merge rule for both threads.
+
+    A worker cannot drive playwright, so it hands the render back. What comes
+    back must still keep the better of the two extractions, and must never lose
+    the HTTP payload, status or headers the retry rules read.
+    """
+
+    HTTP_BODY = b"<html><head><title>Static</title></head><body><div id='app'></div></body></html>"
+
+    def _http_only(self, *, headers=None):
+        with (
+            patch("feedian.extract.build_opener") as build_opener,
+            patch("feedian.extract.validate_fetch_url"),
+        ):
+            response = build_opener.return_value.open.return_value.__enter__.return_value
+            response.headers.get.return_value = "text/html; charset=utf-8"
+            response.headers.items.return_value = list((headers or {"ETag": "abc"}).items())
+            response.read.return_value = self.HTTP_BODY
+            response.geturl.return_value = "https://example.com/article"
+            response.status = 200
+            return fetch_page_text("https://example.com/article", 5, 1000, allow_browser=False)
+
+    def test_a_worker_defers_the_render_instead_of_running_it(self) -> None:
+        with patch("feedian.extract.render_html_with_browser") as render:
+            page = self._http_only()
+
+        render.assert_not_called()
+        self.assertIsNotNone(page.browser_pending)
+        self.assertEqual(page.browser_pending.kind, "low-quality")
+        self.assertEqual(page.http_status, 200)
+        self.assertEqual(page.raw_body, self.HTTP_BODY)
+
+    def test_a_better_browser_result_replaces_the_text_and_keeps_the_http_payload(self) -> None:
+        page = self._http_only()
+        body = "Rendered article body. " * 30
+        with patch("feedian.extract.render_html_with_browser") as render:
+            render.return_value = (
+                f"<html><head><title>Rendered</title></head><body><article>{body}</article></body></html>",
+                "https://example.com/article",
+                "Rendered",
+            )
+            merged = complete_browser_fallback(page)
+
+        self.assertEqual(merged.fetch_method, "browser")
+        self.assertIn("Rendered article body", merged.text)
+        self.assertEqual(merged.raw_body, self.HTTP_BODY, "the HTTP original is still stored")
+        self.assertEqual(merged.http_status, 200, "the terminal-status rules read this")
+        self.assertEqual(merged.response_headers, {"ETag": "abc"})
+        self.assertIsNone(merged.browser_pending)
+
+    def test_a_worse_browser_result_leaves_the_http_text_in_place(self) -> None:
+        with (
+            patch("feedian.extract.build_opener") as build_opener,
+            patch("feedian.extract.validate_fetch_url"),
+            # Forced on, so the test stays about the merge rather than about
+            # which HTML happens to look low-confidence today.
+            patch("feedian.extract.should_render_with_browser", return_value=True),
+        ):
+            response = build_opener.return_value.open.return_value.__enter__.return_value
+            response.headers.get.return_value = "text/html; charset=utf-8"
+            response.headers.items.return_value = []
+            response.read.return_value = (
+                "<html><body><article>" + "Static body sentence. " * 20 + "</article></body></html>"
+            ).encode("utf-8")
+            response.geturl.return_value = "https://example.com/article"
+            response.status = 200
+            page = fetch_page_text("https://example.com/article", 5, 1000, allow_browser=False)
+
+        self.assertIsNotNone(page.browser_pending)
+        with patch("feedian.extract.render_html_with_browser") as render:
+            render.return_value = ("<html><body><p>tiny</p></body></html>", "https://example.com/article", "")
+            merged = complete_browser_fallback(page)
+
+        self.assertEqual(merged.fetch_method, "http")
+        self.assertIn("Static body sentence", merged.text)
+
+    def test_a_failing_browser_keeps_the_http_body_and_only_notes_the_reason(self) -> None:
+        page = self._http_only()
+        with patch("feedian.extract.render_html_with_browser", side_effect=RuntimeError("boom")):
+            merged = complete_browser_fallback(page)
+
+        self.assertEqual(merged.fetch_method, "http")
+        self.assertEqual(merged.raw_body, self.HTTP_BODY)
+        self.assertEqual(merged.http_status, 200)
+        self.assertIn("browser fallback failed: boom", merged.error or "")
+
+    def test_completing_a_result_with_nothing_pending_returns_it_unchanged(self) -> None:
+        page = PageFetchResult(url="https://example.com/a", text="body")
+
+        self.assertIs(complete_browser_fallback(page), page)
+
+    @patch("feedian.extract.build_opener")
+    @patch("feedian.extract.validate_fetch_url")
+    def test_http_403_defers_its_standalone_browser_fetch(self, validate_url, build_opener) -> None:
+        build_opener.return_value.open.side_effect = HTTPError(
+            "https://example.com/article", 403, "Forbidden", {}, BytesIO()
+        )
+
+        page = fetch_page_text("https://example.com/article", 5, 1000, allow_browser=False)
+
+        self.assertEqual(page.browser_pending.kind, "http-error")
+        self.assertEqual(page.browser_pending.initial_error, "HTTP 403")
+        self.assertEqual(page.http_status, 403)
+
+    @patch("feedian.extract.fetch_page_text_with_browser")
+    @patch("feedian.extract.build_opener")
+    @patch("feedian.extract.validate_fetch_url")
+    def test_a_deferred_403_render_reports_failure_the_same_way(
+        self, validate_url, build_opener, browser_fetch
+    ) -> None:
+        build_opener.return_value.open.side_effect = HTTPError(
+            "https://example.com/article", 403, "Forbidden", {}, BytesIO()
+        )
+        browser_fetch.side_effect = RuntimeError("no browser")
+
+        merged = complete_browser_fallback(
+            fetch_page_text("https://example.com/article", 5, 1000, allow_browser=False)
+        )
+
+        self.assertEqual(merged.error, "HTTP 403; browser fallback failed: no browser")
+        self.assertEqual(merged.http_status, 403)

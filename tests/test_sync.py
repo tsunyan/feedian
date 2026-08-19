@@ -1349,3 +1349,185 @@ def test_hatena_full_disables_the_early_stop(monkeypatch) -> None:
 
     assert captured["known"] is None
     assert captured["stop_after_known_pages"] == 0
+
+
+# --- Parallel page fetching. Spec 20260819-sync-ingest-throughput. ---
+
+
+def _duplicate_url_items() -> list[tuple[CanonicalItem, bytes]]:
+    """Two source items, one resource: what two RSS feeds carrying one article look like."""
+    return [
+        (
+            CanonicalItem(
+                source="rss", source_id=f"rss-feed{n}", content_key="url:shared",
+                url="https://example.test/shared", title=f"From feed {n}",
+            ),
+            b"{}",
+        )
+        for n in (1, 2)
+    ]
+
+
+def _page(url: str, text: str = "article body") -> PageFetchResult:
+    return PageFetchResult(
+        url=url, final_url=url, text=text, title="Article",
+        raw_body=b"<html>body</html>", media_type="text/html", http_status=200,
+        fetch_method="http", extraction_method="trafilatura",
+    )
+
+
+def _run_sync(monkeypatch, tmp_path, items, *, workers: int, fetch, **kwargs):
+    monkeypatch.setattr("feedian.sync._provider_items", lambda *_a, **_k: iter(items))
+    monkeypatch.setattr("feedian.sync.fetch_page_text", fetch)
+    config = VaultConfig(providers={"rss": ProviderSettings(folder="RSS")})
+    config.fetch["workers"] = workers
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        return store, sync_vault(store, config, source="rss", fetch_comments=False, **kwargs)
+    finally:
+        pass
+
+
+@pytest.mark.parametrize("workers", [1, 8])
+def test_two_items_sharing_a_resource_fetch_the_page_once(monkeypatch, tmp_path, workers) -> None:
+    calls: list[str] = []
+
+    def fetch(url, **_kwargs):
+        calls.append(url)
+        return _page(url)
+
+    store, report = _run_sync(monkeypatch, tmp_path, _duplicate_url_items(), workers=workers, fetch=fetch)
+    try:
+        assert calls == ["https://example.test/shared"], "the second item is deferred, then judged not due"
+        assert report.fetched == 1
+        assert report.processed == 2
+        audited = store.connection.execute(
+            "SELECT COUNT(*) FROM sync_run_item WHERE sync_run_id = ?", (report.run_id,)
+        ).fetchone()[0]
+        assert audited == 2, "both source items are recorded"
+        captures = store.connection.execute("SELECT COUNT(*) FROM fetch_capture").fetchone()[0]
+        assert captures == 1
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("workers", [1, 8])
+def test_a_failed_fetch_does_not_fail_the_other_item_on_the_same_resource(
+    monkeypatch, tmp_path, workers
+) -> None:
+    calls: list[str] = []
+
+    def fetch(url, **_kwargs):
+        calls.append(url)
+        raise RuntimeError("network down")
+
+    store, report = _run_sync(monkeypatch, tmp_path, _duplicate_url_items(), workers=workers, fetch=fetch)
+    try:
+        assert calls == ["https://example.test/shared"], "backoff keeps the deferred item from retrying"
+        statuses = sorted(
+            row[0]
+            for row in store.connection.execute(
+                "SELECT status FROM sync_run_item WHERE sync_run_id = ?", (report.run_id,)
+            )
+        )
+        assert statuses == ["completed", "failed"], "only the item that fetched is failed"
+        assert report.failed == 1
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("workers", [1, 8])
+def test_force_fetch_still_fetches_once_per_item(monkeypatch, tmp_path, workers) -> None:
+    calls: list[str] = []
+
+    def fetch(url, **_kwargs):
+        calls.append(url)
+        return _page(url, text=f"body {len(calls)}")
+
+    store, report = _run_sync(
+        monkeypatch, tmp_path, _duplicate_url_items(), workers=workers, fetch=fetch, force_fetch=True
+    )
+    try:
+        assert len(calls) == 2, "force means every item fetches, as it does when run serially"
+        assert report.fetched == 2
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("workers", [1, 8])
+def test_an_rss_item_whose_fetch_raises_keeps_the_feed_body(monkeypatch, tmp_path, workers) -> None:
+    item = CanonicalItem(
+        source="rss", source_id="rss-1", content_key="url:a", url="https://example.test/a",
+        title="RSS Article", embedded_content="Feed body",
+    )
+
+    def fetch(*_args, **_kwargs):
+        raise RuntimeError("network down")
+
+    store, report = _run_sync(monkeypatch, tmp_path, [(item, b"{}")], workers=workers, fetch=fetch)
+    try:
+        body = store.connection.execute(
+            "SELECT rr.content_markdown FROM resource r"
+            " JOIN resource_revision rr ON rr.resource_revision_id = r.current_revision_id"
+        ).fetchone()
+        assert body is not None and body[0] == "Feed body", "the body we already had is not dropped"
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("workers", [1, 8])
+def test_an_rss_item_with_an_empty_page_falls_back_to_the_feed_body(monkeypatch, tmp_path, workers) -> None:
+    item = CanonicalItem(
+        source="rss", source_id="rss-1", content_key="url:a", url="https://example.test/a",
+        title="RSS Article", embedded_content="Feed body",
+    )
+    store, report = _run_sync(
+        monkeypatch, tmp_path, [(item, b"{}")], workers=workers,
+        fetch=lambda url, **_k: _page(url, text="   "),
+    )
+    try:
+        row = store.connection.execute(
+            "SELECT rr.content_markdown, fc.extracted_by FROM resource r"
+            " JOIN resource_revision rr ON rr.resource_revision_id = r.current_revision_id"
+            " JOIN fetch_capture fc ON fc.resource_id = r.resource_id"
+        ).fetchone()
+        assert row[0] == "Feed body"
+        assert "rss-feed-fallback" in row[1]
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("workers", [1, 8])
+def test_a_not_modified_page_is_recorded_without_a_new_revision(monkeypatch, tmp_path, workers) -> None:
+    item = CanonicalItem(
+        source="rss", source_id="rss-1", content_key="url:a", url="https://example.test/a",
+        embedded_content="Feed body",
+    )
+    store, report = _run_sync(
+        monkeypatch, tmp_path, [(item, b"{}")], workers=workers,
+        fetch=lambda url, **_k: PageFetchResult(url=url, text="", not_modified=True, http_status=304),
+    )
+    try:
+        revisions = store.connection.execute("SELECT COUNT(*) FROM resource_revision").fetchone()[0]
+        assert revisions == 0
+        assert report.fetched == 1
+    finally:
+        store.close()
+
+
+def test_workers_do_not_drive_the_browser_themselves(monkeypatch, tmp_path) -> None:
+    seen: list[bool] = []
+
+    def fetch(url, **kwargs):
+        seen.append(kwargs["allow_browser"])
+        return _page(url)
+
+    store, _ = _run_sync(
+        monkeypatch, tmp_path,
+        [(CanonicalItem(source="rss", source_id="a", content_key="url:a", url="https://example.test/a"), b"{}")],
+        workers=8, fetch=fetch,
+    )
+    try:
+        assert seen == [False], "playwright stays on the main thread; the render is deferred"
+    finally:
+        store.close()
