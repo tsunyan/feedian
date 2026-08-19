@@ -319,6 +319,13 @@ def _provider_items(
                 if collection_progress is not None
                 else None
             ),
+            known=known if quick else None,
+            # Zero keeps full mode sweeping every page; the caller validated the
+            # configured value before quick ever reaches here.
+            stop_after_known_pages=stop_after_known_pages if quick else 0,
+            on_stopped_early=(
+                (lambda: on_stopped_early(provider)) if on_stopped_early is not None else None
+            ),
         )
         for item in items:
             yield item, stable_json(item.as_bookmark_metadata()).encode("utf-8")

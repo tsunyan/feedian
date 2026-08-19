@@ -1297,3 +1297,55 @@ def test_full_sync_suppresses_a_resource_using_configured_terminal_kind_settings
         assert report.fetched == 0
     finally:
         store.close()
+
+
+def test_hatena_quick_passes_known_ids_and_reports_stopping_early(monkeypatch) -> None:
+    """Quick hands the early-stop settings down. Spec 20260819-sync-ingest-throughput."""
+    captured: dict[str, object] = {}
+    stopped: list[str] = []
+
+    def fetch_bookmarks(*_args, **kwargs):
+        captured.update(kwargs)
+        kwargs["on_stopped_early"]()
+        return []
+
+    monkeypatch.setattr("feedian.sync._required_env", lambda _name: "value")
+    monkeypatch.setattr("feedian.sync.fetch_hatena_bookmarks", fetch_bookmarks)
+    list(
+        _provider_items(
+            VaultConfig(providers={"hatena": VaultConfig().providers["hatena"]}),
+            "hatena",
+            None,
+            quick=True,
+            known={"already-have"},
+            stop_after_known_pages=2,
+            on_stopped_early=stopped.append,
+        )
+    )
+
+    assert captured["known"] == {"already-have"}
+    assert captured["stop_after_known_pages"] == 2
+    assert stopped == ["hatena"]
+
+
+def test_hatena_full_disables_the_early_stop(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr("feedian.sync._required_env", lambda _name: "value")
+    monkeypatch.setattr(
+        "feedian.sync.fetch_hatena_bookmarks",
+        lambda *_args, **kwargs: (captured.update(kwargs), [])[1],
+    )
+    list(
+        _provider_items(
+            VaultConfig(providers={"hatena": VaultConfig().providers["hatena"]}),
+            "hatena",
+            None,
+            quick=False,
+            known={"already-have"},
+            stop_after_known_pages=2,
+        )
+    )
+
+    assert captured["known"] is None
+    assert captured["stop_after_known_pages"] == 0

@@ -229,20 +229,47 @@ def fetch_hatena_bookmarks(
     retry_base_seconds: float = 1.0,
     request_interval_seconds: float = 0.3,
     on_page: Callable[[int, int], None] | None = None,
+    known: set[str] | None = None,
+    stop_after_known_pages: int = 0,
+    on_stopped_early: Callable[[], None] | None = None,
 ) -> list[CanonicalItem]:
+    """Collect bookmarks through the authenticated search API.
+
+    A non-zero stop_after_known_pages turns on quick collection: each query
+    stops once that many consecutive pages held nothing outside `known`. The
+    search API returns each query in non-increasing timestamp order, measured
+    over all 6,987 rows and 69 page boundaries of the reference vault, so new
+    bookmarks sit at the head. See docs/specs/20260819-sync-ingest-throughput.ja.md.
+    """
+    quick = stop_after_known_pages > 0
+    known_ids = known or set()
     items_by_id: dict[str, CanonicalItem] = {}
     examined = 0
     known_total = 0
+    new_items = 0
+    stopped_early = False
     page_size = 100
     next_request_at = 0.0
     for search_query in SEARCH_QUERIES:
         offset = 0
         query_total: int | None = None
+        # Counted per query, never shared. Which query a new bookmark's text
+        # lands in is not knowable ahead of time, so one query stopping on a
+        # page of known items says nothing about the other.
+        consecutive_known_pages = 0
         while True:
-            remaining = None if limit is None else max(0, limit - offset)
-            requested = page_size if remaining is None else min(page_size, remaining)
-            if requested <= 0:
-                break
+            if quick:
+                # limit counts the items quick actually takes on, as it does for
+                # Raindrop. Comparing it against the offset instead would stop a
+                # query before reaching new items that sort below known ones.
+                if limit is not None and new_items >= limit:
+                    break
+                requested = page_size
+            else:
+                remaining = None if limit is None else max(0, limit - offset)
+                requested = page_size if remaining is None else min(page_size, remaining)
+                if requested <= 0:
+                    break
             now = time.monotonic()
             if next_request_at > now:
                 time.sleep(next_request_at - now)
@@ -274,10 +301,16 @@ def fetch_hatena_bookmarks(
             if query_total is None:
                 query_total = total
                 known_total += min(total, limit) if limit is not None else total
+            page_items = 0
+            page_new = 0
             for row in rows:
                 item = _search_result_item(row)
                 if item is not None:
                     items_by_id[item.source_id] = item
+                    page_items += 1
+                    if item.source_id not in known_ids:
+                        page_new += 1
+                        new_items += 1
             examined += len(rows)
             target_total = known_total
             if on_page is not None:
@@ -285,9 +318,26 @@ def fetch_hatena_bookmarks(
             offset += len(rows)
             if not rows or offset >= total or len(rows) < requested:
                 break
+            if quick:
+                # A page that parsed nothing carries no evidence either way, so
+                # it neither confirms nor breaks the streak of known pages.
+                if page_items == 0:
+                    consecutive_known_pages = 0
+                elif page_new == 0:
+                    consecutive_known_pages += 1
+                    if consecutive_known_pages >= stop_after_known_pages:
+                        stopped_early = True
+                        break
+                else:
+                    consecutive_known_pages = 0
 
+    if stopped_early and on_stopped_early is not None:
+        on_stopped_early()
     items = sorted(items_by_id.values(), key=lambda item: item.created_at, reverse=True)
-    return items[:limit]
+    # Quick hands every collected item downstream, known ones included, because
+    # sync.py is what skips them and counts them as skipped. Truncating here
+    # would cut by total count rather than by the new items limit means.
+    return items if quick else items[:limit]
 
 
 def _validate_search_response(data: dict[str, Any]) -> tuple[list[Any], int]:

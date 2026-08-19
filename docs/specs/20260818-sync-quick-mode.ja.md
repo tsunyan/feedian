@@ -67,7 +67,7 @@ quickが処理するのは次の和集合である。
 | provider | 収集 | 根拠 |
 |---|---|---|
 | `raindrop` | 早期打ち切りする | Raindrop APIの`sort=-created`は作成日時の降順である（[Multiple raindrops](https://developer.raindrop.io/v1/raindrops/multiple)）。既知itemだけのページに到達したら以降も既知とみなせる |
-| `hatena` | 変更しない（全件収集を維持） | 検索APIの返却順が降順である保証を確認できていない。`fetch_hatena_bookmarks`は取得後に`created_at`で並べ替えている（`feedian/hatena.py:288`）。収集の削減より下流スキップの効果が大きい |
+| `hatena` | **早期に打ち切る**（クエリごとに独立して判定） | 検索APIの返却順を全件走査で実測し、6,987行・69ページ境界で非増加順を確認した。[syncとingestのスループット](20260819-sync-ingest-throughput.ja.md) により改訂（改訂1） |
 | `rss` | 変更しない | ETag / Last-Modifiedによる条件付き取得が既にあり、feedの返却窓が有界である |
 
 **Raindropのページ境界** — `RaindropClient`に`iter_raindrop_pages(...) -> Iterator[list[dict]]`を追加し、既存の`iter_raindrops`をその平坦化として実装する。paging処理を二重に持たないためである。
@@ -231,6 +231,20 @@ sync: run=<id> mode=quick processed=12 changed=12 skipped=2988 fetched=12 retrie
 | Hatenaにも早期打ち切りを導入する | 検索APIの返却順が降順である保証を確認できていない。下流スキップだけで支配的なコスト（コメント件数照会）は消える |
 | `--quick`を`--new-only`へ改名する | 利用者が最初に使った呼称であり、helpで対象を説明すれば誤解は生じない |
 | provider単位で`sync_run.mode`を記録する | 自動昇格が不採用になり、mixed modeを実行する場面が無くなった |
+
+## 改訂
+
+### 改訂1 — Claude Code (2026-08-19)
+
+**箇所**: `最終案` / provider別の収集方針の表、`hatena` の行
+
+**(前)** `| hatena | 変更しない（全件収集を維持） | 検索APIの返却順が降順である保証を確認できていない。fetch_hatena_bookmarks は取得後に created_at で並べ替えている。収集の削減より下流スキップの効果が大きい |`
+
+**(後)** `| hatena | 早期に打ち切る（クエリごとに独立して判定） | 検索APIの返却順を全件走査で実測し、6,987行・69ページ境界で非増加順を確認した |`
+
+**理由**: 本仕様が判断を保留した根拠は「返却順の保証を確認できていない」ことだった。2026-08-19に全71リクエストを走査し、`q=https` 5,018行・51ページ・境界50箇所、`q=http` 1,969行・20ページ・境界19箇所のすべてで `timestamp` が非増加であることを確認した。保留の根拠が消えたため、本仕様自身が「実測が取れれば導入できる」と書いた条件（同 `:408`）が満たされた。なお契約は「厳密な降順」ではなく「非増加」である。`q=https` には同一 `timestamp` の行が実在する。
+
+**根拠**: [syncとingestのスループット](20260819-sync-ingest-throughput.ja.md)
 
 ## 草案
 
