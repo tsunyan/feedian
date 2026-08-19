@@ -243,6 +243,10 @@ def fetch_hatena_bookmarks(
     """
     quick = stop_after_known_pages > 0
     known_ids = known or set()
+    # The two searches overlap, and the same bookmark can land in both. Counting
+    # it once per appearance would spend the limit on duplicates and stop before
+    # reaching new bookmarks further down.
+    seen_new: set[str] = set()
     items_by_id: dict[str, CanonicalItem] = {}
     examined = 0
     known_total = 0
@@ -309,8 +313,12 @@ def fetch_hatena_bookmarks(
                     items_by_id[item.source_id] = item
                     page_items += 1
                     if item.source_id not in known_ids:
+                        # The page holds something outside the vault, so it is not
+                        # a known page - whichever query surfaced it first.
                         page_new += 1
-                        new_items += 1
+                        if item.source_id not in seen_new:
+                            seen_new.add(item.source_id)
+                            new_items += 1
             examined += len(rows)
             target_total = known_total
             if on_page is not None:

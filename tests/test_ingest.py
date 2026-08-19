@@ -987,3 +987,53 @@ def test_a_fallback_passes_through_its_own_backend_limits(tmp_path, monkeypatch)
         assert secondary.peak == 1, "the fallback obeys its own limit, not the primary's"
     finally:
         store.close()
+
+
+def test_a_fallback_counts_as_one_candidate_not_two(tmp_path, monkeypatch) -> None:
+    """Review 20260819-2: a fallback is a second attempt, not a second candidate."""
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("MANUS_API_KEY", "manus-key")
+    root = tmp_path / "vault"
+    root.mkdir()
+    store = _vault_with_resources(root, 1)
+    try:
+        config = VaultConfig()
+        config.llm.fallback = LLMFallbackSettings(enabled=True, backend="manus-api", model="manus-1.6")
+        seen: list[tuple[int, int]] = []
+        report = ingest_source_notes(
+            store, root, config, model="gpt-5.6-terra",
+            backend_instance=ConcurrencyProbe(error=BackendRateLimitError("slow down")),
+            fallback_instance=ConcurrencyProbe(backend="manus-api"),
+            progress=lambda processed, total, _candidate, _report: seen.append((processed, total)),
+        )
+
+        assert report.created == 1
+        assert report.processed == 1
+        assert all(processed <= total for processed, total in seen), seen
+    finally:
+        store.close()
+
+
+def test_progress_counts_finished_candidates_not_submitted_ones(tmp_path, monkeypatch) -> None:
+    """Review 20260819-4: jobs are submitted ahead of the first result.
+
+    Counting at submit made every candidate look done as soon as one was.
+    """
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    root = tmp_path / "vault"
+    root.mkdir()
+    store = _vault_with_resources(root, 3)
+    try:
+        config = VaultConfig()
+        config.llm.workers = 3
+        seen: list[tuple[int, int]] = []
+        report = ingest_source_notes(
+            store, root, config, model="gpt-5.6-terra",
+            backend_instance=ConcurrencyProbe(),
+            progress=lambda processed, total, _candidate, _report: seen.append((processed, total)),
+        )
+
+        assert report.processed == 3
+        assert seen == [(1, 3), (2, 3), (3, 3)]
+    finally:
+        store.close()

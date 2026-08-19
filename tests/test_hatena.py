@@ -311,3 +311,48 @@ class HatenaQuickCollectionTests(unittest.TestCase):
             fetch_hatena_bookmarks("user", "key", request_interval_seconds=0,
                                    known=set(), stop_after_known_pages=1)
         self.assertEqual(read_json.call_count, 2)
+
+    def test_a_bookmark_found_by_both_queries_spends_the_limit_once(self) -> None:
+        """Review 20260819-1: the two searches overlap, so one bookmark can appear twice.
+
+        The threshold is 2 here so a single all-known page does not end the walk;
+        what is under test is the limit, not the early stop.
+        """
+        known_urls = [f"https://example.com/k{i}" for i in range(99)]
+        pages = [
+            self._page(["https://example.com/newA"], 1),
+            self._page(["https://example.com/newA"] + known_urls, 200),
+            self._page(["https://example.com/newB"] + known_urls, 200, 100),
+        ]
+        with patch("feedian.hatena._read_json", side_effect=pages) as read_json:
+            items = fetch_hatena_bookmarks(
+                "user", "key", limit=2, request_interval_seconds=0,
+                known=self._known(*known_urls), stop_after_known_pages=2,
+            )
+
+        urls = [item.url for item in items]
+        self.assertEqual(read_json.call_count, 3)
+        self.assertIn("https://example.com/newB", urls, "the duplicate must not use up the budget")
+
+    def test_a_page_holding_a_new_bookmark_is_not_a_known_page(self) -> None:
+        """Review 20260819-3: known means the vault, not "seen earlier this run".
+
+        The finalized specification ends a query when every item on a page is in
+        the set handed in from the database. A bookmark the other query surfaced
+        first is still absent from the vault, so its page has new content and the
+        walk goes on - otherwise quick misses whatever sits below it.
+        """
+        known_urls = [f"https://example.com/k{i}" for i in range(99)]
+        pages = [
+            self._page(["https://example.com/newA"], 1),
+            self._page(["https://example.com/newA"] + known_urls, 200),
+            self._page(["https://example.com/newB"] + known_urls, 200, 100),
+        ]
+        with patch("feedian.hatena._read_json", side_effect=pages) as read_json:
+            items = fetch_hatena_bookmarks(
+                "user", "key", request_interval_seconds=0,
+                known=self._known(*known_urls), stop_after_known_pages=1,
+            )
+
+        self.assertEqual(read_json.call_count, 3)
+        self.assertIn("https://example.com/newB", [item.url for item in items])

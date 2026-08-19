@@ -232,7 +232,14 @@ def ingest_source_notes(
         )
 
     def account(job: _Job, attempt: _Attempt) -> None:
-        nonlocal created, reused, failed, input_tokens, output_tokens, cost_usd, unpriced, unmetered
+        nonlocal processed, created, reused, failed
+        nonlocal input_tokens, output_tokens, cost_usd, unpriced, unmetered
+        # Counted where the candidate is settled, not where its job is submitted.
+        # Jobs are submitted up to the worker count ahead of the first result, so
+        # counting at submit reports every candidate done as soon as one is. A
+        # fallback does not reach here for the attempt it replaces, so one
+        # candidate is still counted once.
+        processed += 1
         if attempt.reused:
             reused += 1
             report(job.candidate, "reused", attempt.run_id, attempt.error_text)
@@ -328,7 +335,6 @@ def ingest_source_notes(
                         break
                     job = queue.pop(index)
                     gate_for(job.backend).take()
-                    processed += 1
                     _open_run(store, job)
                     open_runs[job.run_id] = job
                     pending[executor.submit(_execute_job, job, language=language)] = job
