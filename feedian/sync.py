@@ -258,6 +258,7 @@ def sync_vault(
                     refresh_days=refresh_days,
                     force_fetch=force_fetch,
                     retry_settings=retry_settings,
+                    workers=fetch_workers,
                 )
                 retried += provider_retried
                 fetched += provider_fetched
@@ -598,6 +599,7 @@ def _run_quick_body_only_pass(
     refresh_days: int,
     force_fetch: bool,
     retry_settings: FetchRetrySettings,
+    workers: int,
 ) -> tuple[int, int, int]:
     """Retry resources that still have no body, without touching any provider.
 
@@ -606,6 +608,7 @@ def _run_quick_body_only_pass(
     """
     retried = fetched = failed = 0
     remaining = budget
+    due: list[tuple[str, str, tuple[str, str], list[str]]] = []
     for resource_id, url in store.unfetched_resources([provider]):
         if resource_id in handled_resource_ids:
             continue
@@ -629,18 +632,19 @@ def _run_quick_body_only_pass(
         # is often shared (the same URL bookmarked in Raindrop and in Hatena), and it
         # leaves `unfetched_resources` as soon as this fetch lands, so the other
         # provider's pass would never get to record its outcome.
-        source_item_ids = store.source_items_for_resource(resource_id, all_providers)
+        due.append((resource_id, url, store.resource_fetch_validators(resource_id),
+                    store.source_items_for_resource(resource_id, all_providers)))
+
+    # unfetched_resources already yields one row per resource, so nothing here
+    # needs the chunked deferral the item loop uses.
+    for (resource_id, url, _validators, source_item_ids), (page, fetch_error) in zip(
+        due, _fetch_urls(due, retry_settings=retry_settings, workers=workers)
+    ):
         try:
-            etag, last_modified = store.resource_fetch_validators(resource_id)
-            page = fetch_page_text(
-                url,
-                timeout_seconds=retry_settings.timeout_seconds,
-                max_chars=10_000,
-                allow_private_urls=False,
-                etag=etag,
-                last_modified=last_modified,
-                browser_timeout_seconds=retry_settings.browser_timeout_seconds,
-            )
+            if fetch_error is not None:
+                raise fetch_error
+            # playwright is bound to the thread that started it.
+            page = complete_browser_fallback(page)
             if page.not_modified:
                 store.record_not_modified_fetch(
                     resource_id,
@@ -669,6 +673,43 @@ def _run_quick_body_only_pass(
             for source_item_id in source_item_ids:
                 store.record_sync_item(run_id, source_item_id, "failed", str(exc))
     return retried, fetched, failed
+
+
+def _fetch_urls(
+    due: list[tuple[str, str, tuple[str, str], list[str]]],
+    *,
+    retry_settings: FetchRetrySettings,
+    workers: int,
+) -> list[tuple[PageFetchResult | None, Exception | None]]:
+    """Fetch the body-only pass's URLs, in the input order the caller stores in."""
+    if not due:
+        return []
+
+    def fetch(entry) -> tuple[PageFetchResult | None, Exception | None]:
+        _resource_id, url, (etag, last_modified), _items = entry
+        try:
+            return (
+                fetch_page_text(
+                    url,
+                    timeout_seconds=retry_settings.timeout_seconds,
+                    max_chars=10_000,
+                    allow_private_urls=False,
+                    etag=etag,
+                    last_modified=last_modified,
+                    browser_timeout_seconds=retry_settings.browser_timeout_seconds,
+                    allow_browser=False,
+                ),
+                None,
+            )
+        except Exception as exc:
+            return None, exc
+
+    if len(due) == 1 or workers == 1:
+        return [fetch(entry) for entry in due]
+    with ThreadPoolExecutor(
+        max_workers=min(len(due), workers), thread_name_prefix="feedian-retry"
+    ) as executor:
+        return list(executor.map(fetch, due))
 
 
 def _audited_source_items(

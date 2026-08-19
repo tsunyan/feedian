@@ -109,9 +109,6 @@ def plan_source_notes(
     provider: str | None = None,
     backend_instance: LLMBackend | None = None,
 ) -> IngestPlan:
-    # Runs a killed process left open are not pending work. The vault write
-    # lock is held by the caller, so this cannot touch another process's run.
-    store.fail_interrupted_llm_runs()
     backend_id = canonical_backend_id(provider or backend)
     selected_backend = backend_instance or get_backend(backend_id)
     rows = _source_rows(store)
@@ -196,6 +193,11 @@ def ingest_source_notes(
     )
     if dry_run:
         return IngestReport(processed=len(plan.candidates), reused=plan.reusable)
+    # Past the dry-run return, so planning stays read-only: the CLI plans a dry
+    # run without the vault write lock, and this writes. Runs a killed process
+    # left open are not pending work, but only this process may say so - under
+    # the lock, another ingest's live runs are not ours to fail.
+    store.fail_interrupted_llm_runs()
     if plan.new_requests and not selected_backend.supports_model(model):
         raise BackendPolicyError(f"Backend {backend_id} does not support model {model!r}.")
     preflight_metadata = selected_backend.preflight() if plan.new_requests else {}

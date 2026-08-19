@@ -533,12 +533,15 @@ def complete_browser_fallback(page: PageFetchResult) -> PageFetchResult:
                 error=f"{pending.initial_error}; browser fallback failed: {exc}",
                 http_status=page.http_status,
             )
+    if pending.kind != "low-quality" or pending.fetch is None:
+        # Not an assert: python -O strips those, and the merge would then read
+        # attributes off None instead of saying what went wrong.
+        raise ValueError(f"Unsupported browser candidate: {pending.kind}")
     rendered, browser_error = _render_for_merge(
         pending.fetch_url,
         timeout_seconds=pending.timeout_seconds,
         allow_private_urls=pending.allow_private_urls,
     )
-    assert pending.fetch is not None
     return _merge_html_result(pending.fetch, rendered=rendered, browser_error=browser_error)
 
 

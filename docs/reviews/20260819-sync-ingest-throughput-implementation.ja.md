@@ -97,6 +97,29 @@ Hatena収集は `https` と `http` の2検索を行い、同じbookmarkが両方
 | 4 | 並列ingestのprogressがsubmit数を表示 | 低 | 採用 | `processed` は submit 時ではなく `account` の冒頭で加算する |
 | 5 | レビュー対象と修正commitの関係 | 低 | 採用 | 2 commitを `0947088` 直後の1 commitへsquashした |
 
+### PR #18 のレビュー（Codex GitHub app / CodeRabbit, 2026-08-19）
+
+PRを開いた際の自動レビュー。4件を採用した。
+
+| # | 指摘 | 出所 | 重大度 | 採否 | 対応 |
+|---|---|---|---|---|---|
+| 6 | `fail_interrupted_llm_runs()` がplanningにあり、dry-runがlock外で書き込む | Codex P2 / CodeRabbit Critical | 高 | 採用 | 実行経路（dry-run returnの後）へ移した |
+| 7 | (B1) 本文のみpassが直列のまま | Codex P1 | 中 | 採用 | `fetch.workers` を渡し、取得だけをworkerへ出した |
+| 8 | `assert pending.fetch is not None` は `python -O` で除去される | CodeRabbit | 低 | 採用 | 明示的な分岐と `ValueError` に置き換えた |
+| 9 | 改訂記録の `(後)` が現在の本文と一致しない | CodeRabbit | 低 | 採用 | 太字・リンク・`（改訂1）` を含む現在の本文を引用し直した |
+
+#### 指摘6について — 置換対象を取り違えた
+
+**これは私の編集ミスである。** `fail_interrupted_llm_runs()` を `ingest_source_notes` の冒頭へ入れるつもりで、`backend_id = canonical_backend_id(provider or backend)` を目印に置換したが、この行は `plan_source_notes`（`feedian/ingest.py:100`）にも同じ形で存在し、先頭の一致である planning 側へ入っていた。
+
+結果として、**`feedian ingest --dry-run` が `vault_write_lock` の外でDBを書き換える**状態になっていた（`feedian/cli.py:691-699` はdry-run経路でlockを取らずにplanningを呼ぶ）。他プロセスが実行中の `llm_run` を失敗へ書き換え得るため、データ完全性の問題である。しかも私が付けたコメント「The vault write lock is held by the caller」自体が、その位置では偽だった。
+
+既存テストが通っていたのは、`ingest_source_notes` が内部で `plan_source_notes` を呼ぶため、回収の効果だけは観測できていたからである。**呼ばれる位置を検証していなかった。** dry-runとplanningが書き込まないことを固定する回帰テストを追加した。
+
+#### 指摘7について
+
+確定仕様は `fetch.workers` を「(A)ループと(B1)passの双方」と定めているが、実装は(A)にしか渡していなかった。本文未取得のresourceが多いVault（取得失敗や中断の後）では、(B1)がtimeoutの総和を直列で払い続ける。`_fetch_urls` を足し、(A)と同じく取得だけをworkerへ出してDB書き込みとbrowser描画をmain threadに残した。(B1)は `unfetched_resources` がresourceごとに1行を返すので、(A)が要する同一resourceの繰り延べは不要である。
+
 ### 指摘5について
 
 指摘は規約どおりであり、採用した。`AGENTS.md` のコードレビュー運用は、修正を1 commitへsquashして `対象` がちょうど1 commit前に留まることを求めている。指摘1・2の修正（`6e6531f`）と指摘3・4の修正（`4ba9626`）を、レビュー文書とともに `0947088` の直後の1 commitへまとめ直した。squash前の2 commitはpushしていないため、失われる公開履歴は無い。

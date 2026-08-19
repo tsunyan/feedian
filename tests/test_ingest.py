@@ -1037,3 +1037,40 @@ def test_progress_counts_finished_candidates_not_submitted_ones(tmp_path, monkey
         assert seen == [(1, 3), (2, 3), (3, 3)]
     finally:
         store.close()
+
+
+def test_a_dry_run_leaves_another_process_running_llm_run_alone(tmp_path, monkeypatch) -> None:
+    """Review 20260819-6: planning happens without the vault write lock.
+
+    The CLI plans a dry run before taking the lock, so nothing on that path may
+    write - least of all close a run another ingest is still executing.
+    """
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    root = tmp_path / "vault"
+    root.mkdir()
+    store = _vault_with_resources(root, 1)
+    try:
+        resource_id = store.connection.execute("SELECT resource_id FROM resource LIMIT 1").fetchone()[0]
+        revision_id = store.connection.execute(
+            "SELECT resource_revision_id FROM resource_revision LIMIT 1"
+        ).fetchone()[0]
+        store.start_llm_run(
+            resource_id=resource_id, resource_revision_id=revision_id, operation="source-note",
+            model="m", prompt_version="v", input_fingerprint="owned-by-another-process",
+            request={"logical": {}, "actual": None}, backend="openai-responses",
+            summary_schema_version=1, fingerprint_version=2,
+            auth_mode="api-key", billing_mode="metered-api", backend_metadata={},
+        )
+
+        plan_source_notes(store, model="gpt-5.6-terra", backend_instance=ConcurrencyProbe())
+        ingest_source_notes(
+            store, root, VaultConfig(), model="gpt-5.6-terra", dry_run=True,
+            backend_instance=ConcurrencyProbe(),
+        )
+
+        still_running = store.connection.execute(
+            "SELECT COUNT(*) FROM llm_run WHERE status = 'running'"
+        ).fetchone()[0]
+        assert still_running == 1, "planning and a dry run must not touch it"
+    finally:
+        store.close()

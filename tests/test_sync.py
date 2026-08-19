@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -1529,5 +1530,61 @@ def test_workers_do_not_drive_the_browser_themselves(monkeypatch, tmp_path) -> N
     )
     try:
         assert seen == [False], "playwright stays on the main thread; the render is deferred"
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("workers", [1, 8])
+def test_the_body_only_pass_fetches_in_parallel_too(monkeypatch, tmp_path, workers) -> None:
+    """Review 20260819-5: fetch.workers covers the (A) loop and the (B1) pass."""
+    import threading
+
+    live = 0
+    peak = 0
+    lock = threading.Lock()
+    seen_allow_browser: list[bool] = []
+    # Every worker must arrive before any may leave, so the peak is the worker
+    # count exactly rather than however many happened to overlap under load.
+    barrier = threading.Barrier(workers, timeout=10)
+
+    def fetch(url, **kwargs):
+        nonlocal live, peak
+        with lock:
+            seen_allow_browser.append(kwargs["allow_browser"])
+            live += 1
+            peak = max(peak, live)
+        try:
+            barrier.wait()
+            return _page(url)
+        finally:
+            with lock:
+                live -= 1
+
+    items = [
+        (
+            CanonicalItem(
+                source="rss", source_id=f"rss-{n}", content_key=f"url:{n}",
+                url=f"https://example.test/{n}",
+            ),
+            b"{}",
+        )
+        for n in range(8)
+    ]
+    monkeypatch.setattr("feedian.sync._provider_items", lambda *_a, **_k: iter(items))
+    monkeypatch.setattr("feedian.sync.fetch_page_text", fetch)
+    config = VaultConfig(providers={"rss": ProviderSettings(folder="RSS")})
+    config.fetch["workers"] = workers
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        # First a full pass, so every resource is stored but left without a body.
+        sync_vault(store, config, source="rss", fetch_comments=False, fetch_pages=False)
+        peak = 0
+        seen_allow_browser.clear()
+        report = sync_vault(store, config, source="rss", quick=True, fetch_comments=False)
+
+        assert report.fetched == 8, "the backlog is drained by the body-only pass"
+        assert report.processed == 0, "no item was new"
+        assert peak == workers
+        assert seen_allow_browser and not any(seen_allow_browser), "browser stays on the main thread"
     finally:
         store.close()
