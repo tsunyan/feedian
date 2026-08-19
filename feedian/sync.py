@@ -20,7 +20,13 @@ from .hatena import (
 from .raindrop import RaindropClient
 from .rss import RssItem, fetch_rss_items, published_timestamp
 from .store import VaultStore, sha256_bytes, stable_json
-from .vault import FetchRetrySettings, VaultConfig, fetch_retry_settings, normalized_rss_feeds
+from .vault import (
+    FetchRetrySettings,
+    VaultConfig,
+    fetch_retry_settings,
+    normalized_rss_feeds,
+    positive_int_setting,
+)
 
 
 HATENA_COMMENT_LIMIT = 20
@@ -58,13 +64,9 @@ def sync_vault(
     providers = _selected_providers(config, source)
     stop_after_known_pages = 1
     if quick:
-        stop_after_known_pages = config.fetch.get("quick_stop_after_known_pages", 1)
-        # Coercing first would silently turn 1.5 into 1 and true into 1, cutting
-        # collection shorter than the value the user wrote.
-        if isinstance(stop_after_known_pages, bool) or not isinstance(stop_after_known_pages, int):
-            raise ValueError("config.fetch.quick_stop_after_known_pages must be an integer")
-        if stop_after_known_pages < 1:
-            raise ValueError("config.fetch.quick_stop_after_known_pages must be >= 1")
+        stop_after_known_pages = positive_int_setting(
+            "fetch.quick_stop_after_known_pages", config.fetch.get("quick_stop_after_known_pages", 1)
+        )
     refresh_days = int(config.fetch.get("refresh_days", 30))
     retry_settings = fetch_retry_settings(config)
     fingerprint = sha256_bytes(
@@ -226,7 +228,7 @@ def sync_vault(
             store,
             run_id,
             list(comment_targets.values()),
-            workers=int(config.fetch.get("comment_workers", 8)),
+            workers=positive_int_setting("fetch.comment_workers", config.fetch.get("comment_workers", 8)),
             force=force_comments,
             progress=comment_progress,
         )

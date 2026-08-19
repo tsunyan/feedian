@@ -44,6 +44,7 @@ class LLMFallbackSettings:
 class LLMSettings:
     backend: str = "openai-responses"
     model: str = "gpt-5.6-terra"
+    workers: int = 8
     fallback: LLMFallbackSettings = field(default_factory=LLMFallbackSettings)
 
 
@@ -65,6 +66,7 @@ class VaultConfig:
             "html_max_bytes": 10 * 1024 * 1024,
             "document_max_bytes": 100 * 1024 * 1024,
             "refresh_days": 30,
+            "workers": 8,
             "comment_workers": 8,
             "star_refresh_days": 30,
             "allow_private_hosts": [],
@@ -231,6 +233,11 @@ def load_vault_config(root: str | Path) -> VaultConfig:
     providers = _parse_providers(raw.get("providers"))
     fetch = VaultConfig().fetch
     fetch.update(dict(raw.get("fetch") or {}))
+    # Checked here so a bad value stops the command before any provider is
+    # contacted, rather than partway through a run.
+    for key in ("workers", "comment_workers", "quick_stop_after_known_pages"):
+        if key in fetch:
+            positive_int_setting(f"fetch.{key}", fetch[key])
     return VaultConfig(
         format_version=format_version,
         raw_folder=_relative_folder(raw.get("raw_folder", "raw"), "raw_folder"),
@@ -265,6 +272,7 @@ def render_vault_config(config: VaultConfig) -> str:
         "llm": {
             "backend": config.llm.backend,
             "model": config.llm.model,
+            "workers": config.llm.workers,
             "fallback": {
                 "enabled": config.llm.fallback.enabled,
                 "backend": config.llm.fallback.backend,
@@ -323,9 +331,12 @@ def _parse_llm(raw: object) -> LLMSettings:
         return LLMSettings()
     if not isinstance(raw, dict):
         raise ValueError("llm must be a JSON object.")
-    unknown = sorted(set(raw) - {"backend", "model", "fallback"})
+    unknown = sorted(set(raw) - {"backend", "model", "workers", "fallback"})
     if unknown:
         raise ValueError(f"Unknown llm field(s): {', '.join(unknown)}")
+    # Added inside format version 2. A config written before this key existed
+    # takes the default, so no migration is required to open it.
+    workers = positive_int_setting("llm.workers", raw.get("workers", LLMSettings.workers))
     backend_value = raw.get("backend", "openai-responses")
     model_value = raw.get("model", "gpt-5.6-terra")
     if not isinstance(backend_value, str) or not isinstance(model_value, str):
@@ -359,7 +370,7 @@ def _parse_llm(raw: object) -> LLMSettings:
         raise ValueError("Enabled llm.fallback requires both backend and model.")
     if fallback.backend and fallback.backend not in allowed_backends:
         raise ValueError(f"Unknown llm.fallback.backend: {fallback.backend}")
-    return LLMSettings(backend=backend, model=model, fallback=fallback)
+    return LLMSettings(backend=backend, model=model, workers=workers, fallback=fallback)
 
 
 def _parse_providers(raw: object) -> dict[str, ProviderSettings]:
@@ -408,6 +419,21 @@ def _parse_providers(raw: object) -> dict[str, ProviderSettings]:
             },
         )
     return providers
+
+
+def positive_int_setting(name: str, value: object) -> int:
+    """One definition of the rule for every worker and page-count setting.
+
+    Coercing first would silently turn 1.5 into 1 and true into 1, giving the
+    run a concurrency the user never wrote. load_vault_config applies this to a
+    user's file; the read sites apply it again because a VaultConfig can also be
+    built in code, where nothing has been through the parser.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"config.{name} must be an integer")
+    if value < 1:
+        raise ValueError(f"config.{name} must be >= 1")
+    return value
 
 
 def _relative_folder(value: object, field_name: str) -> str:
