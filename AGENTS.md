@@ -57,7 +57,7 @@ For substantial changes, write a specification and reach agreement on it before 
   **A human writes this section. Agents must not write it until instructed to do so.**
 - **Draft (`草案`)** — The initial specification proposal. Either a human or an agent may write it.
 - **Review (`レビュー`)** — Zero or more rounds. Give each round a `### レビュー<N> — <名前> (YYYY-MM-DD)` heading.
-  The name must be `Claude Code`, `Codex`, or a person's name.
+  The name must be `Claude Code`, `Codex`, `ChatGPT`, other agent's name or a person's name.
   More importantly than the feedback itself, always record **whether it was accepted or rejected and why**. The reasons for rejecting proposals become valuable later.
 - Do not include the word “specification” in the document title; its location under `docs/specs/` already makes that clear.
 - If no review is needed, omit the `レビュー` and `最終案` sections and finalize the draft as-is.
