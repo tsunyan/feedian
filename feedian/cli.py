@@ -154,7 +154,14 @@ def build_parser() -> argparse.ArgumentParser:
         action_parser = schedule_subparsers.add_parser(action, help=f"{action.title()} the Feedian scheduled jobs.")
         action_parser.add_argument("--vault", help="Vault root. Defaults to the current or configured Vault.")
 
-    ingest = subparsers.add_parser("ingest", help="Use the LLM to create source notes from stored resources.")
+    ingest = subparsers.add_parser(
+        "ingest",
+        help=(
+            "Use the LLM to create source notes from stored resources. Runs llm.workers "
+            "requests at once. Stopping with Ctrl-C may still be billed for requests "
+            "already started; the count never exceeds the configured concurrency."
+        ),
+    )
     ingest.add_argument("--vault", help="Vault root. Defaults to the current or configured Vault.")
     ingest.add_argument("--model", help="Model/profile for this run. Uses the backend setting when omitted.")
     backend_group = ingest.add_mutually_exclusive_group()

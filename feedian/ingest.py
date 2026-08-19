@@ -4,6 +4,8 @@ import hashlib
 import json
 import re
 import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor
+from concurrent.futures import wait as futures_wait
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
@@ -107,6 +109,9 @@ def plan_source_notes(
     provider: str | None = None,
     backend_instance: LLMBackend | None = None,
 ) -> IngestPlan:
+    # Runs a killed process left open are not pending work. The vault write
+    # lock is held by the caller, so this cannot touch another process's run.
+    store.fail_interrupted_llm_runs()
     backend_id = canonical_backend_id(provider or backend)
     selected_backend = backend_instance or get_backend(backend_id)
     rows = _source_rows(store)
@@ -202,16 +207,91 @@ def ingest_source_notes(
         resolve_fallback(config, backend_id, backend_instance=fallback_instance)
         if plan.new_requests else None
     )
-    start_interval = selected_backend.capabilities.min_start_interval_seconds
-    last_start = 0.0
+    workers = max(1, int(config.llm.workers))
+    gates: dict[str, _BackendGate] = {}
     processed = created = reused = failed = input_tokens = output_tokens = 0
     unpriced = unmetered = 0
     cost_usd = 0.0
+    queue: list[_Job] = []
+    pending: dict[Any, _Job] = {}
+    open_runs: dict[str, _Job] = {}
+    interrupted = False
+
+    def gate_for(backend: LLMBackend) -> _BackendGate:
+        return gates.setdefault(backend.capabilities.backend, _BackendGate(backend.capabilities))
+
+    def report(candidate: IngestCandidate, status: str, run_id: str | None, error: str | None) -> None:
+        if progress is None:
+            return
+        progress(
+            processed, len(plan.candidates), candidate,
+            IngestReport(
+                processed, created, reused, failed, input_tokens, output_tokens, cost_usd,
+                unpriced, unmetered, last_status=status, last_run_id=run_id, last_error=error,
+            ),
+        )
+
+    def account(job: _Job, attempt: _Attempt) -> None:
+        nonlocal created, reused, failed, input_tokens, output_tokens, cost_usd, unpriced, unmetered
+        if attempt.reused:
+            reused += 1
+            report(job.candidate, "reused", attempt.run_id, attempt.error_text)
+            return
+        if attempt.audit is not None:
+            created += 1
+            audit = attempt.audit
+            input_tokens += _usage_count(audit.usage.get("input_tokens"))
+            output_tokens += _usage_count(audit.usage.get("output_tokens"))
+            if not audit.usage or not attempt.usage_available:
+                unmetered += 1
+            if isinstance(attempt.estimated_cost, (int, float)):
+                cost_usd += float(attempt.estimated_cost)
+            else:
+                unpriced += 1
+            report(job.candidate, "created", attempt.run_id, attempt.error_text)
+            return
+        failed += 1
+        report(job.candidate, "failed", attempt.run_id, attempt.error_text)
+
+    def settle(job: _Job) -> None:
+        """Close one finished job, taking the fallback if the plan named one."""
+        attempt = _close_run(store, vault_root, job)
+        open_runs.pop(job.run_id, None)
+        if (
+            attempt.error is not None
+            and fallback is not None
+            and not job.is_fallback
+            and getattr(attempt.error, "fallback_eligible", False)
+        ):
+            # Named in the plan before the run started; Feedian never picks a
+            # destination on its own. Replanning reads the database, so it stays
+            # here rather than moving into a worker.
+            fallback_candidate = _candidate(
+                store, job.row, model=fallback.model, language=language, force=force,
+                backend=fallback.backend_id, backend_instance=fallback.backend,
+            )
+            if fallback_candidate.cached_result is not None:
+                store.put_source_note(
+                    resource_id=job.candidate.resource_id, llm_run_id=None,
+                    markdown=render_source_note(
+                        job.row, job.metadata, fallback_candidate.cached_result, model=fallback.model,
+                    ),
+                )
+                account(job, _Attempt(run_id=attempt.run_id, reused=True))
+                return
+            queue.insert(0, _Job(
+                candidate=fallback_candidate, row=job.row, metadata=job.metadata,
+                backend_id=fallback.backend_id, backend=fallback.backend, model=fallback.model,
+                temporary_parent=_temporary_parent_for(fallback.backend, vault_root),
+                preflight_metadata=fallback.preflight(), is_fallback=True,
+            ))
+            return
+        account(job, attempt)
+
     for candidate in plan.candidates:
         row = candidate.row
-        metadata = candidate.metadata
-        processed += 1
         if candidate.cached_result is not None:
+            processed += 1
             # Planning only reads, so a result found under the version-one key is
             # rewritten here, where the vault write lock is held.
             store.promote_legacy_fingerprint(
@@ -223,89 +303,69 @@ def ingest_source_notes(
             )
             store.put_source_note(
                 resource_id=candidate.resource_id, llm_run_id=None,
-                markdown=render_source_note(row, metadata, candidate.cached_result, model=model),
+                markdown=render_source_note(row, candidate.metadata, candidate.cached_result, model=model),
             )
             reused += 1
-            if progress is not None:
-                progress(
-                    processed, len(plan.candidates), candidate,
-                    IngestReport(
-                        processed, created, reused, failed, input_tokens, output_tokens, cost_usd,
-                        unpriced, unmetered, last_status="reused",
-                    ),
-                )
+            report(candidate, "reused", None, None)
             continue
-        if start_interval > 0:
-            delay = start_interval - (time.monotonic() - last_start)
-            if delay > 0:
-                time.sleep(delay)
-        last_start = time.monotonic()
-        attempt = _attempt_candidate(
-            store, vault_root, row=row, metadata=metadata, candidate=candidate,
-            backend_id=backend_id, backend=selected_backend, model=model, language=language,
+        queue.append(_Job(
+            candidate=candidate, row=row, metadata=candidate.metadata,
+            backend_id=backend_id, backend=selected_backend, model=model,
             temporary_parent=temporary_parent, preflight_metadata=preflight_metadata,
-        )
-        if (
-            attempt.error is not None
-            and fallback is not None
-            and getattr(attempt.error, "fallback_eligible", False)
-        ):
-            # Named in the plan before the run started; Feedian never picks a
-            # destination on its own.
-            fallback_candidate = _candidate(
-                store, row, model=fallback.model, language=language, force=force,
-                backend=fallback.backend_id, backend_instance=fallback.backend,
-            )
-            if fallback_candidate.cached_result is not None:
-                store.put_source_note(
-                    resource_id=candidate.resource_id, llm_run_id=None,
-                    markdown=render_source_note(
-                        row, metadata, fallback_candidate.cached_result, model=fallback.model,
-                    ),
-                )
-                attempt = _Attempt(run_id=attempt.run_id, audit=None, error=None, reused=True)
-            else:
-                attempt = _attempt_candidate(
-                    store, vault_root, row=row, metadata=metadata, candidate=fallback_candidate,
-                    backend_id=fallback.backend_id, backend=fallback.backend,
-                    model=fallback.model, language=language,
-                    # An HTTP primary leaves temporary_parent inside the Vault; a
-                    # local fallback must not run there.
-                    temporary_parent=_temporary_parent_for(fallback.backend, vault_root),
-                    preflight_metadata=fallback.preflight(),
-                )
-        run_id = attempt.run_id
-        item_error = attempt.error_text
-        if attempt.reused:
-            item_status = "reused"
-            reused += 1
-        elif attempt.audit is not None:
-            item_status = "created"
-            created += 1
-            audit = attempt.audit
-            input_tokens += _usage_count(audit.usage.get("input_tokens"))
-            output_tokens += _usage_count(audit.usage.get("output_tokens"))
-            if not audit.usage or not attempt.usage_available:
-                unmetered += 1
-            if isinstance(attempt.estimated_cost, (int, float)):
-                cost_usd += float(attempt.estimated_cost)
-            else:
-                unpriced += 1
-        else:
-            item_status = "failed"
-            failed += 1
-        if progress is not None:
-            progress(
-                processed, len(plan.candidates), candidate,
-                IngestReport(
-                    processed, created, reused, failed, input_tokens, output_tokens, cost_usd,
-                    unpriced, unmetered,
-                    last_status=item_status, last_run_id=run_id, last_error=item_error,
-                ),
-            )
+        ))
+
+    if queue:
+        executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="feedian-ingest")
+        try:
+            while queue or pending:
+                submitted = False
+                while queue and len(pending) < workers:
+                    now = time.monotonic()
+                    index = next(
+                        (i for i, job in enumerate(queue) if gate_for(job.backend).due_at() <= now), None
+                    )
+                    if index is None:
+                        break
+                    job = queue.pop(index)
+                    gate_for(job.backend).take()
+                    processed += 1
+                    _open_run(store, job)
+                    open_runs[job.run_id] = job
+                    pending[executor.submit(_execute_job, job, language=language)] = job
+                    submitted = True
+                if submitted and queue:
+                    continue
+                if not pending and queue:
+                    # Nothing may start yet and nothing is running. Waiting on an
+                    # empty set returns at once, so sleep to the earliest opening
+                    # instead of spinning. No run and no Future exist yet, so a
+                    # KeyboardInterrupt here costs nothing.
+                    delay = min(gate_for(job.backend).due_at() for job in queue) - time.monotonic()
+                    if delay > 0:
+                        time.sleep(delay)
+                    continue
+                timeout = None
+                if queue:
+                    due = min(gate_for(job.backend).due_at() for job in queue)
+                    timeout = max(0.0, due - time.monotonic()) if due != float("inf") else None
+                done, _ = futures_wait(pending, timeout=timeout, return_when=FIRST_COMPLETED)
+                for future in done:
+                    job = pending.pop(future)
+                    gate_for(job.backend).release()
+                    settle(future.result())
+        except BaseException:
+            interrupted = True
+            raise
+        finally:
+            if interrupted:
+                _abandon_open_runs(store, vault_root, pending, open_runs)
+            executor.shutdown(wait=True)
+
     return IngestReport(
         processed, created, reused, failed, input_tokens, output_tokens, cost_usd, unpriced, unmetered,
     )
+
+
 
 
 @dataclass(frozen=True)
@@ -345,71 +405,161 @@ def _temporary_parent_for(backend: LLMBackend, vault_root: str | Path) -> Path:
         raise BackendPolicyError(str(exc)) from exc
 
 
-def _attempt_candidate(
+def _abandon_open_runs(
     store: VaultStore,
     vault_root: str | Path,
-    *,
-    row: Any,
-    metadata: dict[str, Any],
-    candidate: IngestCandidate,
-    backend_id: str,
-    backend: LLMBackend,
-    model: str,
-    language: str,
-    temporary_parent: Path,
-    preflight_metadata: dict[str, Any],
-) -> _Attempt:
-    """Open one llm_run, execute it, and close it either way."""
-    run_id = store.start_llm_run(
-        resource_id=candidate.resource_id, resource_revision_id=str(row["resource_revision_id"]),
-        operation="source-note", model=model, prompt_version=PROMPT_VERSION,
-        input_fingerprint=candidate.fingerprint,
-        request={"logical": candidate.request, "actual": None},
-        backend=backend_id,
+    pending: dict[Any, _Job],
+    open_runs: dict[str, _Job],
+) -> None:
+    """Close every run that will not produce a saved result, after an interrupt.
+
+    A Future that cancels cleanly never reached the backend, so its run is a
+    failure and nothing was billed. One that refuses to cancel is already
+    RUNNING: it may still put its request on the wire, so it is drained and its
+    real outcome recorded. The number that can still go out is bounded by the
+    Futures running at that moment, which is the concurrency the user chose.
+
+    Cancelling is done here rather than through shutdown(cancel_futures=True),
+    which does not say which Futures it cancelled - leaving no way to know which
+    runs to close.
+    """
+    cancelled = [future for future in list(pending) if future.cancel()]
+    for future in cancelled:
+        job = pending.pop(future, None)
+        if job is None:
+            continue
+        job.error = RuntimeError("interrupted before the backend was called")
+        _close_run(store, vault_root, job)
+        open_runs.pop(job.run_id, None)
+    for future in list(pending):
+        job = pending.pop(future)
+        try:
+            future.result()
+        except BaseException as exc:  # noqa: BLE001 - recorded, not handled
+            job.error = job.error or exc
+        _close_run(store, vault_root, job)
+        open_runs.pop(job.run_id, None)
+    # Anything still open was started but never handed to a Future, or its
+    # submit raised. The main thread owns it either way.
+    for job in list(open_runs.values()):
+        job.error = job.error or RuntimeError("interrupted before the backend was called")
+        _close_run(store, vault_root, job)
+        open_runs.pop(job.run_id, None)
+
+
+class _BackendGate:
+    """Admission for one backend: how many may run, and how often one may start.
+
+    Both live here rather than inside the worker. A worker that sleeps on a start
+    interval is RUNNING while it has sent nothing, and Future.cancel() cannot
+    reach it - so an interrupt during that sleep still lets the request go out.
+    Deciding before submit keeps the wait where a KeyboardInterrupt can end it.
+    """
+
+    def __init__(self, capabilities: Any) -> None:
+        self.limit = max(1, int(getattr(capabilities, "max_parallelism", 1) or 1))
+        self.interval = max(0.0, float(getattr(capabilities, "min_start_interval_seconds", 0.0) or 0.0))
+        self.running = 0
+        self.next_start_at = 0.0
+
+    def due_at(self) -> float:
+        return self.next_start_at if self.running < self.limit else float("inf")
+
+    def take(self) -> None:
+        self.running += 1
+        self.next_start_at = max(time.monotonic(), self.next_start_at) + self.interval
+
+    def release(self) -> None:
+        self.running = max(0, self.running - 1)
+
+
+@dataclass
+class _Job:
+    """One summary from the moment its run is opened to the moment it is closed."""
+
+    candidate: IngestCandidate
+    row: Any
+    metadata: dict[str, Any]
+    backend_id: str
+    backend: LLMBackend
+    model: str
+    temporary_parent: Path
+    preflight_metadata: dict[str, Any]
+    is_fallback: bool = False
+    run_id: str = ""
+    started_at: float = 0.0
+    audit: Any = None
+    error: Exception | None = None
+
+
+def _open_run(store: VaultStore, job: _Job) -> None:
+    """Start the audit row. Called immediately before the job is submitted."""
+    job.run_id = store.start_llm_run(
+        resource_id=job.candidate.resource_id,
+        resource_revision_id=str(job.row["resource_revision_id"]),
+        operation="source-note", model=job.model, prompt_version=PROMPT_VERSION,
+        input_fingerprint=job.candidate.fingerprint,
+        request={"logical": job.candidate.request, "actual": None},
+        backend=job.backend_id,
         summary_schema_version=CANONICAL_SUMMARY_SCHEMA_VERSION,
         fingerprint_version=2,
-        auth_mode=backend.capabilities.auth_mode,
-        billing_mode=backend.capabilities.billing_mode,
-        backend_metadata=preflight_metadata,
+        auth_mode=job.backend.capabilities.auth_mode,
+        billing_mode=job.backend.capabilities.billing_mode,
+        backend_metadata=job.preflight_metadata,
     )
-    started_at = time.monotonic()
+    job.started_at = time.monotonic()
+
+
+def _execute_job(job: _Job, *, language: str) -> _Job:
+    """The only part that runs off the main thread: the provider call itself."""
     try:
-        audit = backend.summarize(
-            model=model, item=metadata, page=_page(row, metadata), language=language,
-            timeout_seconds=60, max_output_tokens=800, reasoning_effort="low",
-            max_retries=3, retry_base_seconds=1.0, temporary_parent=temporary_parent,
+        job.audit = job.backend.summarize(
+            model=job.model, item=job.metadata, page=_page(job.row, job.metadata),
+            language=language, timeout_seconds=60, max_output_tokens=800,
+            reasoning_effort="low", max_retries=3, retry_base_seconds=1.0,
+            temporary_parent=job.temporary_parent,
         )
     except Exception as exc:
-        prompt = str(candidate.request["input"][0]["content"][0]["text"])
+        job.error = exc
+    return job
+
+
+def _close_run(store: VaultStore, vault_root: str | Path, job: _Job) -> _Attempt:
+    """Write the outcome of one job. Main thread only."""
+    duration_ms = round((time.monotonic() - job.started_at) * 1000)
+    if job.error is not None:
+        prompt = str(job.candidate.request["input"][0]["content"][0]["text"])
         error_text = sanitize_error(
-            str(exc), Path(vault_root).resolve(),
-            private_values=(prompt, str(row["content_markdown"] or "")),
+            str(job.error), Path(vault_root).resolve(),
+            private_values=(prompt, str(job.row["content_markdown"] or "")),
         )
         store.finish_llm_run(
-            run_id,
-            request={"logical": candidate.request, "actual": getattr(exc, "request", None)},
+            job.run_id,
+            request={"logical": job.candidate.request, "actual": getattr(job.error, "request", None)},
             error=error_text,
-            duration_ms=round((time.monotonic() - started_at) * 1000),
+            duration_ms=duration_ms,
         )
-        return _Attempt(run_id=run_id, error=exc, error_text=error_text)
-    price = _price_record(audit.usage, model, billing_mode=audit.billing_mode)
+        return _Attempt(run_id=job.run_id, error=job.error, error_text=error_text)
+    audit = job.audit
+    price = _price_record(audit.usage, job.model, billing_mode=audit.billing_mode)
     store.finish_llm_run(
-        run_id,
-        request={"logical": candidate.request, "actual": audit.request},
+        job.run_id,
+        request={"logical": job.candidate.request, "actual": audit.request},
         response=audit.response, result=audit.result, usage=audit.usage or None, price=price,
         auth_mode=audit.auth_mode, billing_mode=audit.billing_mode,
         backend_metadata=audit.metadata,
-        duration_ms=round((time.monotonic() - started_at) * 1000),
+        duration_ms=duration_ms,
     )
     store.put_source_note(
-        resource_id=candidate.resource_id, llm_run_id=run_id,
-        markdown=render_source_note(row, metadata, audit.result, model=model),
+        resource_id=job.candidate.resource_id, llm_run_id=job.run_id,
+        markdown=render_source_note(job.row, job.metadata, audit.result, model=job.model),
     )
     return _Attempt(
-        run_id=run_id, audit=audit,
+        run_id=job.run_id, audit=audit,
         estimated_cost=price.get("estimated_cost_usd"),
-        usage_available=backend.capabilities.usage_available,
+        usage_available=job.backend.capabilities.usage_available,
     )
+
 
 
 def fallback_maximum_cost(plan: IngestPlan, fallback: "_Fallback | None") -> float | None:
