@@ -13,6 +13,7 @@ from feedian.vault import (
     initialize_vault,
     load_vault_config,
     migrate_vault_config,
+    render_vault_config,
     save_default_vault,
     user_settings_path,
 )
@@ -289,3 +290,69 @@ class FetchRetrySettingsTests(unittest.TestCase):
 
                 with self.assertRaisesRegex(ValueError, "browser_timeout_seconds"):
                     fetch_retry_settings(config)
+
+
+def _write_config(root, payload: dict) -> None:
+    (root / ".feedian").mkdir(parents=True, exist_ok=True)
+    (root / ".feedian" / "config.json").write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+
+
+def _base_config(**overrides) -> dict:
+    payload = {
+        "format_version": 2,
+        "raw_folder": "raw",
+        "source_folder": "source",
+        "review_folder": "review",
+        "providers": {"raindrop": {"folder": "Raindrop", "enabled": True}},
+        "fetch": {},
+        "llm": {"backend": "openai-responses", "model": "gpt-5.6-terra"},
+    }
+    payload.update(overrides)
+    return payload
+
+
+@pytest.mark.parametrize("key", ["workers", "comment_workers", "quick_stop_after_known_pages"])
+@pytest.mark.parametrize("value", [0, -1, True, 1.5, "8"])
+def test_worker_settings_are_rejected_at_config_load(tmp_path, key, value) -> None:
+    """Spec 20260819-sync-ingest-throughput: one rule, applied when the file is read."""
+    _write_config(tmp_path, _base_config(fetch={key: value}))
+
+    with pytest.raises(ValueError):
+        load_vault_config(tmp_path)
+
+
+@pytest.mark.parametrize("value", [0, -1, True, 1.5, "8"])
+def test_llm_workers_is_rejected_at_config_load(tmp_path, value) -> None:
+    _write_config(tmp_path, _base_config(llm={"backend": "openai-responses", "model": "m", "workers": value}))
+
+    with pytest.raises(ValueError):
+        load_vault_config(tmp_path)
+
+
+def test_llm_workers_round_trips_without_a_format_version_bump(tmp_path) -> None:
+    _write_config(tmp_path, _base_config(llm={"backend": "openai-responses", "model": "m", "workers": 3}))
+
+    config = load_vault_config(tmp_path)
+    rendered = json.loads(render_vault_config(config))
+
+    assert config.llm.workers == 3
+    assert rendered["llm"]["workers"] == 3, "always emitted, so the setting is visible in the file"
+    assert rendered["format_version"] == 2, "an optional key with a default needs no migration"
+
+
+def test_a_config_written_before_llm_workers_existed_takes_the_default(tmp_path) -> None:
+    _write_config(tmp_path, _base_config())
+
+    config = load_vault_config(tmp_path)
+
+    assert config.llm.workers == 8
+    assert config.fetch["workers"] == 8
+
+
+def test_unknown_llm_field_is_still_rejected(tmp_path) -> None:
+    _write_config(tmp_path, _base_config(llm={"backend": "openai-responses", "model": "m", "threads": 4}))
+
+    with pytest.raises(ValueError, match="Unknown llm field"):
+        load_vault_config(tmp_path)

@@ -282,6 +282,7 @@ def summarize_bookmark_with_audit(
     retry_base_seconds: float,
     max_article_chars: int = 10000,
     provider: str = "openai",
+    pace_starts: bool = True,
 ) -> SummaryAudit:
     payload = build_summary_request(
         model=model,
@@ -294,7 +295,8 @@ def summarize_bookmark_with_audit(
     )
     if provider == "manus":
         return _summarize_with_manus(
-            api_key, payload, timeout_seconds, max_retries, retry_base_seconds
+            api_key, payload, timeout_seconds, max_retries, retry_base_seconds,
+            pace_starts=pace_starts,
         )
     if provider != "openai":
         raise ValueError(f"Unsupported LLM provider: {provider}")
@@ -340,8 +342,15 @@ def _summarize_with_manus(
     timeout_seconds: int,
     max_retries: int,
     retry_base_seconds: float,
+    *,
+    pace_starts: bool = True,
 ) -> SummaryAudit:
-    _wait_for_manus_create_slot()
+    if pace_starts:
+        # ingest paces starts in its scheduler instead, before it hands the work
+        # to a thread. Waiting here as well would space creates twice, and would
+        # put the wait inside a running Future - where an interrupt can no longer
+        # stop the request from being sent.
+        _wait_for_manus_create_slot()
     manus_payload = {
         "message": {"content": build_manus_message(payload["input"][0]["content"][0]["text"])},
         "agent_profile": payload["model"] if payload["model"].startswith("manus-") else "manus-1.6",

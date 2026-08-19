@@ -40,6 +40,8 @@ For substantial changes, write a specification and reach agreement on it before 
 
 ## 最終案
 
+## 改訂
+
 ## 草案
 
 ## レビュー
@@ -67,11 +69,15 @@ Keep the roles separate to avoid maintaining the same information in two places.
 
 | | Role | Updates |
 |---|---|---|
-| `docs/specs/` | Details and ADRs for individual specifications: why decisions were made and which alternatives were rejected | Do not edit after finalization |
+| `docs/specs/` | Details and ADRs for individual specifications: why decisions were made and which alternatives were rejected | Revise the final proposal when a later decision supersedes it, and record the change |
 | `DESIGN.md` | Summaries of finalized specifications and the overall design | Update during implementation and link to the relevant specification |
 
 When in doubt, use `DESIGN.md` for “how things work now” and the specification for “why this decision was made.”
 If `DESIGN.md` contains only a summary without a link to the specification, readers lose the path to the details.
+
+**`DESIGN.md` remains the only place that describes current behaviour.** Revising a specification does not
+make it a second copy of that: a superseded decision is corrected once, at the moment it is superseded, and
+the document is static again afterwards. Only `DESIGN.md` carries an ongoing obligation to stay current.
 
 ### Lifecycle and commits
 
@@ -93,6 +99,29 @@ Before finalization, **append rather than rewrite**. Only the status line may be
 - **Do not correct the draft even when errors are found.** Record feedback in the review section and the conclusion in the final proposal.
   Editing the draft makes feedback that refers to it impossible to understand. Its value as an ADR comes precisely from preserving rejected proposals.
 - Typographical, formatting, and other corrections that do not change meaning may be made at any time.
+
+### Revising a final proposal
+
+**A finalized specification never leaves a decision standing that is known to be wrong.** When a later
+specification supersedes one of its decisions, correct the passage in `最終案` and append the change to
+`## 改訂`. The reasoning is in [syncとingestのスループット](docs/specs/20260819-sync-ingest-throughput.ja.md).
+
+- **A specification has exactly one current form.** The current decision and an old one must not stand
+  side by side in the same document.
+- **Record every change as an appended entry**, under a `### 改訂<N> — <名前> (YYYY-MM-DD)` heading,
+  stating the passage, `(前)`, `(後)`, the reason, and the evidence. Quote both sides: the document alone
+  should explain the change without anyone reaching for `git log`.
+- **The same procedure applies before and after the commit.** Before it there is no old version in git at
+  all, which makes writing `(前)` matter more, not less.
+- **Section order is fixed — `最終案` → `改訂` → `草案` → `レビュー`.** `## 改訂` goes directly after
+  `最終案`, never at the end of the file: `## レビュー` has to stay last so a further review round always
+  has somewhere to go.
+- **The status stays `確定`.** No `改訂` status exists; another state would only add another judgement.
+- **`草案` and `レビュー` remain append-only.** Preserving rejected proposals is what makes them worth
+  keeping. Only `最終案` is revised.
+- **A wrong finalized specification is not a reason to defer the fix.** Revise it and implement the
+  correction in the same stretch of work.
+- The file name is never changed, as above.
 
 Specifications are outside git before finalization, which creates two concerns.
 

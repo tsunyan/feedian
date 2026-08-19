@@ -743,6 +743,25 @@ class VaultStore:
             )
         return int(cursor.rowcount)
 
+    def fail_interrupted_llm_runs(self) -> int:
+        """Close runs a killed process left open, so they are not read as pending.
+
+        Call this holding the vault write lock. Without it a run another process
+        is still executing would be marked failed here.
+        """
+        now = utc_now()
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE llm_run
+                SET status = 'failed', error = coalesce(error, 'interrupted before the next ingest'),
+                    finished_at = ?
+                WHERE status = 'running'
+                """,
+                (now,),
+            )
+        return int(cursor.rowcount)
+
     def finish_sync_run(self, run_id: str, *, status: str, error: str | None = None) -> None:
         if status not in {"completed", "failed", "partial"}:
             raise ValueError(f"Unsupported sync run status: {status}")

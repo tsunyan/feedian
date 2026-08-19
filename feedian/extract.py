@@ -47,6 +47,40 @@ class PageFetchResult:
     payload_too_large: bool = False
     not_modified: bool = False
     failure_kind: str | None = None
+    browser_pending: "BrowserCandidate | None" = None
+
+
+@dataclass(frozen=True)
+class _HtmlFetch:
+    """The HTTP side of one HTML fetch, kept whole so the merge can be redone.
+
+    A deferred browser render has to be compared against exactly what the HTTP
+    response produced, including the payload, status and headers that
+    should_fetch_resource later reads.
+    """
+
+    url: str
+    decoded: str
+    final_url: str
+    encoding: str
+    truncated: bool
+    content_type: str
+    response_headers: dict[str, str] | None
+    status: int | None
+    raw: bytes | None
+    parts: "ExtractedPageParts"
+
+
+@dataclass(frozen=True)
+class BrowserCandidate:
+    """A browser render a worker thread could not run itself."""
+
+    kind: str
+    fetch_url: str
+    allow_private_urls: bool
+    timeout_seconds: int
+    initial_error: str = ""
+    fetch: _HtmlFetch | None = None
 
 
 @dataclass
@@ -218,6 +252,7 @@ def fetch_page_text(
     etag: str = "",
     last_modified: str = "",
     browser_timeout_seconds: int = 30,
+    allow_browser: bool = True,
 ) -> PageFetchResult:
     # max_chars remains in the public call signature for compatibility. Extracted
     # text is stored in full; the limit is applied only when building an LLM prompt.
@@ -271,21 +306,22 @@ def fetch_page_text(
                 not_modified=True,
             )
         if exc.code in {401, 403, 406}:
-            try:
-                return fetch_page_text_with_browser(
-                    original_url=url,
-                    fetch_url=fetch_url,
-                    timeout_seconds=browser_timeout_seconds,
-                    allow_private_urls=allow_private_urls,
-                    initial_error=f"HTTP {exc.code}",
-                )
-            except Exception as browser_exc:
+            # No HTTP body exists to compare against here, so the browser result
+            # stands alone. Deferring it keeps playwright on one thread.
+            pending = BrowserCandidate(
+                kind="http-error",
+                fetch_url=fetch_url,
+                allow_private_urls=allow_private_urls,
+                timeout_seconds=browser_timeout_seconds,
+                initial_error=f"HTTP {exc.code}",
+            )
+            if not allow_browser:
                 return PageFetchResult(
-                    url=url,
-                    text="",
-                    error=f"HTTP {exc.code}; browser fallback failed: {browser_exc}",
-                    http_status=exc.code,
+                    url=url, text="", http_status=exc.code, browser_pending=pending
                 )
+            return complete_browser_fallback(
+                PageFetchResult(url=url, text="", http_status=exc.code, browser_pending=pending)
+            )
         return PageFetchResult(url=url, text="", error=f"HTTP {exc.code}", http_status=exc.code)
     except URLError as exc:
         failure_kind = "timeout" if isinstance(exc.reason, TimeoutError) else None
@@ -348,30 +384,91 @@ def fetch_page_text(
         )
 
     http_parts = extract_page_parts(decoded, final_url)
-    best_text = http_parts.text
-    best_title = http_parts.title
-    best_method = http_parts.method
-    best_discussion = http_parts.discussion_text
-    best_html = decoded
-    fetch_method = "http"
-    browser_error: str | None = None
-    if should_render_with_browser(http_parts.text, decoded, http_parts.title):
-        try:
-            rendered_html, rendered_url, rendered_title = render_html_with_browser(
-                fetch_url,
-                timeout_seconds=browser_timeout_seconds,
+    fetch = _HtmlFetch(
+        url=url,
+        decoded=decoded,
+        final_url=final_url,
+        encoding=encoding,
+        truncated=truncated,
+        content_type=content_type,
+        response_headers=response_headers,
+        status=status if isinstance(status, int) else None,
+        raw=raw,
+        parts=http_parts,
+    )
+    if not should_render_with_browser(http_parts.text, decoded, http_parts.title):
+        return _merge_html_result(fetch)
+    if not allow_browser:
+        # playwright's sync API is bound to the thread that started it, so a
+        # worker hands the render back rather than running it. The tail is left
+        # unfinished on purpose: running the html2txt fallback now would change
+        # what the browser text is later compared against.
+        return _merge_html_result(
+            fetch,
+            pending=BrowserCandidate(
+                kind="low-quality",
+                fetch_url=fetch_url,
                 allow_private_urls=allow_private_urls,
-            )
-            browser_parts = extract_page_parts(rendered_html, rendered_url)
-            if text_quality_score(browser_parts.text) > text_quality_score(best_text):
-                best_text = browser_parts.text
-                best_title = browser_parts.title or rendered_title
-                best_method = browser_parts.method
-                best_discussion = browser_parts.discussion_text
-                best_html = rendered_html
-                fetch_method = "browser"
-        except Exception as exc:
-            browser_error = str(exc)
+                timeout_seconds=browser_timeout_seconds,
+                fetch=fetch,
+            ),
+        )
+    rendered, browser_error = _render_for_merge(
+        fetch_url, timeout_seconds=browser_timeout_seconds, allow_private_urls=allow_private_urls
+    )
+    return _merge_html_result(fetch, rendered=rendered, browser_error=browser_error)
+
+
+def _render_for_merge(
+    fetch_url: str, *, timeout_seconds: int, allow_private_urls: bool
+) -> tuple[tuple[str, str, str] | None, str | None]:
+    """Render one page, reporting failure instead of raising.
+
+    A browser that fails must not cost us the HTTP body we already hold; the
+    caller keeps that body and only appends the reason to the warning.
+    """
+    try:
+        return (
+            render_html_with_browser(
+                fetch_url, timeout_seconds=timeout_seconds, allow_private_urls=allow_private_urls
+            ),
+            None,
+        )
+    except Exception as exc:
+        return None, str(exc)
+
+
+def _merge_html_result(
+    fetch: _HtmlFetch,
+    *,
+    rendered: tuple[str, str, str] | None = None,
+    browser_error: str | None = None,
+    pending: BrowserCandidate | None = None,
+) -> PageFetchResult:
+    """Choose between the HTTP and browser extractions and build the result.
+
+    The single definition of best-of-two. fetch_page_text calls it directly when
+    it may drive the browser itself, and the main thread calls it through
+    complete_browser_fallback when a worker deferred the render. Two copies of
+    this rule would drift, and the HTTP payload, status and headers it carries
+    forward are what the retry-suppression rules read.
+    """
+    best_text = fetch.parts.text
+    best_title = fetch.parts.title
+    best_method = fetch.parts.method
+    best_discussion = fetch.parts.discussion_text
+    best_html = fetch.decoded
+    fetch_method = "http"
+    if rendered is not None:
+        rendered_html, rendered_url, rendered_title = rendered
+        browser_parts = extract_page_parts(rendered_html, rendered_url)
+        if text_quality_score(browser_parts.text) > text_quality_score(best_text):
+            best_text = browser_parts.text
+            best_title = browser_parts.title or rendered_title
+            best_method = browser_parts.method
+            best_discussion = browser_parts.discussion_text
+            best_html = rendered_html
+            fetch_method = "browser"
 
     if not best_text:
         all_text = normalize_plain_text(html2txt(best_html) or "")
@@ -380,7 +477,7 @@ def fetch_page_text(
             best_method = "trafilatura-html2txt"
 
     warning: str | None = None
-    if truncated:
+    if fetch.truncated:
         warning = "HTML download truncated at 10 MiB"
     if not best_text:
         warning = "no extractable text found"
@@ -392,22 +489,60 @@ def fetch_page_text(
             warning += f"; browser fallback failed: {browser_error}"
 
     return PageFetchResult(
-        url=url,
+        url=fetch.url,
         text=best_text,
         title=best_title,
         error=warning,
         fetch_method=fetch_method,
         extraction_method=best_method,
-        content_encoding=encoding,
-        content_truncated=truncated,
+        content_encoding=fetch.encoding,
+        content_truncated=fetch.truncated,
         discussion_text=best_discussion,
-        final_url=final_url,
-        media_type=content_type,
-        response_headers=response_headers,
-        http_status=status if isinstance(status, int) else None,
-        raw_body=raw,
+        final_url=fetch.final_url,
+        media_type=fetch.content_type,
+        response_headers=fetch.response_headers,
+        http_status=fetch.status,
+        raw_body=fetch.raw,
         rendered_html=best_html if fetch_method == "browser" else "",
+        browser_pending=pending,
     )
+
+
+def complete_browser_fallback(page: PageFetchResult) -> PageFetchResult:
+    """Run a deferred browser render on the calling thread and merge it in.
+
+    Call this only from the thread that owns the playwright runtime. A result
+    with nothing pending is returned unchanged, so callers need no branch.
+    """
+    pending = page.browser_pending
+    if pending is None:
+        return page
+    if pending.kind == "http-error":
+        try:
+            return fetch_page_text_with_browser(
+                original_url=page.url,
+                fetch_url=pending.fetch_url,
+                timeout_seconds=pending.timeout_seconds,
+                allow_private_urls=pending.allow_private_urls,
+                initial_error=pending.initial_error,
+            )
+        except Exception as exc:
+            return PageFetchResult(
+                url=page.url,
+                text="",
+                error=f"{pending.initial_error}; browser fallback failed: {exc}",
+                http_status=page.http_status,
+            )
+    if pending.kind != "low-quality" or pending.fetch is None:
+        # Not an assert: python -O strips those, and the merge would then read
+        # attributes off None instead of saying what went wrong.
+        raise ValueError(f"Unsupported browser candidate: {pending.kind}")
+    rendered, browser_error = _render_for_merge(
+        pending.fetch_url,
+        timeout_seconds=pending.timeout_seconds,
+        allow_private_urls=pending.allow_private_urls,
+    )
+    return _merge_html_result(pending.fetch, rendered=rendered, browser_error=browser_error)
 
 
 def fetch_page_text_with_browser(

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
+from dataclasses import replace
 
 import pytest
 
@@ -749,5 +752,332 @@ def test_the_plan_states_what_an_enabled_metered_fallback_could_cost(tmp_path) -
 
         assert plan.max_cost_usd is None
         assert fallback_maximum_cost(plan, fallback) > 0
+    finally:
+        store.close()
+
+
+# --- Parallel ingest. Spec 20260819-sync-ingest-throughput. ---
+
+
+class _Audit:
+    result = {
+        "note_title": "Summary", "summary": "Short", "key_points": ["Point"],
+        "tags": ["tag"], "content_type": "article",
+    }
+    request: dict = {}
+    response = {"id": "response"}
+    usage = {"input_tokens": 1, "output_tokens": 1}
+
+
+class ConcurrencyProbe(FakeBackend):
+    """Records how many summarize calls overlap, and when each one started."""
+
+    def __init__(self, *, max_parallelism: int = 8, min_start_interval_seconds: float = 0.0,
+                 hold: float = 0.02, barrier_parties: int | None = None, **kwargs) -> None:
+        super().__init__(_Audit(), **kwargs)
+        self.capabilities = replace(
+            self.capabilities,
+            max_parallelism=max_parallelism,
+            min_start_interval_seconds=min_start_interval_seconds,
+        )
+        self.hold = hold
+        self.peak = 0
+        self.starts: list[float] = []
+        self._live = 0
+        self._lock = threading.Lock()
+        # Holding each caller until the whole group arrives makes the peak the
+        # worker count exactly. Sleeping instead only usually overlaps: one call
+        # can finish before the last starts, which is how this passed locally
+        # and failed on CI.
+        self._barrier = threading.Barrier(barrier_parties, timeout=10) if barrier_parties else None
+
+    def summarize(self, **kwargs):
+        with self._lock:
+            self._live += 1
+            self.peak = max(self.peak, self._live)
+            self.starts.append(time.monotonic())
+        try:
+            if self._barrier is not None:
+                self._barrier.wait()
+            elif self.hold > 0:
+                time.sleep(self.hold)
+            return super().summarize(**kwargs)
+        finally:
+            with self._lock:
+                self._live -= 1
+
+
+def _vault_with_resources(root, count: int):
+    initialize_vault(root)
+    store = VaultStore.open(root / ".feedian" / "feedian.sqlite3")
+    for index in range(count):
+        item = store.upsert_canonical_item(
+            CanonicalItem(
+                source="hatena", source_id=f"item-{index}", content_key=f"url:{index}",
+                url=f"https://example.test/{index}", title=f"Article {index}",
+            )
+        )
+        store.record_resource_revision(item.resource_id or "", content_markdown=f"Body {index}", title=f"A{index}")
+    return store
+
+
+@pytest.mark.parametrize("workers,expected_peak", [(1, 1), (3, 3)])
+def test_llm_workers_bounds_how_many_summaries_overlap(tmp_path, monkeypatch, workers, expected_peak) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    root = tmp_path / "vault"
+    root.mkdir()
+    store = _vault_with_resources(root, 6)
+    try:
+        backend = ConcurrencyProbe(barrier_parties=workers)
+        config = VaultConfig()
+        config.llm.workers = workers
+        report = ingest_source_notes(
+            store, root, config, model="gpt-5.6-terra", backend_instance=backend
+        )
+
+        assert report.created == 6
+        assert backend.peak == expected_peak
+    finally:
+        store.close()
+
+
+def test_a_backend_that_declares_one_stays_serial_however_many_workers(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    root = tmp_path / "vault"
+    root.mkdir()
+    store = _vault_with_resources(root, 4)
+    try:
+        backend = ConcurrencyProbe(max_parallelism=1)
+        config = VaultConfig()
+        config.llm.workers = 8
+        ingest_source_notes(store, root, config, model="gpt-5.6-terra", backend_instance=backend)
+
+        assert backend.peak == 1, "codex-local declares 1 for the same reason"
+    finally:
+        store.close()
+
+
+def test_the_start_interval_paces_the_run(tmp_path, monkeypatch) -> None:
+    """What is guaranteed is the spacing of submissions, not of wire sends.
+
+    Between the scheduler admitting a job and the worker reaching the provider
+    there is thread dispatch, so per-call gaps jitter either way. Three jobs at a
+    0.05s interval still cannot finish in under two intervals.
+    """
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    root = tmp_path / "vault"
+    root.mkdir()
+    store = _vault_with_resources(root, 3)
+    try:
+        backend = ConcurrencyProbe(min_start_interval_seconds=0.05, hold=0.0)
+        config = VaultConfig()
+        config.llm.workers = 8
+        started = time.monotonic()
+        report = ingest_source_notes(
+            store, root, config, model="gpt-5.6-terra", backend_instance=backend
+        )
+        elapsed = time.monotonic() - started
+
+        assert report.created == 3
+        assert len(backend.starts) == 3
+        assert elapsed >= 0.10, f"three starts at 0.05s apart took {elapsed:.3f}s"
+    finally:
+        store.close()
+
+
+def test_an_interrupt_closes_every_run_and_starts_no_further_backend_call(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    root = tmp_path / "vault"
+    root.mkdir()
+    store = _vault_with_resources(root, 6)
+    try:
+        class Interrupting(ConcurrencyProbe):
+            def summarize(self, **kwargs):
+                with self._lock:
+                    self.starts.append(time.monotonic())
+                if len(self.starts) == 1:
+                    raise KeyboardInterrupt
+                return FakeBackend.summarize(self, **kwargs)
+
+        backend = Interrupting(max_parallelism=1)
+        config = VaultConfig()
+        config.llm.workers = 1
+        with pytest.raises(KeyboardInterrupt):
+            ingest_source_notes(store, root, config, model="gpt-5.6-terra", backend_instance=backend)
+
+        left_running = store.connection.execute(
+            "SELECT COUNT(*) FROM llm_run WHERE status = 'running'"
+        ).fetchone()[0]
+        assert left_running == 0, "no run is left open by a graceful stop"
+        assert len(backend.starts) == 1, "nothing new is sent after the interrupt"
+    finally:
+        store.close()
+
+
+def test_runs_left_running_by_a_killed_process_are_closed_on_the_next_ingest(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    root = tmp_path / "vault"
+    root.mkdir()
+    store = _vault_with_resources(root, 1)
+    try:
+        item = store.connection.execute("SELECT resource_id FROM resource LIMIT 1").fetchone()[0]
+        revision = store.connection.execute(
+            "SELECT resource_revision_id FROM resource_revision LIMIT 1"
+        ).fetchone()[0]
+        store.start_llm_run(
+            resource_id=item, resource_revision_id=revision, operation="source-note",
+            model="m", prompt_version="v", input_fingerprint="abandoned",
+            request={"logical": {}, "actual": None}, backend="openai-responses",
+            summary_schema_version=1, fingerprint_version=2,
+            auth_mode="api-key", billing_mode="metered-api", backend_metadata={},
+        )
+        assert store.connection.execute(
+            "SELECT COUNT(*) FROM llm_run WHERE status = 'running'"
+        ).fetchone()[0] == 1
+
+        ingest_source_notes(
+            store, root, VaultConfig(), model="gpt-5.6-terra", backend_instance=ConcurrencyProbe()
+        )
+
+        assert store.connection.execute(
+            "SELECT COUNT(*) FROM llm_run WHERE status = 'running'"
+        ).fetchone()[0] == 0
+    finally:
+        store.close()
+
+
+def test_the_scheduler_waits_instead_of_spinning_when_nothing_may_start_yet(tmp_path, monkeypatch) -> None:
+    """Waiting on an empty set of Futures returns at once; without this it spins."""
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    root = tmp_path / "vault"
+    root.mkdir()
+    store = _vault_with_resources(root, 2)
+    slept: list[float] = []
+    real_sleep = time.sleep
+
+    def record(seconds):
+        slept.append(seconds)
+        real_sleep(seconds)
+
+    try:
+        backend = ConcurrencyProbe(max_parallelism=1, min_start_interval_seconds=0.05, hold=0.0)
+        config = VaultConfig()
+        config.llm.workers = 1
+        monkeypatch.setattr("feedian.ingest.time.sleep", record)
+        ingest_source_notes(store, root, config, model="gpt-5.6-terra", backend_instance=backend)
+
+        assert slept, "the second job is not due yet and nothing is running, so it waits"
+        assert all(seconds > 0 for seconds in slept)
+        assert len(slept) < 10, f"one wait per opening, not a spin: {slept}"
+    finally:
+        store.close()
+
+
+def test_a_fallback_passes_through_its_own_backend_limits(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("MANUS_API_KEY", "manus-key")
+    root = tmp_path / "vault"
+    root.mkdir()
+    store = _vault_with_resources(root, 4)
+    try:
+        primary = ConcurrencyProbe(error=BackendRateLimitError("slow down"))
+        secondary = ConcurrencyProbe(backend="manus-api", max_parallelism=1, hold=0.02)
+        config = VaultConfig()
+        config.llm.workers = 8
+        config.llm.fallback = LLMFallbackSettings(enabled=True, backend="manus-api", model="manus-1.6")
+        report = ingest_source_notes(
+            store, root, config, model="gpt-5.6-terra",
+            backend_instance=primary, fallback_instance=secondary,
+        )
+
+        assert report.created == 4, "every article was summarised by the fallback"
+        assert secondary.peak == 1, "the fallback obeys its own limit, not the primary's"
+    finally:
+        store.close()
+
+
+def test_a_fallback_counts_as_one_candidate_not_two(tmp_path, monkeypatch) -> None:
+    """Review 20260819-2: a fallback is a second attempt, not a second candidate."""
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("MANUS_API_KEY", "manus-key")
+    root = tmp_path / "vault"
+    root.mkdir()
+    store = _vault_with_resources(root, 1)
+    try:
+        config = VaultConfig()
+        config.llm.fallback = LLMFallbackSettings(enabled=True, backend="manus-api", model="manus-1.6")
+        seen: list[tuple[int, int]] = []
+        report = ingest_source_notes(
+            store, root, config, model="gpt-5.6-terra",
+            backend_instance=ConcurrencyProbe(error=BackendRateLimitError("slow down")),
+            fallback_instance=ConcurrencyProbe(backend="manus-api"),
+            progress=lambda processed, total, _candidate, _report: seen.append((processed, total)),
+        )
+
+        assert report.created == 1
+        assert report.processed == 1
+        assert all(processed <= total for processed, total in seen), seen
+    finally:
+        store.close()
+
+
+def test_progress_counts_finished_candidates_not_submitted_ones(tmp_path, monkeypatch) -> None:
+    """Review 20260819-4: jobs are submitted ahead of the first result.
+
+    Counting at submit made every candidate look done as soon as one was.
+    """
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    root = tmp_path / "vault"
+    root.mkdir()
+    store = _vault_with_resources(root, 3)
+    try:
+        config = VaultConfig()
+        config.llm.workers = 3
+        seen: list[tuple[int, int]] = []
+        report = ingest_source_notes(
+            store, root, config, model="gpt-5.6-terra",
+            backend_instance=ConcurrencyProbe(),
+            progress=lambda processed, total, _candidate, _report: seen.append((processed, total)),
+        )
+
+        assert report.processed == 3
+        assert seen == [(1, 3), (2, 3), (3, 3)]
+    finally:
+        store.close()
+
+
+def test_a_dry_run_leaves_another_process_running_llm_run_alone(tmp_path, monkeypatch) -> None:
+    """Review 20260819-6: planning happens without the vault write lock.
+
+    The CLI plans a dry run before taking the lock, so nothing on that path may
+    write - least of all close a run another ingest is still executing.
+    """
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    root = tmp_path / "vault"
+    root.mkdir()
+    store = _vault_with_resources(root, 1)
+    try:
+        resource_id = store.connection.execute("SELECT resource_id FROM resource LIMIT 1").fetchone()[0]
+        revision_id = store.connection.execute(
+            "SELECT resource_revision_id FROM resource_revision LIMIT 1"
+        ).fetchone()[0]
+        store.start_llm_run(
+            resource_id=resource_id, resource_revision_id=revision_id, operation="source-note",
+            model="m", prompt_version="v", input_fingerprint="owned-by-another-process",
+            request={"logical": {}, "actual": None}, backend="openai-responses",
+            summary_schema_version=1, fingerprint_version=2,
+            auth_mode="api-key", billing_mode="metered-api", backend_metadata={},
+        )
+
+        plan_source_notes(store, model="gpt-5.6-terra", backend_instance=ConcurrencyProbe())
+        ingest_source_notes(
+            store, root, VaultConfig(), model="gpt-5.6-terra", dry_run=True,
+            backend_instance=ConcurrencyProbe(),
+        )
+
+        still_running = store.connection.execute(
+            "SELECT COUNT(*) FROM llm_run WHERE status = 'running'"
+        ).fetchone()[0]
+        assert still_running == 1, "planning and a dry run must not touch it"
     finally:
         store.close()

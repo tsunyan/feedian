@@ -213,9 +213,15 @@ The active provider and model are shown in the ingest preview and execution head
     "html_max_bytes": 10485760,
     "document_max_bytes": 104857600,
     "refresh_days": 30,
+    "workers": 8,
     "comment_workers": 8,
     "star_refresh_days": 30,
     "allow_private_hosts": []
+  },
+  "llm": {
+    "backend": "openai-responses",
+    "model": "gpt-5.6-terra",
+    "workers": 8
   }
 }
 ```
@@ -233,14 +239,17 @@ The active provider and model are shown in the ingest preview and execution head
 | `fetch.html_max_bytes` | Maximum HTML download size. |
 | `fetch.document_max_bytes` | Maximum retained non-HTML response size. |
 | `fetch.refresh_days` | Age after which Feedian checks a linked page for updates again. |
+| `fetch.workers` | Parallel workers for page fetching during `sync`. Defaults to 8. |
 | `fetch.comment_workers` | Parallel workers for Hatena comment retrieval. |
 | `fetch.star_refresh_days` | Default age for refreshing Hatena Star counts. |
 | `fetch.allow_private_hosts` | Explicit private/local hosts that page fetching may access. Empty by default. |
 | `fetch.retry_base_minutes` | Wait before retrying a page that failed once. Doubles with each further consecutive failure. |
 | `fetch.retry_max_days` | Ceiling on that growing wait. |
 | `fetch.terminal_http_statuses` | Statuses that are never retried, only `--force-fetch` gets past them. Defaults to `[404, 410]`; an empty list turns this off and lets the growing wait handle everything. |
+| `fetch.quick_stop_after_known_pages` | Consecutive pages of already-stored items that end collection during a quick sync. Defaults to 1. Raising it makes quick look further past known items. |
+| `llm.workers` | Parallel workers for `ingest`. Defaults to 8. Each backend caps this further with its own limit; local agent backends run one at a time. |
 
-Unknown config fields are rejected instead of silently ignored.
+Unknown config fields are rejected instead of silently ignored. `fetch.workers`, `fetch.comment_workers`, `fetch.quick_stop_after_known_pages`, and `llm.workers` must be integers of 1 or more; a boolean, a decimal, or a quoted number is rejected when the config is read rather than coerced.
 
 ## Command reference
 

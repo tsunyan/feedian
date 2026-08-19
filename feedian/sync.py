@@ -4,10 +4,16 @@ import json
 import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
-from typing import Callable, Iterable
+from typing import Any, Callable, Iterable, Iterator
 
-from .canonical import CanonicalItem, canonical_item_from_metadata
-from .extract import PageFetchResult, decode_html, extract_content_images, fetch_page_text
+from .canonical import CanonicalItem, canonical_item_from_metadata, canonicalize_url
+from .extract import (
+    PageFetchResult,
+    complete_browser_fallback,
+    decode_html,
+    extract_content_images,
+    fetch_page_text,
+)
 from .hatena import (
     HatenaEntryDiscussion,
     HatenaPublicComment,
@@ -20,7 +26,13 @@ from .hatena import (
 from .raindrop import RaindropClient
 from .rss import RssItem, fetch_rss_items, published_timestamp
 from .store import VaultStore, sha256_bytes, stable_json
-from .vault import FetchRetrySettings, VaultConfig, fetch_retry_settings, normalized_rss_feeds
+from .vault import (
+    FetchRetrySettings,
+    VaultConfig,
+    fetch_retry_settings,
+    normalized_rss_feeds,
+    positive_int_setting,
+)
 
 
 HATENA_COMMENT_LIMIT = 20
@@ -58,14 +70,11 @@ def sync_vault(
     providers = _selected_providers(config, source)
     stop_after_known_pages = 1
     if quick:
-        stop_after_known_pages = config.fetch.get("quick_stop_after_known_pages", 1)
-        # Coercing first would silently turn 1.5 into 1 and true into 1, cutting
-        # collection shorter than the value the user wrote.
-        if isinstance(stop_after_known_pages, bool) or not isinstance(stop_after_known_pages, int):
-            raise ValueError("config.fetch.quick_stop_after_known_pages must be an integer")
-        if stop_after_known_pages < 1:
-            raise ValueError("config.fetch.quick_stop_after_known_pages must be >= 1")
+        stop_after_known_pages = positive_int_setting(
+            "fetch.quick_stop_after_known_pages", config.fetch.get("quick_stop_after_known_pages", 1)
+        )
     refresh_days = int(config.fetch.get("refresh_days", 30))
+    fetch_workers = positive_int_setting("fetch.workers", config.fetch.get("workers", 8))
     retry_settings = fetch_retry_settings(config)
     fingerprint = sha256_bytes(
         stable_json(
@@ -83,6 +92,10 @@ def sync_vault(
     )
     run_id = store.create_sync_run(providers, fingerprint, mode="quick" if quick else "full")
     processed = changed = failed = fetched = skipped = retried = 0
+    # What progress reports: items whose handling is finished. processed now
+    # counts a whole chunk before any of it is stored, so it can no longer
+    # stand in for that.
+    settled = 0
     comment_targets: dict[str, tuple[str, str, str]] = {}
     provider_errors: list[str] = []
     stopped_early_providers: list[str] = []
@@ -97,115 +110,142 @@ def sync_vault(
         for provider in providers:
             known = store.known_native_ids(provider) if quick else None
             provider_fetch_attempts = 0
-            for item, raw_payload in _provider_items(
-                config,
-                provider,
-                limit,
-                collection_progress=collection_progress,
-                store=store,
-                provider_error=record_provider_error,
-                quick=quick,
-                known=known,
-                stop_after_known_pages=stop_after_known_pages,
-                on_stopped_early=stopped_early_providers.append,
+            for chunk in _resource_disjoint_chunks(
+                _provider_items(
+                    config,
+                    provider,
+                    limit,
+                    collection_progress=collection_progress,
+                    store=store,
+                    provider_error=record_provider_error,
+                    quick=quick,
+                    known=known,
+                    stop_after_known_pages=stop_after_known_pages,
+                    on_stopped_early=stopped_early_providers.append,
+                ),
+                size=max(1, fetch_workers * 4),
             ):
-                if quick and known is not None and item.source_id in known:
-                    skipped += 1
-                    if progress is not None:
-                        # Count skips too, so the collection-sized progress bar advances.
-                        progress(processed + skipped, item)
-                    continue
-                processed += 1
-                stored = store.upsert_canonical_item(item, source_payload=raw_payload)
-                if quick and stored.resource_id:
-                    handled_resource_ids.add(stored.resource_id)
-                # Bound before the try: should_fetch_resource reads fetch_capture and
-                # parses its timestamp, so it can raise, and the handler below reads
-                # this to decide whose audit rows to write.
-                should_fetch_page = False
-                try:
-                    should_fetch_page = bool(
-                        stored.resource_id
-                        and fetch_pages
-                        and item.url
-                        and store.should_fetch_resource(
-                            stored.resource_id,
-                            refresh_days=refresh_days,
-                            force=force_fetch,
-                            retry_base_minutes=retry_settings.retry_base_minutes,
-                            retry_max_days=retry_settings.retry_max_days,
-                            terminal_http_statuses=retry_settings.terminal_http_statuses,
-                            terminal_failure_kinds=retry_settings.terminal_failure_kinds,
-                            terminal_kind_failures=retry_settings.terminal_kind_failures,
+                prepared: list[_PreparedItem] = []
+                for item, raw_payload in chunk:
+                    if quick and known is not None and item.source_id in known:
+                        skipped += 1
+                        settled += 1
+                        if progress is not None:
+                            # Count skips too, so the collection-sized progress bar advances.
+                            progress(settled, item)
+                        continue
+                    processed += 1
+                    stored = store.upsert_canonical_item(item, source_payload=raw_payload)
+                    if quick and stored.resource_id:
+                        handled_resource_ids.add(stored.resource_id)
+                    # Bound before the try: should_fetch_resource reads fetch_capture and
+                    # parses its timestamp, so it can raise, and the handler below reads
+                    # this to decide whose audit rows to write.
+                    should_fetch_page = False
+                    prepare_error: Exception | None = None
+                    validators = ("", "")
+                    try:
+                        should_fetch_page = bool(
+                            stored.resource_id
+                            and fetch_pages
+                            and item.url
+                            and store.should_fetch_resource(
+                                stored.resource_id,
+                                refresh_days=refresh_days,
+                                force=force_fetch,
+                                retry_base_minutes=retry_settings.retry_base_minutes,
+                                retry_max_days=retry_settings.retry_max_days,
+                                terminal_http_statuses=retry_settings.terminal_http_statuses,
+                                terminal_failure_kinds=retry_settings.terminal_failure_kinds,
+                                terminal_kind_failures=retry_settings.terminal_kind_failures,
+                            )
+                        )
+                        if should_fetch_page and stored.resource_id:
+                            provider_fetch_attempts += 1
+                            validators = store.resource_fetch_validators(stored.resource_id)
+                    except Exception as exc:
+                        prepare_error = exc
+                    prepared.append(
+                        _PreparedItem(
+                            item=item,
+                            stored=stored,
+                            should_fetch_page=should_fetch_page,
+                            validators=validators,
+                            prepare_error=prepare_error,
                         )
                     )
-                    if should_fetch_page and stored.resource_id:
-                        provider_fetch_attempts += 1
-                        try:
-                            etag, last_modified = store.resource_fetch_validators(stored.resource_id)
-                            page = fetch_page_text(
-                                item.url,
-                                timeout_seconds=retry_settings.timeout_seconds,
-                                max_chars=10_000,
-                                allow_private_urls=False,
-                                etag=etag,
-                                last_modified=last_modified,
-                                browser_timeout_seconds=retry_settings.browser_timeout_seconds,
-                            )
-                        except Exception as exc:
-                            if item.embedded_content and not _resource_has_revision(store, stored.resource_id):
-                                store.record_resource_revision(
+
+                _fetch_prepared_pages(prepared, retry_settings=retry_settings, workers=fetch_workers)
+
+                for entry in prepared:
+                    item = entry.item
+                    stored = entry.stored
+                    should_fetch_page = entry.should_fetch_page
+                    try:
+                        if entry.prepare_error is not None:
+                            raise entry.prepare_error
+                        if should_fetch_page and stored.resource_id:
+                            try:
+                                if entry.fetch_error is not None:
+                                    raise entry.fetch_error
+                                # playwright is bound to the thread that started it, so a
+                                # render the worker deferred runs here instead.
+                                page = complete_browser_fallback(entry.page)
+                            except Exception as exc:
+                                if item.embedded_content and not _resource_has_revision(store, stored.resource_id):
+                                    store.record_resource_revision(
+                                        stored.resource_id,
+                                        content_markdown=item.embedded_content,
+                                        title=item.title,
+                                        final_url=item.url,
+                                        extracted_by="rss-feed-fallback",
+                                    )
+                                elif stored.resource_id:
+                                    # Only when the feed body did not stand in: record_failed_fetch
+                                    # rewrites the capture, and its defaults would clear the payload
+                                    # and final URL that the fallback revision just recorded.
+                                    store.record_failed_fetch(stored.resource_id, warning=str(exc))
+                                raise
+                            if page.not_modified:
+                                store.record_not_modified_fetch(
                                     stored.resource_id,
-                                    content_markdown=item.embedded_content,
-                                    title=item.title,
-                                    final_url=item.url,
-                                    extracted_by="rss-feed-fallback",
+                                    final_url=page.final_url or item.url,
+                                    response_headers=page.response_headers,
                                 )
-                            elif stored.resource_id:
-                                # Only when the feed body did not stand in: record_failed_fetch
-                                # rewrites the capture, and its defaults would clear the payload
-                                # and final URL that the fallback revision just recorded.
-                                store.record_failed_fetch(stored.resource_id, warning=str(exc))
-                            raise
-                        if page.not_modified:
-                            store.record_not_modified_fetch(
+                            elif not page.text.strip() and item.embedded_content:
+                                page.text = item.embedded_content
+                                page.title = page.title or item.title
+                                page.extraction_method = "rss-feed-fallback"
+                            if not page.not_modified:
+                                _store_page(store, stored.resource_id, page)
+                            fetched += 1
+                        elif stored.resource_id and item.embedded_content and not _resource_has_revision(store, stored.resource_id):
+                            store.record_resource_revision(
                                 stored.resource_id,
-                                final_url=page.final_url or item.url,
-                                response_headers=page.response_headers,
+                                content_markdown=item.embedded_content,
+                                title=item.title,
+                                final_url=item.url,
+                                extracted_by="rss-feed",
                             )
-                        elif not page.text.strip() and item.embedded_content:
-                            page.text = item.embedded_content
-                            page.title = page.title or item.title
-                            page.extraction_method = "rss-feed-fallback"
-                        if not page.not_modified:
-                            _store_page(store, stored.resource_id, page)
-                        fetched += 1
-                    elif stored.resource_id and item.embedded_content and not _resource_has_revision(store, stored.resource_id):
-                        store.record_resource_revision(
-                            stored.resource_id,
-                            content_markdown=item.embedded_content,
-                            title=item.title,
-                            final_url=item.url,
-                            extracted_by="rss-feed",
-                        )
-                    if stored.resource_id and fetch_comments and item.url:
-                        comment_targets.setdefault(
-                            stored.resource_id, (stored.source_item_id, stored.resource_id, item.url)
-                        )
-                    for source_item_id in _audited_source_items(
-                        store, stored, providers, quick=quick, fetched_body=should_fetch_page
-                    ):
-                        store.record_sync_item(run_id, source_item_id, "completed")
-                    changed += int(stored.changed)
-                except Exception as exc:
-                    failed += 1
-                    for source_item_id in _audited_source_items(
-                        store, stored, providers, quick=quick, fetched_body=should_fetch_page
-                    ):
-                        store.record_sync_item(run_id, source_item_id, "failed", str(exc))
-                finally:
-                    if progress is not None:
-                        progress(processed + skipped, item)
+                        if stored.resource_id and fetch_comments and item.url:
+                            comment_targets.setdefault(
+                                stored.resource_id, (stored.source_item_id, stored.resource_id, item.url)
+                            )
+                        for source_item_id in _audited_source_items(
+                            store, stored, providers, quick=quick, fetched_body=should_fetch_page
+                        ):
+                            store.record_sync_item(run_id, source_item_id, "completed")
+                        changed += int(stored.changed)
+                    except Exception as exc:
+                        failed += 1
+                        for source_item_id in _audited_source_items(
+                            store, stored, providers, quick=quick, fetched_body=should_fetch_page
+                        ):
+                            store.record_sync_item(run_id, source_item_id, "failed", str(exc))
+                    finally:
+                        settled += 1
+                        if progress is not None:
+                            progress(settled, item)
             if quick and fetch_pages:
                 budget = None if limit is None else max(0, limit - provider_fetch_attempts)
                 provider_retried, provider_fetched, provider_failed = _run_quick_body_only_pass(
@@ -218,6 +258,7 @@ def sync_vault(
                     refresh_days=refresh_days,
                     force_fetch=force_fetch,
                     retry_settings=retry_settings,
+                    workers=fetch_workers,
                 )
                 retried += provider_retried
                 fetched += provider_fetched
@@ -226,7 +267,7 @@ def sync_vault(
             store,
             run_id,
             list(comment_targets.values()),
-            workers=int(config.fetch.get("comment_workers", 8)),
+            workers=positive_int_setting("fetch.comment_workers", config.fetch.get("comment_workers", 8)),
             force=force_comments,
             progress=comment_progress,
         )
@@ -249,6 +290,123 @@ def sync_vault(
         retried=retried,
         stopped_early=tuple(stopped_early_providers),
     )
+
+
+@dataclass
+class _PreparedItem:
+    """One item taken as far as the main thread can before the network."""
+
+    item: CanonicalItem
+    stored: Any
+    should_fetch_page: bool
+    validators: tuple[str, str]
+    prepare_error: Exception | None = None
+    page: PageFetchResult | None = None
+    fetch_error: Exception | None = None
+
+
+def _resource_disjoint_chunks(
+    items: Iterable[tuple[CanonicalItem, bytes]], *, size: int
+) -> Iterator[list[tuple[CanonicalItem, bytes]]]:
+    """Group items into chunks, never twice the same resource in one chunk.
+
+    Serial syncing got duplicate suppression for free: the second item pointing
+    at a resource saw the capture the first one had just written, and
+    should_fetch_resource said no. Fetching a chunk at once removes that, so an
+    item whose resource is already claimed is held back for a later chunk and
+    re-judged there by the ordinary rule. Merging the results instead would be
+    wrong for two paths: after a failed fetch the later item's own audit is
+    completed rather than failed, and under --force-fetch every item fetches and
+    spends budget. Resources are keyed by canonical URL, so this needs no
+    database read - and one URL really can arrive as several items, from two RSS
+    feeds carrying the same article or one URL saved to Raindrop twice.
+    """
+    pending: list[tuple[CanonicalItem, bytes]] = []
+    source = iter(items)
+    exhausted = False
+    while True:
+        chunk: list[tuple[CanonicalItem, bytes]] = []
+        claimed: set[str] = set()
+        deferred: list[tuple[CanonicalItem, bytes]] = []
+        for entry in pending:
+            _place(entry, chunk, claimed, deferred, size)
+        pending = deferred
+        while not exhausted and len(chunk) < size:
+            try:
+                entry = next(source)
+            except StopIteration:
+                exhausted = True
+                break
+            if not _place(entry, chunk, claimed, pending, size):
+                continue
+        if chunk:
+            yield chunk
+            continue
+        if exhausted and not pending:
+            return
+        if not pending:
+            return
+
+
+def _place(
+    entry: tuple[CanonicalItem, bytes],
+    chunk: list[tuple[CanonicalItem, bytes]],
+    claimed: set[str],
+    deferred: list[tuple[CanonicalItem, bytes]],
+    size: int,
+) -> bool:
+    item = entry[0]
+    key = canonicalize_url(item.url) if item.url else ""
+    if len(chunk) >= size or (key and key in claimed):
+        deferred.append(entry)
+        return False
+    if key:
+        claimed.add(key)
+    chunk.append(entry)
+    return True
+
+
+def _fetch_prepared_pages(
+    prepared: list[_PreparedItem], *, retry_settings: FetchRetrySettings, workers: int
+) -> None:
+    """Fetch one chunk's pages, writing each result back onto its entry.
+
+    Workers do external I/O only. Every database call and every judgement stays
+    on the calling thread, because the SQLite connection belongs to it and
+    playwright is bound to whichever thread started it.
+    """
+    due = [entry for entry in prepared if entry.should_fetch_page and entry.prepare_error is None]
+    if not due:
+        return
+
+    def fetch(entry: _PreparedItem) -> tuple[PageFetchResult | None, Exception | None]:
+        etag, last_modified = entry.validators
+        try:
+            return (
+                fetch_page_text(
+                    entry.item.url,
+                    timeout_seconds=retry_settings.timeout_seconds,
+                    max_chars=10_000,
+                    allow_private_urls=False,
+                    etag=etag,
+                    last_modified=last_modified,
+                    browser_timeout_seconds=retry_settings.browser_timeout_seconds,
+                    allow_browser=False,
+                ),
+                None,
+            )
+        except Exception as exc:
+            return None, exc
+
+    if len(due) == 1 or workers == 1:
+        for entry in due:
+            entry.page, entry.fetch_error = fetch(entry)
+        return
+    with ThreadPoolExecutor(
+        max_workers=min(len(due), workers), thread_name_prefix="feedian-fetch"
+    ) as executor:
+        for entry, (page, error) in zip(due, executor.map(fetch, due)):
+            entry.page, entry.fetch_error = page, error
 
 
 def _selected_providers(config: VaultConfig, source: str) -> list[str]:
@@ -318,6 +476,13 @@ def _provider_items(
                 (lambda collected, total: collection_progress(provider, collected, total))
                 if collection_progress is not None
                 else None
+            ),
+            known=known if quick else None,
+            # Zero keeps full mode sweeping every page; the caller validated the
+            # configured value before quick ever reaches here.
+            stop_after_known_pages=stop_after_known_pages if quick else 0,
+            on_stopped_early=(
+                (lambda: on_stopped_early(provider)) if on_stopped_early is not None else None
             ),
         )
         for item in items:
@@ -434,6 +599,7 @@ def _run_quick_body_only_pass(
     refresh_days: int,
     force_fetch: bool,
     retry_settings: FetchRetrySettings,
+    workers: int,
 ) -> tuple[int, int, int]:
     """Retry resources that still have no body, without touching any provider.
 
@@ -442,6 +608,7 @@ def _run_quick_body_only_pass(
     """
     retried = fetched = failed = 0
     remaining = budget
+    due: list[tuple[str, str, tuple[str, str], list[str]]] = []
     for resource_id, url in store.unfetched_resources([provider]):
         if resource_id in handled_resource_ids:
             continue
@@ -465,18 +632,19 @@ def _run_quick_body_only_pass(
         # is often shared (the same URL bookmarked in Raindrop and in Hatena), and it
         # leaves `unfetched_resources` as soon as this fetch lands, so the other
         # provider's pass would never get to record its outcome.
-        source_item_ids = store.source_items_for_resource(resource_id, all_providers)
+        due.append((resource_id, url, store.resource_fetch_validators(resource_id),
+                    store.source_items_for_resource(resource_id, all_providers)))
+
+    # unfetched_resources already yields one row per resource, so nothing here
+    # needs the chunked deferral the item loop uses.
+    for (resource_id, url, _validators, source_item_ids), (page, fetch_error) in zip(
+        due, _fetch_urls(due, retry_settings=retry_settings, workers=workers)
+    ):
         try:
-            etag, last_modified = store.resource_fetch_validators(resource_id)
-            page = fetch_page_text(
-                url,
-                timeout_seconds=retry_settings.timeout_seconds,
-                max_chars=10_000,
-                allow_private_urls=False,
-                etag=etag,
-                last_modified=last_modified,
-                browser_timeout_seconds=retry_settings.browser_timeout_seconds,
-            )
+            if fetch_error is not None:
+                raise fetch_error
+            # playwright is bound to the thread that started it.
+            page = complete_browser_fallback(page)
             if page.not_modified:
                 store.record_not_modified_fetch(
                     resource_id,
@@ -505,6 +673,43 @@ def _run_quick_body_only_pass(
             for source_item_id in source_item_ids:
                 store.record_sync_item(run_id, source_item_id, "failed", str(exc))
     return retried, fetched, failed
+
+
+def _fetch_urls(
+    due: list[tuple[str, str, tuple[str, str], list[str]]],
+    *,
+    retry_settings: FetchRetrySettings,
+    workers: int,
+) -> list[tuple[PageFetchResult | None, Exception | None]]:
+    """Fetch the body-only pass's URLs, in the input order the caller stores in."""
+    if not due:
+        return []
+
+    def fetch(entry) -> tuple[PageFetchResult | None, Exception | None]:
+        _resource_id, url, (etag, last_modified), _items = entry
+        try:
+            return (
+                fetch_page_text(
+                    url,
+                    timeout_seconds=retry_settings.timeout_seconds,
+                    max_chars=10_000,
+                    allow_private_urls=False,
+                    etag=etag,
+                    last_modified=last_modified,
+                    browser_timeout_seconds=retry_settings.browser_timeout_seconds,
+                    allow_browser=False,
+                ),
+                None,
+            )
+        except Exception as exc:
+            return None, exc
+
+    if len(due) == 1 or workers == 1:
+        return [fetch(entry) for entry in due]
+    with ThreadPoolExecutor(
+        max_workers=min(len(due), workers), thread_name_prefix="feedian-retry"
+    ) as executor:
+        return list(executor.map(fetch, due))
 
 
 def _audited_source_items(

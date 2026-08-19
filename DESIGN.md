@@ -30,10 +30,27 @@
 - 既定の反転は**CLI層に限定する**。`sync_vault`の`quick`既定は`False`のままである。`_run_pipeline`はkeyword引数なしで`sync_vault`を呼ぶため、関数既定を反転させると週次runが黙ってquickになる。
 - `--force-fetch`と`--force-comments`はfull専用であり、`--full`が無ければCLI errorとする。forceの「既知itemを強制的に再取得する」はquickの「既知itemに触れない」と正面から矛盾するため、暗黙の優先順位を設けない。
 - ページ取得が失敗したときは`fetch_capture`だけを記録し、空本文の`resource_revision`を書かない。従来は失敗しても空revisionが書かれてresourceが「取得済み」に見え、`ingest`が本文なしで要約を作って課金していた。失敗記録は現在のrevisionが空本文であれば`resource.current_revision_id`をNULLへ正規化するが、`resource_revision`行は削除しない（`llm_run`など5つの外部キーが参照する）。同じ判定を`reextract`にも適用する。
-- Raindropのみ収集を早期に打ち切る。`sort=-created`が作成日時の降順であることをAPIが定義しているためである。Hatenaは検索APIの返却順に保証が無いため全件収集を維持し、RSSはETag / Last-Modifiedによる条件付き取得が既にあるため変更しない。過去日付を保持したRaindropの一括インポートは降順の深い位置に着地するため、quickでは検出できない。
+- RaindropとHatenaは収集を早期に打ち切る。Raindropは`sort=-created`が作成日時の降順であることをAPIが定義している。Hatenaは検索APIの返却順を全件走査で実測し、6,987行・69ページ境界のすべてで`timestamp`が非増加であることを確認した（[syncとingestのスループット](docs/specs/20260819-sync-ingest-throughput.ja.md)）。契約は厳密な降順ではなく非増加である。同一`timestamp`のブックマークが実在するためである。Hatenaの打ち切り判定は検索クエリ（`https`と`http`）ごとに独立して持つ。新規ブックマークがどちらの全文検索トークンに載るかは事前に分からず、片方が1ページで止まりもう片方が走査を続けるのは正常な状態である。新着ゼロの実測で71リクエストが2リクエスト、5分10秒が約9秒になる。RSSはETag / Last-Modifiedによる条件付き取得が既にあるため変更しない。過去日付を保持したRaindropの一括インポートは降順の深い位置に着地するため、quickでは検出できない。Hatenaでは同一URLの再ブックマークが`timestamp`を更新して先頭へ移動するため、1回のsync間隔に100件以上の再ブックマークが挟まると新着を取りこぼし得る。復旧経路は`--full`であり、`fetch.quick_stop_after_known_pages`を上げれば緩和できる。
 - (B1)はproviderの新着列挙から分離したDB駆動のpassであり、provider APIへのリクエストを要さない。本文取得だけを行い、provider metadata更新とコメント照会は伴わない。1つのresourceを複数のsource itemが共有する（同じ記事をRaindropとHatenaでブックマークした場合）ため、取得は1回だけ行い`sync_run_item`は全参照元へ記録する。`--limit`は(A)と(B1)の共有予算とし(A)を優先する。候補は最新`fetch_capture.fetched_at`の昇順で処理し、予算内で同じ先頭群だけが選ばれ続けることを防ぐ。
 - SQLite schema version 7の`sync_run`は`mode`を保存する。`_due_providers`は`mode='full'`のrunだけを見るため、quickを繰り返しても`feedian run`の完全同期がdueでなくなることはない。
 - quickだけを実行し続けると、provider側のmetadata差分、Hatenaコメントの増減、`refresh_days`到達による再取得、取得失敗本文の復旧が反映されない。これらは自動補正せず、完全同期の定期実行を案内する。
+
+## 並列処理
+
+外部I/Oだけをworkerへ出し、判断と書き込みはmain threadに残す。判断理由と却下した代替案は [syncとingestのスループット](docs/specs/20260819-sync-ingest-throughput.ja.md) を参照する。
+
+- 並列化は**保存される状態を意味的に変えない**。同じ入力と同じ外部応答に対して、本文・HTTP payload・`http_status`・response header・切り詰め情報・RSS fallbackの適用有無・監査内容・外部への取得回数・`--limit` の消費量が直列実行と一致する。UUID、timestamp、所要時間、独立したresource間の完了順は比較対象外である。正しい実装でも実行ごとに変わるためである。
+- 動かせない制約が2つある。**DBはmain thread専用**である（`sqlite3.connect` を既定の `check_same_thread=True` で開くため）。**playwrightは生成したthreadに束縛される**ため、browser描画もmain threadで行う。browser経由の抽出は全取得の1.0%（9,877件中99件）であり、workerごとにchromiumを立てる費用に見合わない。
+- `fetch_page_text` の `allow_browser=False` はworkerが使う。browser描画が必要な場合は結果に `browser_pending` を立てて返し、main threadが `complete_browser_fallback` で描画して合成する。**合成規則は `_merge_html_result` の1箇所にあり、直列経路と並列経路が同じ実装を通る。** HTTP抽出とbrowser抽出は `text_quality_score` で比較し、良い方を残す。browserが失敗してもHTTP本文は残り、警告だけが連結される。HTTP原本・status・headerは合成後も保持する。`http_status` は終端ステータス規則（404/410）の入力である。
+- 取得はitem単位ではなく**resource単位**で行う。同一resourceを指すitemは同じchunkへ入れず後続chunkへ繰り延べ、先行itemの結果が保存された後に通常の `should_fetch_resource` で再評価する。直列実行が暗黙に持っていた重複抑止をchunk化が壊すためである。結果を合流させないのは、取得失敗時に後続itemのauditが `completed` であること、`--force-fetch` ではitemごとに取得して予算を消費することが、合流では再現できないためである。resourceは正規化URLで束ねられる一方、`source_id` はRSSがfeed識別子由来、Raindropが `_id` 由来なので、同一URLが複数itemとして現れる。
+- 取得後処理は全てmain threadで、例外 → `not_modified` → browser合成 → 空本文の `embedded_content` fallback → `_store_page` → audit の順に行う。この順序を変えるとRSSの本文fallbackを失う。
+- `fetch.workers` は(A)のproviderループと(B1)の本文のみpassの双方に効く。(B1)は`unfetched_resources`がresourceごとに1行を返すため、(A)が要する同一resourceの繰り延べを必要としない。
+- **`fail_interrupted_llm_runs()` はplanningではなく実行経路で呼ぶ。** `feedian ingest --dry-run` はplanningを`vault_write_lock`の外で行うため、planningが書き込むと、他プロセスが実行中の`llm_run`をdry-runが失敗へ書き換え得る。
+- ingestは `backend.summarize` だけをworkerへ出す。`start_llm_run`、`finish_llm_run`、`put_source_note`、fallbackの再計画（DBを読むため）はmain threadに残る。schedulerはglobal枠とbackend別枠の空きを確認した候補だけを投入し、executorのqueueへ積み上げない。**開始間隔（`min_start_interval_seconds`）もworkerではなくschedulerが守る。** workerで待つとFutureがRUNNINGなのに何も送っていない状態ができ、`Future.cancel()` が届かなくなるためである。schedulerの待機条件は「いずれかのFutureの完了、または最も早いbackend開始可能時刻」で、Futureが無いときも次の開始時刻まで待つ。空集合への `wait` は即座に返るためである。
+- backendごとの実効並列度は `min(llm.workers, capabilities.max_parallelism)` である。`openai-responses` と `manus-api` は8、`codex-local` と新規backendは1（`CODEX_HOME` を全実行で共有しており同時実行の安全性を確認していないため、宣言するまで直列で動かす）。1次backendとfallback backendはそれぞれ**実際に呼ぶbackend自身**の枠と間隔を通る。Manusの `MANUS_CREATE_INTERVAL_SECONDS`（6.1秒）はcapabilityとして宣言し、ingest経路では `_summarize_with_manus` のgateを迂回する。legacy export経路にschedulerは無いので現行どおりgateを使う。間隔はどの経路でもちょうど1回だけ強制される。
+- **課金へのcommit境界はFutureのRUNNING遷移であり、wire送信時刻ではない。** `cancel()` に成功したFutureはbackendを呼ばないので課金されず、対応する `llm_run` をmain threadが失敗終端する。`cancel()` に失敗したFutureは開始済みとして扱い、まだ送信していなくてもCtrl-C後に送られ得る。`ThreadPoolExecutor` はRUNNINGへ遷移させてからcallableを呼ぶため、この窓は必ず残る。窓に残るのはpayload組み立てだけで待機は無く、送られ得る件数はその時点のRUNNING Future数以下、すなわち利用者が選んだ並列度を超えない。`shutdown(cancel_futures=True)` はどのFutureをcancelしたか返さないため使わない。開始間隔が保証するのはscheduler投入時刻の間隔である。
+- main threadは、自分が開いた `llm_run` のうち監査結果を保存できなかったものを全て失敗終端してから `KeyboardInterrupt` を再送出する。`start_llm_run` とsubmitの間で中断されFutureを持たないrunも含む。強制終了で残った `running` は次回ingest開始時に `fail_interrupted_llm_runs()` が回収する。`vault_write_lock` の内側で呼ぶため、別processの有効なrunには触れない。
+- 並列度は対象ごとに別の設定を持つ。`fetch.workers`（本文取得、既定8）、`fetch.comment_workers`（Hatenaコメント、既定8）、`llm.workers`（ingest、既定8）。同一ホストへの同時取得は制限しない。通常のWebブラウザはHTML本文以外のリソースを同時に要求するため、8本は極端な数ではない。
 
 ## 本文取得の再試行抑制
 

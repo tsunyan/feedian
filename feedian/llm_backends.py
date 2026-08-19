@@ -11,6 +11,7 @@ from typing import Any, Callable, Protocol
 
 from .extract import PageFetchResult
 from .llm import (
+    MANUS_CREATE_INTERVAL_SECONDS,
     LLMAuthError,
     LLMProtocolError,
     LLMRateLimitError,
@@ -133,6 +134,7 @@ class ApiBackend:
         model_name: str,
         max_article_chars: int,
         usage_available: bool,
+        max_parallelism: int = 1,
         min_start_interval_seconds: float = 0.0,
     ) -> None:
         self.provider = provider
@@ -145,6 +147,7 @@ class ApiBackend:
             billing_mode="metered-api",
             max_article_chars=max_article_chars,
             usage_available=usage_available,
+            max_parallelism=max_parallelism,
             min_start_interval_seconds=min_start_interval_seconds,
         )
         self._api_key: str | None = None
@@ -193,6 +196,8 @@ class ApiBackend:
                 retry_base_seconds,
                 self.capabilities.max_article_chars,
                 provider=self.provider,
+                # The scheduler already waited out this backend's start interval.
+                pace_starts=False,
             )
         except LLMAuthError as exc:
             raise BackendAuthError(str(exc)) from exc
@@ -580,6 +585,7 @@ def get_backend(value: str) -> LLMBackend:
             model_name=os.environ.get("OPENAI_MODEL", "gpt-5.6-terra"),
             max_article_chars=10_000,
             usage_available=True,
+            max_parallelism=8,
         )
     if backend == "manus-api":
         return ApiBackend(
@@ -589,9 +595,11 @@ def get_backend(value: str) -> LLMBackend:
             model_name=os.environ.get("MANUS_MODEL", "manus-1.6"),
             max_article_chars=3_000,
             usage_available=False,
-            # Manus pacing lives in llm.py because the legacy export path shares
-            # that call; declaring it here too would make each create wait twice.
-            min_start_interval_seconds=0.0,
+            # Concurrency buys nothing on task creation, which this interval
+            # paces; it buys the window in which several created tasks are
+            # polled at once.
+            max_parallelism=8,
+            min_start_interval_seconds=MANUS_CREATE_INTERVAL_SECONDS,
         )
     if backend == "codex-local":
         return CodexLocalBackend()
