@@ -773,7 +773,7 @@ class ConcurrencyProbe(FakeBackend):
     """Records how many summarize calls overlap, and when each one started."""
 
     def __init__(self, *, max_parallelism: int = 8, min_start_interval_seconds: float = 0.0,
-                 hold: float = 0.02, **kwargs) -> None:
+                 hold: float = 0.02, barrier_parties: int | None = None, **kwargs) -> None:
         super().__init__(_Audit(), **kwargs)
         self.capabilities = replace(
             self.capabilities,
@@ -785,6 +785,11 @@ class ConcurrencyProbe(FakeBackend):
         self.starts: list[float] = []
         self._live = 0
         self._lock = threading.Lock()
+        # Holding each caller until the whole group arrives makes the peak the
+        # worker count exactly. Sleeping instead only usually overlaps: one call
+        # can finish before the last starts, which is how this passed locally
+        # and failed on CI.
+        self._barrier = threading.Barrier(barrier_parties, timeout=10) if barrier_parties else None
 
     def summarize(self, **kwargs):
         with self._lock:
@@ -792,7 +797,9 @@ class ConcurrencyProbe(FakeBackend):
             self.peak = max(self.peak, self._live)
             self.starts.append(time.monotonic())
         try:
-            if self.hold > 0:
+            if self._barrier is not None:
+                self._barrier.wait()
+            elif self.hold > 0:
                 time.sleep(self.hold)
             return super().summarize(**kwargs)
         finally:
@@ -821,7 +828,7 @@ def test_llm_workers_bounds_how_many_summaries_overlap(tmp_path, monkeypatch, wo
     root.mkdir()
     store = _vault_with_resources(root, 6)
     try:
-        backend = ConcurrencyProbe()
+        backend = ConcurrencyProbe(barrier_parties=workers)
         config = VaultConfig()
         config.llm.workers = workers
         report = ingest_source_notes(
