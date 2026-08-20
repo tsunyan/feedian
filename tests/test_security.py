@@ -375,6 +375,7 @@ class BrowserFallbackNetworkBoundaryTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.route_handler = None
                 self.web_socket_handler = None
+                self.init_scripts: list[str] = []
                 self.closed = False
 
             def route(self, _pattern, handler) -> None:
@@ -382,6 +383,9 @@ class BrowserFallbackNetworkBoundaryTests(unittest.TestCase):
 
             def route_web_socket(self, _pattern, handler) -> None:
                 self.web_socket_handler = handler
+
+            def add_init_script(self, script) -> None:
+                self.init_scripts.append(script)
 
             def new_page(self):
                 return FakePage(self)
@@ -405,6 +409,12 @@ class BrowserFallbackNetworkBoundaryTests(unittest.TestCase):
         web_socket.close.assert_called_once_with(
             code=1008, reason="WebSockets are disabled during page extraction."
         )
+        # WebRTC reaches STUN/TURN hosts without passing through route(), so
+        # the constructors must be gone before any page script runs.
+        self.assertEqual(len(fake_context.init_scripts), 1)
+        webrtc_script = fake_context.init_scripts[0]
+        for constructor in ("RTCPeerConnection", "webkitRTCPeerConnection", "mozRTCPeerConnection"):
+            self.assertIn(constructor, webrtc_script)
         self.assertTrue(fake_context.closed)
 
 

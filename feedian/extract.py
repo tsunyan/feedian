@@ -946,6 +946,16 @@ def resolve_content_url(url: str) -> str:
 _browser_runtime = None
 _browser = None
 
+_DISABLE_WEBRTC_SCRIPT = """
+for (const name of ['RTCPeerConnection', 'webkitRTCPeerConnection', 'mozRTCPeerConnection']) {
+  try {
+    Object.defineProperty(window, name, {value: undefined, configurable: false, writable: false});
+  } catch (error) {
+    // Already non-configurable in this frame; nothing further to remove.
+  }
+}
+"""
+
 
 def render_html_with_browser(
     url: str,
@@ -992,6 +1002,12 @@ def render_html_with_browser(
         "**/*",
         lambda web_socket: web_socket.close(code=1008, reason="WebSockets are disabled during page extraction."),
     )
+    # WebRTC is a third transport route() cannot see: ICE gathering reaches
+    # attacker-named STUN/TURN hosts over UDP/TCP directly. Article extraction
+    # never needs it, so the constructors are removed before any page script
+    # runs, in every frame of this context. Left undefined rather than throwing
+    # because that is the shape pages already handle as "no WebRTC here".
+    context.add_init_script(_DISABLE_WEBRTC_SCRIPT)
     try:
         response = page.goto(url, wait_until="domcontentloaded", timeout=policy.browser_timeout_seconds * 1000)
         if response is not None and response.status >= 400:

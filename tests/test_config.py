@@ -50,6 +50,14 @@ class FetchPolicyFromConfigTests(unittest.TestCase):
         self.assertIn("localhost", policy.network.allowed_private_hosts)
         self.assertIn("anything.internal", policy.network.allowed_private_hosts)
 
+    def test_allow_private_urls_must_be_a_json_boolean(self) -> None:
+        """bool("false") is True, so a coerced string would turn this flag's
+        only guard into "allow every private address"."""
+        for invalid in ("false", "true", 0, 1, None):
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(ValueError, "allow_private_urls must be true or false"):
+                    Config(vault_path="vault", allow_private_urls=invalid)
+
     def test_size_and_browser_timeout_defaults_match_vault_config(self) -> None:
         config = Config(vault_path="vault")
         vault_defaults = VaultConfig().fetch

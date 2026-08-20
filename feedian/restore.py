@@ -110,7 +110,10 @@ def _trusted_archive_sha256(vault_root: Path, tag: str) -> str:
         # git, rather than relying on git to fail on our behalf.
         raise ValueError("A non-empty tag is required to verify a restore.")
     try:
-        result = _run_git(vault_root, ["show", f"{tag}:.feedian/snapshot.json"])
+        # refs/tags/ and not the bare name: any revision expression would
+        # otherwise resolve, so `HEAD`, `@`, or a branch name would let a
+        # mutable ref stand in for the tag this anchor is defined as.
+        result = _run_git(vault_root, ["show", f"refs/tags/{tag}:.feedian/snapshot.json"])
     except RuntimeError as exc:
         raise RuntimeError(
             f"Could not read .feedian/snapshot.json at tag {tag!r}. "

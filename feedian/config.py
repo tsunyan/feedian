@@ -44,6 +44,11 @@ class Config:
         self.max_output_tokens = max(100, int(self.max_output_tokens))
         if self.openai_reasoning_effort not in {"none", "minimal", "low", "medium", "high", "xhigh", "max"}:
             raise ValueError("openai_reasoning_effort must be a supported reasoning effort.")
+        if not isinstance(self.allow_private_urls, bool):
+            # Coercing would make the JSON string "false" allow every private
+            # address, since bool("false") is True. This flag is the legacy
+            # CLI's only private-host guard, so a typo must fail the load.
+            raise ValueError("allow_private_urls must be true or false.")
         self.max_retries = max(0, min(int(self.max_retries), 5))
         self.retry_base_seconds = max(0.1, float(self.retry_base_seconds))
         self.request_timeout_seconds = max(1, int(self.request_timeout_seconds))

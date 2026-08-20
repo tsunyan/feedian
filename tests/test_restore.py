@@ -39,7 +39,7 @@ def _build_valid_archive(tmp_path: Path, *, name: str = "snapshot") -> tuple[Pat
 
 def _fake_show(tag: str, archive_sha256: str):
     def fake_run_git(_vault_root, args):
-        assert args == ["show", f"{tag}:.feedian/snapshot.json"]
+        assert args == ["show", f"refs/tags/{tag}:.feedian/snapshot.json"]
         payload = json.dumps({"archive": {"sha256": archive_sha256}})
         return subprocess.CompletedProcess(args, 0, stdout=payload, stderr="")
 
@@ -120,6 +120,28 @@ def test_restore_raises_valueerror_not_attributeerror_on_malformed_manifest(tmp_
 
     with pytest.raises(ValueError, match="missing archive.sha256"):
         restore_database(root, archive_path, "test-tag")
+
+
+def test_restore_resolves_the_anchor_only_through_refs_tags(tmp_path) -> None:
+    """A bare revision expression would let any mutable ref stand in for the
+    tag: `HEAD`, `@`, or a branch name all resolve for `git show <rev>:path`.
+    Pinning to refs/tags/ is what makes "the Git tag" mean the Git tag."""
+    root = tmp_path / "vault"
+    root.mkdir()
+    initialize_vault(root)
+    subprocess.run(["git", "init", "--quiet"], cwd=root, check=True, capture_output=True, text=True)
+    subprocess.run(["git", "config", "user.email", "t@example.invalid"], cwd=root, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "test"], cwd=root, check=True, capture_output=True)
+    (root / ".feedian" / "snapshot.json").write_text(
+        json.dumps({"archive": {"sha256": "0" * 64}}), encoding="utf-8"
+    )
+    subprocess.run(["git", "add", "-A"], cwd=root, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-q", "-m", "snapshot"], cwd=root, check=True, capture_output=True)
+    archive_path, _archive_sha256 = _build_valid_archive(tmp_path)
+
+    for revision in ("HEAD", "@"):
+        with pytest.raises(RuntimeError, match=r"Could not read \.feedian/snapshot\.json"):
+            restore_database(root, archive_path, revision)
 
 
 def test_restore_rejects_an_empty_tag_instead_of_reading_the_local_index(tmp_path) -> None:
