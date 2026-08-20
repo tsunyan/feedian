@@ -21,6 +21,16 @@
 - 処理順序は「provider出力の解析 → 許容された正規化 → canonical schema検証」である。正規化は前後空白の除去、型強制、長さと要素数の切り詰めだけを救済し、検証に失敗した結果はsource noteにも成功runにもならない。
 - source noteのfrontmatterは互換性のため`model`のみを維持する。backendの識別は`llm_run`監査記録で行う。
 
+## フェッチと復元の境界
+
+Webページ・RSS・Hatena exportの取得とsnapshot復元は、外部入力を保存領域へ入れる前に同じ境界で検証する。詳細な判断理由と受け入れた残存リスクは [フェッチ・設定・復元の境界強化](docs/specs/20260820-fetch-config-integrity-hardening.ja.md) を参照する。
+
+- urllibによるdirect fetchは、DNSが返した全アドレスを検証し、その同じaddrinfo集合だけを使って接続する。環境変数由来のproxyは使わない。Vault設定の`fetch.allow_private_hosts`は正規化したhost単位の許可リストであり、1ホストの許可を他のprivate addressへ広げない。
+- page fetchのHTML・documentサイズ上限とHTTP・browser timeoutは`FetchPolicy`へまとめ、syncの全取得へ同じpolicyを渡す。RSSは接続安全性の`NetworkPolicy`だけを共有し、30秒timeoutと10 MiB XML上限を維持する。legacy CLIの`Config.allow_private_urls`は互換性のため全面フラグのまま専用adapterで扱う。
+- Browser fallbackはrequestごとにURLを再検証する。contextではService Workerを無効化し、popupを含む全pageのHTTP通信を同じrouteで検証する。記事抽出に不要なWebSocketは接続前に閉じる。Chromium内部の名前解決と検証の間のTOCTOUは残存リスクとして受け入れる。
+- restoreはlocal archiveの場合もGit tagを必須とし、tagに記録された`.feedian/snapshot.json`のarchive SHA-256と一致するまで展開しない。Releaseから取得する場合はoriginからtagをfetchした後、同じ検証経路へ入る。archive内のDB checksumとSQLite integrity checkも引き続き行う。
+- Vault configのprovider・RSS feedの`enabled`はJSON booleanだけを受理する。文字列や整数を`bool(...)`で暗黙変換しない。
+
 ## Syncのモード
 
 `feedian sync`はquickとfullの2モードを持ち、**CLIの既定はquick**である。判断理由と却下した代替案は [syncのquickモード](docs/specs/20260818-sync-quick-mode.ja.md) を参照する。

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import warnings
-from unittest.mock import ANY, patch
+from unittest.mock import patch
 from urllib.error import HTTPError
 
 from feedian.extract import _ValidatingHTTPHandler, _ValidatingHTTPSHandler

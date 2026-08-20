@@ -958,7 +958,12 @@ def render_html_with_browser(
 
         _browser_runtime = sync_playwright().start()
         _browser = _browser_runtime.chromium.launch(headless=True)
-    page = _browser.new_page(locale="ja-JP")
+    # page.route() alone does not see requests handled by Service Workers or
+    # the first navigation of a popup. A dedicated context lets one route cover
+    # every page in this render, while blocking Service Workers closes their
+    # separate network path entirely.
+    context = _browser.new_context(locale="ja-JP", service_workers="block")
+    page = context.new_page()
 
     def route_request(route) -> None:
         request = route.request
@@ -979,7 +984,14 @@ def render_html_with_browser(
             return
         route.continue_()
 
-    page.route("**/*", route_request)
+    context.route("**/*", route_request)
+    # Article extraction does not need WebSockets. page.route()/context.route()
+    # do not intercept them, so block the separate transport before navigation
+    # instead of leaving an unchecked path to private hosts.
+    context.route_web_socket(
+        "**/*",
+        lambda web_socket: web_socket.close(code=1008, reason="WebSockets are disabled during page extraction."),
+    )
     try:
         response = page.goto(url, wait_until="domcontentloaded", timeout=policy.browser_timeout_seconds * 1000)
         if response is not None and response.status >= 400:
@@ -989,7 +1001,7 @@ def render_html_with_browser(
         validate_fetch_url(final_url, allowed_private_hosts=policy.network.allowed_private_hosts)
         return page.content(), final_url, page.title()
     finally:
-        page.close()
+        context.close()
 
 
 def close_browser() -> None:

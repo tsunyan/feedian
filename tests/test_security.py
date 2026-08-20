@@ -305,10 +305,14 @@ class PlainHttpAndProxyTests(unittest.TestCase):
         self.assertEqual(proxy_handlers[0].proxies, {})
 
 
-class BrowserFallbackNoCacheTests(unittest.TestCase):
-    """Spec 20260820: `_validated_browser_hosts` was a permanent cache that
-    skipped revalidation for a host already seen. It is removed entirely, so
-    every page.route() callback revalidates, even for a repeated host."""
+class BrowserFallbackNetworkBoundaryTests(unittest.TestCase):
+    """Spec 20260820 plus review 20260820-1: every browser transport is bounded.
+
+    `_validated_browser_hosts` was a permanent cache that skipped revalidation
+    for a host already seen. It is removed entirely, and the route now belongs
+    to a Service-Worker-free context so popup requests are covered too.
+    WebSockets use a separate Playwright route and are disabled.
+    """
 
     def setUp(self) -> None:
         import feedian.extract as extract_module
@@ -340,18 +344,18 @@ class BrowserFallbackNoCacheTests(unittest.TestCase):
         class FakeResponse:
             status = 200
 
-        class FakePage:
-            def __init__(self) -> None:
-                self._handler = None
+        web_socket = Mock()
 
-            def route(self, _pattern, handler) -> None:
-                self._handler = handler
+        class FakePage:
+            def __init__(self, context) -> None:
+                self._context = context
 
             def goto(self, target_url, wait_until, timeout):
+                self._context.web_socket_handler(web_socket)
                 # The same host requested twice in one render: a permanent
                 # cache would only validate it once.
-                self._handler(FakeRoute(FakeRequest(target_url)))
-                self._handler(FakeRoute(FakeRequest(target_url)))
+                self._context.route_handler(FakeRoute(FakeRequest(target_url)))
+                self._context.route_handler(FakeRoute(FakeRequest(target_url)))
                 return FakeResponse()
 
             def wait_for_timeout(self, _ms) -> None:
@@ -367,11 +371,27 @@ class BrowserFallbackNoCacheTests(unittest.TestCase):
             def title(self) -> str:
                 return "Title"
 
+        class FakeContext:
+            def __init__(self) -> None:
+                self.route_handler = None
+                self.web_socket_handler = None
+                self.closed = False
+
+            def route(self, _pattern, handler) -> None:
+                self.route_handler = handler
+
+            def route_web_socket(self, _pattern, handler) -> None:
+                self.web_socket_handler = handler
+
+            def new_page(self):
+                return FakePage(self)
+
             def close(self) -> None:
-                pass
+                self.closed = True
 
         fake_browser = Mock()
-        fake_browser.new_page.return_value = FakePage()
+        fake_context = FakeContext()
+        fake_browser.new_context.return_value = fake_context
         self._extract_module._browser = fake_browser
         self._extract_module._browser_runtime = Mock()
 
@@ -381,6 +401,11 @@ class BrowserFallbackNoCacheTests(unittest.TestCase):
         # Two identical in-page requests plus the final-URL check: three
         # separate validations, none of them skipped by a cache.
         self.assertEqual(validate.call_count, 3)
+        fake_browser.new_context.assert_called_once_with(locale="ja-JP", service_workers="block")
+        web_socket.close.assert_called_once_with(
+            code=1008, reason="WebSockets are disabled during page extraction."
+        )
+        self.assertTrue(fake_context.closed)
 
 
 class BrowserCandidateTests(unittest.TestCase):
