@@ -77,7 +77,9 @@ class FetchPolicy:
 
 **`allow_private_hosts`の入力検証。** `config.fetch["allow_private_hosts"]`はJSON array of stringのみ許可する。要素はtrimして小文字化し、空文字は拒否、重複は除去する(`terminal_failure_kinds`(`feedian/vault.py:529-531`)と同じ形の検証)。文字列1個をそのまま渡すような入力(例: `"allow_private_hosts": "localhost"`)は拒否し、`frozenset(value)`のような文字ごとの分解を起こさせない。
 
-**判定方式。** `allow_private_urls: bool`という全面許可フラグは残さない。検証関数は`allowed_private_hosts: frozenset[str]`を受け取り、**解決前のhostname文字列(正規化済み)がこの集合に含まれる場合のみ**、privateアドレスチェックをその1ホストに限りスキップする。1ホストを許可しても他の全private IPを許可しないよう、集合要素ごとの一致で判定する。
+**判定方式。** `VaultConfig`(`sync.py`・RSS fetch)の経路では`allow_private_urls: bool`という全面許可フラグは残さない。検証関数は`allowed_private_hosts: frozenset[str]`を受け取り、**解決前のhostname文字列(正規化済み)がこの集合に含まれる場合のみ**、privateアドレスチェックをその1ホストに限りスキップする。1ホストを許可しても他の全private IPを許可しないよう、集合要素ごとの一致で判定する。
+
+**legacy `Config`(`feedian/config.py`)経路は対象外とし、全面フラグを維持する。** `feedian/__main__.py`はCOMMANDSに載らない別のCLIモード(`--source hatena`等)を持ち、`feedian/config.py`の`Config`(`VaultConfig`とは別のdataclass)を使って`fetch_page_text`を4箇所(`__main__.py:639,843,900,1340`)から直接呼んでいる。`Config.allow_private_urls: bool`はhost単位ではない全面許可フラグであり、`NetworkPolicy`の設計とは相容れない。この経路専用に、`Config`から`FetchPolicy`を組み立てる小さなアダプタ(`allow_private_urls=True`なら全アドレスを許可する`NetworkPolicy`相当の扱いとする)を設け、既存のCLI挙動を変えない。新しい`VaultConfig.fetch["allow_private_hosts"]`の設計をこのアダプタへ拡張することはしない。詳細は改訂2を参照。
 
 ### C. restore検証をGit tagの値へ固定する
 
@@ -233,6 +235,26 @@ def _validated_create_connection(address, timeout, source_address, *, allowed_pr
 **理由。** 改訂前のコードは検証済みaddrinfoから`sockaddr[:2]`(host, port)だけを取り出し、`socket.create_connection(sockaddr[:2], ...)`へ渡していた。ところが`socket.create_connection`自体が内部で`host, port = address`のあと`getaddrinfo(host, port, 0, SOCK_STREAM)`を再実行する。渡している`host`は既に数値IPであるためネットワーク越しのDNS問い合わせには発展せずSSRF上の実害はないが、A節が明記した「接続は検証済みaddrinfo集合の中だけで試み、hostnameを再解決しない」という設計原則と実装が食い違っていた。加えて`sockaddr[:2]`への切り詰めはIPv6の`(address, port, flowinfo, scope_id)`4要素タプルから`flowinfo`/`scope_id`を失わせる、独立した正確性の問題だった。改訂後は、最初の1回の`getaddrinfo`が返した`family`/`socktype`/`proto`/`sockaddr`をそのまま使って`socket.socket(...)`を生成し`connect(sockaddr)`する、CPython自身の`socket.create_connection`と同じ構造に置き換え、`getaddrinfo`の再実行と`sockaddr`の切り詰めを両方なくした。
 
 **評価の経緯。** レビュー6(ChatGPT)がA節のコード例と検証項目2の不一致を指摘し、標準ライブラリの`socket.create_connection`のソースを実際に確認した(`python -c "import socket, inspect; print(inspect.getsource(socket.create_connection))"`)ところ、`for res in getaddrinfo(host, port, 0, SOCK_STREAM):`という再実行が実在した。レビュー7(Claude Code)で採用と判断し、本改訂で最終案へ反映した。
+
+### 改訂2 — Claude Code (2026-08-20)
+
+**該当箇所:** B節の「判定方式」段落。
+
+**(前)**
+
+> **判定方式。** `allow_private_urls: bool`という全面許可フラグは残さない。検証関数は`allowed_private_hosts: frozenset[str]`を受け取り、**解決前のhostname文字列(正規化済み)がこの集合に含まれる場合のみ**、privateアドレスチェックをその1ホストに限りスキップする。1ホストを許可しても他の全private IPを許可しないよう、集合要素ごとの一致で判定する。
+
+**(後)**
+
+> **判定方式。** `VaultConfig`(`sync.py`・RSS fetch)の経路では`allow_private_urls: bool`という全面許可フラグは残さない。検証関数は`allowed_private_hosts: frozenset[str]`を受け取り、**解決前のhostname文字列(正規化済み)がこの集合に含まれる場合のみ**、privateアドレスチェックをその1ホストに限りスキップする。1ホストを許可しても他の全private IPを許可しないよう、集合要素ごとの一致で判定する。
+>
+> **legacy `Config`(`feedian/config.py`)経路は対象外とし、全面フラグを維持する。** `feedian/__main__.py`はCOMMANDSに載らない別のCLIモード(`--source hatena`等)を持ち、`feedian/config.py`の`Config`(`VaultConfig`とは別のdataclass)を使って`fetch_page_text`を4箇所(`__main__.py:639,843,900,1340`)から直接呼んでいる。`Config.allow_private_urls: bool`はhost単位ではない全面許可フラグであり、`NetworkPolicy`の設計とは相容れない。この経路専用に、`Config`から`FetchPolicy`を組み立てる小さなアダプタ(`allow_private_urls=True`なら全アドレスを許可する`NetworkPolicy`相当の扱いとする)を設け、既存のCLI挙動を変えない。新しい`VaultConfig.fetch["allow_private_hosts"]`の設計をこのアダプタへ拡張することはしない。
+
+**理由。** 実装着手前に`fetch_page_text`の全呼び出し元を`grep`で洗い出したところ、B節が想定していなかった第4の経路が見つかった。`feedian/cli.py`の`COMMANDS`(`init`/`sync`/`restore`等)とは別に、`feedian/__main__.py`は`feedian/config.py`の`Config`という別系統のdataclassを使う旧来のCLIモード(引数`--source hatena`等、`is_modern_command`が偽と判定する経路)を持ち続けており、そこから`fetch_page_text`を直接呼んでいた。`Config.allow_private_urls: bool`は`VaultConfig.fetch["allow_private_hosts"]`と異なり、private/localアドレスへの接続を丸ごと許可するかどうかの単純な真偽値であり、host単位の許可リストという概念を持たない。B節はこの経路の存在を見落としたまま「全面許可フラグは残さない」と無条件に書いていたが、`fetch_page_text`のシグネチャを`policy: FetchPolicy`のみを受け取る形に変えると、この4箇所は確実に壊れる。
+
+要件所有者の判断(2026-08-20)により、legacy経路に限り全面フラグを温存し、新規のVaultConfig系統には拡張しないことにした。理由は、この経路がローカルでの単発処理・移行前の後方互換用であり、影響範囲を広げてまで統一する必要がないためである。
+
+**評価の経緯。** implementerへ委譲する前に、`grep -rn "fetch_page_text(" feedian/*.py`で全呼び出し元を確認し、`__main__.py:639,843,900,1340`が`feedian/config.py`の`Config`経由であることを特定した。ユーザーへ選択肢を提示し、「legacy経路に限り全面フラグを温存する」という回答を得た。
 
 ## 草案
 
