@@ -360,6 +360,29 @@ class MainTests(unittest.TestCase):
         self.assertIn("Page reply", comments_text)
         self.assertIn("Hatena voice", comments_text)
 
+    def test_process_hatena_export_passes_allow_private_urls_through_as_a_fetch_policy(self) -> None:
+        """Spec 20260820-fetch-config-integrity-hardening, 改訂2: the legacy CLI
+        path keeps Config.allow_private_urls as an all-or-nothing flag, adapted
+        into a FetchPolicy rather than a bare bool."""
+        atom = """<feed xmlns="http://www.w3.org/2005/Atom"><entry><title>Hatena item</title>
+<link rel="related" href="https://example.com/hatena" /></entry></feed>"""
+        captured_kwargs: dict[str, object] = {}
+
+        def fake_fetch(url, **kwargs):
+            captured_kwargs.update(kwargs)
+            return PageFetchResult(url=url, text="Main article")
+
+        with TemporaryDirectory() as temp_dir:
+            export_path = Path(temp_dir) / "hatena.atom"
+            export_path.write_text(atom, encoding="utf-8")
+            config = Config(vault_path=temp_dir, sleep_seconds=0, allow_private_urls=False)
+            args = parse_args(["--source", "hatena", "--input", str(export_path), "--no-llm"])
+            with patch("feedian.__main__.fetch_page_text", side_effect=fake_fetch):
+                process_hatena_export(config, args)
+
+        policy = captured_kwargs["policy"]
+        self.assertNotIn("anything.internal", policy.network.allowed_private_hosts)
+
     def test_existing_note_for_item_prefers_the_newest_llm_summary(self) -> None:
         with TemporaryDirectory() as temp_dir:
             path = Path(temp_dir)
@@ -768,6 +791,31 @@ class MainTests(unittest.TestCase):
         summarize.assert_not_called()
         self.assertFalse((Path(temp_dir) / "Raindrop").exists())
 
+    def test_process_bookmarks_passes_allow_private_urls_through_as_a_fetch_policy(self) -> None:
+        """Spec 20260820-fetch-config-integrity-hardening, 改訂2: the legacy CLI
+        path keeps Config.allow_private_urls as an all-or-nothing flag, adapted
+        into a FetchPolicy rather than a bare bool."""
+        items = [{"_id": 1, "title": "First", "link": "https://example.com/first", "collection": {}}]
+        page = PageFetchResult(url=items[0]["link"], text="body", title="", error=None)
+        captured_kwargs: dict[str, object] = {}
+
+        def fake_fetch(url, **kwargs):
+            captured_kwargs.update(kwargs)
+            return page
+
+        with TemporaryDirectory() as temp_dir:
+            config = Config(vault_path=temp_dir, sleep_seconds=0, allow_private_urls=True)
+            args = parse_args(["--no-llm"])
+            with (
+                patch.dict(os.environ, {"RAINDROP_TOKEN": "token"}, clear=True),
+                patch("feedian.__main__.RaindropClient.iter_raindrops", return_value=iter(items)),
+                patch("feedian.__main__.fetch_page_text", side_effect=fake_fetch),
+            ):
+                process_bookmarks(config, args)
+
+        policy = captured_kwargs["policy"]
+        self.assertIn("anything.internal", policy.network.allowed_private_hosts)
+
     def test_estimate_uses_raindrop_and_page_fetch_without_openai_or_writes(self) -> None:
         items = [{"_id": 1, "title": "First", "link": "https://example.com/first", "collection": {}}]
         page = PageFetchResult(url=items[0]["link"], text="Example page text.", title="Example", error=None)
@@ -798,6 +846,32 @@ class MainTests(unittest.TestCase):
         self.assertIn("phase=calculating-costs", output.getvalue())
         self.assertIn("price_source=official", output.getvalue())
         self.assertIn("assumed_output_tokens=10 (input-matched)", output.getvalue())
+
+    def test_estimate_passes_allow_private_urls_through_as_a_fetch_policy(self) -> None:
+        """Spec 20260820-fetch-config-integrity-hardening, 改訂2: the legacy CLI
+        path keeps Config.allow_private_urls as an all-or-nothing flag, adapted
+        into a FetchPolicy rather than a bare bool."""
+        items = [{"_id": 1, "title": "First", "link": "https://example.com/first", "collection": {}}]
+        captured_kwargs: dict[str, object] = {}
+
+        def fake_fetch(url, **kwargs):
+            captured_kwargs.update(kwargs)
+            return PageFetchResult(url=url, text="Example page text.", title="Example", error=None)
+
+        with TemporaryDirectory() as temp_dir:
+            config = Config(vault_path=temp_dir, sleep_seconds=0, allow_private_urls=True)
+            args = parse_args(["--estimate", "--estimate-sample-size", "1"])
+            with (
+                patch.dict(os.environ, {"RAINDROP_TOKEN": "token"}, clear=True),
+                patch("feedian.__main__.RaindropClient.iter_raindrops", return_value=iter(items)),
+                patch("feedian.__main__.fetch_page_text", side_effect=fake_fetch),
+                patch("feedian.__main__.count_prompt_tokens", return_value=(10, None)),
+                redirect_stdout(StringIO()),
+            ):
+                estimate_bookmarks(config, args)
+
+        policy = captured_kwargs["policy"]
+        self.assertIn("anything.internal", policy.network.allowed_private_hosts)
 
     def test_estimate_counts_the_shared_developer_instructions(self) -> None:
         items = [{"_id": 1, "title": "First", "link": "https://example.com/first", "collection": {}}]

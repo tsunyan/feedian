@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+import functools
 from io import BytesIO
 import ipaddress
 import re
@@ -9,10 +10,18 @@ import ssl
 from dataclasses import dataclass
 from html import unescape
 from html.parser import HTMLParser
+from http.client import HTTPConnection, HTTPSConnection
 from typing import Iterable
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlparse, urlunparse
-from urllib.request import HTTPSHandler, HTTPRedirectHandler, Request, build_opener
+from urllib.request import (
+    HTTPHandler,
+    HTTPRedirectHandler,
+    HTTPSHandler,
+    ProxyHandler,
+    Request,
+    build_opener,
+)
 
 from charset_normalizer import from_bytes
 from lxml import html as lxml_html
@@ -21,9 +30,9 @@ from trafilatura import extract as extract_main_text
 from trafilatura import extract_metadata, html2txt
 from w3lib.encoding import html_to_unicode
 
+from .vault import FetchPolicy
 
-MAX_HTML_BYTES = 10 * 1024 * 1024
-MAX_DOCUMENT_BYTES = 100 * 1024 * 1024
+
 MIN_HIGH_CONFIDENCE_CHARS = 200
 
 
@@ -77,8 +86,7 @@ class BrowserCandidate:
 
     kind: str
     fetch_url: str
-    allow_private_urls: bool
-    timeout_seconds: int
+    policy: FetchPolicy
     initial_error: str = ""
     fetch: _HtmlFetch | None = None
 
@@ -108,13 +116,13 @@ class UnresolvableHostError(ValueError):
 
 
 class SafeRedirectHandler(HTTPRedirectHandler):
-    def __init__(self, allow_private_urls: bool) -> None:
+    def __init__(self, allowed_private_hosts: frozenset[str]) -> None:
         super().__init__()
-        self.allow_private_urls = allow_private_urls
+        self.allowed_private_hosts = allowed_private_hosts
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         destination = urljoin(req.full_url, newurl)
-        validate_fetch_url(destination, allow_private_urls=self.allow_private_urls)
+        validate_fetch_url(destination, allowed_private_hosts=self.allowed_private_hosts)
         # Python 3.12's urllib follows 307 but does not recognize 308. Both
         # preserve the request method, so treat 308 as 307 after validating
         # the destination. Feedian only issues GET/HEAD content requests.
@@ -124,6 +132,103 @@ class SafeRedirectHandler(HTTPRedirectHandler):
     # urllib does not dispatch 308 responses to HTTPRedirectHandler on the
     # supported Python version. Reuse its loop detection and Location parsing.
     http_error_308 = HTTPRedirectHandler.http_error_302
+
+
+def _validated_create_connection(address, timeout, source_address, *, allowed_private_hosts):
+    """A drop-in for HTTPConnection's `_create_connection` that pins DNS.
+
+    getaddrinfo runs exactly once. Every address it returns is checked, and if
+    any is non-public the whole attempt is rejected (unless the hostname is in
+    allowed_private_hosts); connecting is then tried only within that same
+    validated address set, so the hostname is never re-resolved between the
+    check and the connect. socket.create_connection is not used: it would
+    re-run getaddrinfo internally. See docs/specs/20260820-fetch-config-integrity-hardening.ja.md.
+    """
+    host, port = address
+    infos = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+    if host.lower() not in allowed_private_hosts:
+        for *_, sockaddr in infos:
+            candidate = ipaddress.ip_address(sockaddr[0].split("%", 1)[0])
+            if not candidate.is_global:
+                raise ValueError(f"non-public address is not allowed: {candidate}")
+    last_error: Exception | None = None
+    for family, socktype, proto, _, sockaddr in infos:
+        sock = None
+        try:
+            sock = socket.socket(family, socktype, proto)
+            if timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
+                sock.settimeout(timeout)
+            if source_address:
+                sock.bind(source_address)
+            sock.connect(sockaddr)
+            return sock
+        except OSError as exc:
+            last_error = exc
+            if sock is not None:
+                sock.close()
+    raise last_error or OSError("getaddrinfo returned an empty list")
+
+
+class _ValidatingHTTPConnection(HTTPConnection):
+    """HTTPConnection that only ever connects to the addresses it validated.
+
+    connect() itself is left untouched; only the low-level socket factory is
+    swapped, so TCP_NODELAY, tunnel handling and the rest of
+    HTTPConnection.connect() still run exactly as the standard library wrote
+    them.
+    """
+
+    def __init__(self, host, *, allowed_private_hosts: frozenset[str], **kwargs) -> None:
+        super().__init__(host, **kwargs)
+        self._create_connection = functools.partial(
+            _validated_create_connection, allowed_private_hosts=allowed_private_hosts
+        )
+
+
+class _ValidatingHTTPSConnection(HTTPSConnection):
+    """The HTTPS counterpart to _ValidatingHTTPConnection.
+
+    HTTPSConnection.connect() calls super().connect() before wrapping the
+    socket in TLS, so the same `_create_connection` swap secures the TLS path
+    without touching SNI or `_tunnel_host` handling.
+    """
+
+    def __init__(self, host, *, allowed_private_hosts: frozenset[str], **kwargs) -> None:
+        super().__init__(host, **kwargs)
+        self._create_connection = functools.partial(
+            _validated_create_connection, allowed_private_hosts=allowed_private_hosts
+        )
+
+
+class _ValidatingHTTPHandler(HTTPHandler):
+    """The plain-http:// counterpart to build_opener's default HTTPHandler.
+
+    build_opener silently adds an unvalidated HTTPHandler unless one is passed
+    explicitly. Without this, http:// requests would bypass the pinned
+    connection entirely while https:// ones were protected.
+    """
+
+    def __init__(self, *, allowed_private_hosts: frozenset[str]) -> None:
+        super().__init__()
+        self._allowed_private_hosts = allowed_private_hosts
+
+    def http_open(self, req):
+        connection_class = functools.partial(
+            _ValidatingHTTPConnection, allowed_private_hosts=self._allowed_private_hosts
+        )
+        return self.do_open(connection_class, req)
+
+
+class _ValidatingHTTPSHandler(HTTPSHandler):
+    def __init__(self, *, context: ssl.SSLContext, allowed_private_hosts: frozenset[str]) -> None:
+        super().__init__(context=context)
+        self._allowed_private_hosts = allowed_private_hosts
+
+    def https_open(self, req):
+        connection_class = functools.partial(
+            _ValidatingHTTPSConnection, allowed_private_hosts=self._allowed_private_hosts
+        )
+        return self.do_open(connection_class, req, context=self._context)
 
 
 class TextExtractor(HTMLParser):
@@ -246,12 +351,10 @@ class TextExtractor(HTMLParser):
 
 def fetch_page_text(
     url: str,
-    timeout_seconds: int,
+    policy: FetchPolicy,
     max_chars: int,
-    allow_private_urls: bool = False,
     etag: str = "",
     last_modified: str = "",
-    browser_timeout_seconds: int = 30,
     allow_browser: bool = True,
 ) -> PageFetchResult:
     # max_chars remains in the public call signature for compatibility. Extracted
@@ -259,7 +362,7 @@ def fetch_page_text(
     _ = max_chars
     fetch_url = resolve_content_url(url)
     try:
-        validate_fetch_url(fetch_url, allow_private_urls=allow_private_urls)
+        validate_fetch_url(fetch_url, allowed_private_hosts=policy.network.allowed_private_hosts)
     except ValueError as exc:
         failure_kind = "dns" if isinstance(exc, UnresolvableHostError) else None
         return PageFetchResult(url=url, text="", error=f"blocked URL: {exc}", failure_kind=failure_kind)
@@ -279,11 +382,16 @@ def fetch_page_text(
     )
     try:
         context = ssl.create_default_context()
-        opener = build_opener(HTTPSHandler(context=context), SafeRedirectHandler(allow_private_urls))
-        with opener.open(request, timeout=timeout_seconds) as response:
+        opener = build_opener(
+            _ValidatingHTTPHandler(allowed_private_hosts=policy.network.allowed_private_hosts),
+            _ValidatingHTTPSHandler(context=context, allowed_private_hosts=policy.network.allowed_private_hosts),
+            SafeRedirectHandler(policy.network.allowed_private_hosts),
+            ProxyHandler({}),
+        )
+        with opener.open(request, timeout=policy.timeout_seconds) as response:
             content_type = response.headers.get("Content-Type", "")
             is_html = "text/html" in content_type or "application/xhtml" in content_type
-            limit = MAX_HTML_BYTES if is_html else MAX_DOCUMENT_BYTES
+            limit = policy.html_max_bytes if is_html else policy.document_max_bytes
             raw = response.read(limit + 1)
             try:
                 response_headers = {str(key): str(value) for key, value in response.headers.items()}
@@ -311,8 +419,7 @@ def fetch_page_text(
             pending = BrowserCandidate(
                 kind="http-error",
                 fetch_url=fetch_url,
-                allow_private_urls=allow_private_urls,
-                timeout_seconds=browser_timeout_seconds,
+                policy=policy,
                 initial_error=f"HTTP {exc.code}",
             )
             if not allow_browser:
@@ -335,7 +442,7 @@ def fetch_page_text(
         return PageFetchResult(
             url=url,
             text="",
-            error=f"document exceeds {MAX_DOCUMENT_BYTES} byte safety limit",
+            error=f"document exceeds {policy.document_max_bytes} byte safety limit",
             final_url=final_url,
             media_type=content_type,
             response_headers=response_headers,
@@ -344,7 +451,7 @@ def fetch_page_text(
         )
     truncated = too_large
     if is_html:
-        raw = raw[:MAX_HTML_BYTES]
+        raw = raw[: policy.html_max_bytes]
     if "application/pdf" in content_type.lower():
         result = extract_stored_payload(raw, final_url, content_type)
         result.url = url
@@ -375,7 +482,7 @@ def fetch_page_text(
             extraction_method="plain-text",
             content_encoding=encoding,
             content_truncated=truncated,
-            error="HTML download truncated at 10 MiB" if truncated else None,
+            error=f"HTML download truncated at {policy.html_max_bytes} bytes" if truncated else None,
             final_url=final_url,
             media_type=content_type,
             response_headers=response_headers,
@@ -397,7 +504,7 @@ def fetch_page_text(
         parts=http_parts,
     )
     if not should_render_with_browser(http_parts.text, decoded, http_parts.title):
-        return _merge_html_result(fetch)
+        return _merge_html_result(fetch, policy=policy)
     if not allow_browser:
         # playwright's sync API is bound to the thread that started it, so a
         # worker hands the render back rather than running it. The tail is left
@@ -405,22 +512,20 @@ def fetch_page_text(
         # what the browser text is later compared against.
         return _merge_html_result(
             fetch,
+            policy=policy,
             pending=BrowserCandidate(
                 kind="low-quality",
                 fetch_url=fetch_url,
-                allow_private_urls=allow_private_urls,
-                timeout_seconds=browser_timeout_seconds,
+                policy=policy,
                 fetch=fetch,
             ),
         )
-    rendered, browser_error = _render_for_merge(
-        fetch_url, timeout_seconds=browser_timeout_seconds, allow_private_urls=allow_private_urls
-    )
-    return _merge_html_result(fetch, rendered=rendered, browser_error=browser_error)
+    rendered, browser_error = _render_for_merge(fetch_url, policy=policy)
+    return _merge_html_result(fetch, policy=policy, rendered=rendered, browser_error=browser_error)
 
 
 def _render_for_merge(
-    fetch_url: str, *, timeout_seconds: int, allow_private_urls: bool
+    fetch_url: str, *, policy: FetchPolicy
 ) -> tuple[tuple[str, str, str] | None, str | None]:
     """Render one page, reporting failure instead of raising.
 
@@ -428,12 +533,7 @@ def _render_for_merge(
     caller keeps that body and only appends the reason to the warning.
     """
     try:
-        return (
-            render_html_with_browser(
-                fetch_url, timeout_seconds=timeout_seconds, allow_private_urls=allow_private_urls
-            ),
-            None,
-        )
+        return (render_html_with_browser(fetch_url, policy=policy), None)
     except Exception as exc:
         return None, str(exc)
 
@@ -441,6 +541,7 @@ def _render_for_merge(
 def _merge_html_result(
     fetch: _HtmlFetch,
     *,
+    policy: FetchPolicy,
     rendered: tuple[str, str, str] | None = None,
     browser_error: str | None = None,
     pending: BrowserCandidate | None = None,
@@ -478,7 +579,7 @@ def _merge_html_result(
 
     warning: str | None = None
     if fetch.truncated:
-        warning = "HTML download truncated at 10 MiB"
+        warning = f"HTML download truncated at {policy.html_max_bytes} bytes"
     if not best_text:
         warning = "no extractable text found"
         if browser_error:
@@ -522,8 +623,7 @@ def complete_browser_fallback(page: PageFetchResult) -> PageFetchResult:
             return fetch_page_text_with_browser(
                 original_url=page.url,
                 fetch_url=pending.fetch_url,
-                timeout_seconds=pending.timeout_seconds,
-                allow_private_urls=pending.allow_private_urls,
+                policy=pending.policy,
                 initial_error=pending.initial_error,
             )
         except Exception as exc:
@@ -537,26 +637,20 @@ def complete_browser_fallback(page: PageFetchResult) -> PageFetchResult:
         # Not an assert: python -O strips those, and the merge would then read
         # attributes off None instead of saying what went wrong.
         raise ValueError(f"Unsupported browser candidate: {pending.kind}")
-    rendered, browser_error = _render_for_merge(
-        pending.fetch_url,
-        timeout_seconds=pending.timeout_seconds,
-        allow_private_urls=pending.allow_private_urls,
-    )
-    return _merge_html_result(pending.fetch, rendered=rendered, browser_error=browser_error)
+    rendered, browser_error = _render_for_merge(pending.fetch_url, policy=pending.policy)
+    return _merge_html_result(pending.fetch, policy=pending.policy, rendered=rendered, browser_error=browser_error)
 
 
 def fetch_page_text_with_browser(
     *,
     original_url: str,
     fetch_url: str,
-    timeout_seconds: int,
-    allow_private_urls: bool,
+    policy: FetchPolicy,
     initial_error: str,
 ) -> PageFetchResult:
     rendered_html, rendered_url, rendered_title = render_html_with_browser(
         fetch_url,
-        timeout_seconds=timeout_seconds,
-        allow_private_urls=allow_private_urls,
+        policy=policy,
     )
     parts = extract_page_parts(rendered_html, rendered_url)
     text, title, method = parts.text, parts.title, parts.method
@@ -851,14 +945,22 @@ def resolve_content_url(url: str) -> str:
 
 _browser_runtime = None
 _browser = None
-_validated_browser_hosts: set[tuple[str, bool]] = set()
+
+_DISABLE_WEBRTC_SCRIPT = """
+for (const name of ['RTCPeerConnection', 'webkitRTCPeerConnection', 'mozRTCPeerConnection']) {
+  try {
+    Object.defineProperty(window, name, {value: undefined, configurable: false, writable: false});
+  } catch (error) {
+    // Already non-configurable in this frame; nothing further to remove.
+  }
+}
+"""
 
 
 def render_html_with_browser(
     url: str,
     *,
-    timeout_seconds: int,
-    allow_private_urls: bool,
+    policy: FetchPolicy,
 ) -> tuple[str, str, str]:
     global _browser_runtime, _browser
     if _browser is None:
@@ -866,7 +968,12 @@ def render_html_with_browser(
 
         _browser_runtime = sync_playwright().start()
         _browser = _browser_runtime.chromium.launch(headless=True)
-    page = _browser.new_page(locale="ja-JP")
+    # page.route() alone does not see requests handled by Service Workers or
+    # the first navigation of a popup. A dedicated context lets one route cover
+    # every page in this render, while blocking Service Workers closes their
+    # separate network path entirely.
+    context = _browser.new_context(locale="ja-JP", service_workers="block")
+    page = context.new_page()
 
     def route_request(route) -> None:
         request = route.request
@@ -877,27 +984,40 @@ def render_html_with_browser(
         if parsed.scheme in {"data", "blob", "about"}:
             route.continue_()
             return
-        host_key = (f"{parsed.scheme}://{parsed.hostname}:{parsed.port or ''}", allow_private_urls)
+        # No permanent cache: DNS rebinding could change the target between
+        # requests, so every request is revalidated, including a repeat one to
+        # a host already seen this render.
         try:
-            if host_key not in _validated_browser_hosts:
-                validate_fetch_url(request.url, allow_private_urls=allow_private_urls)
-                _validated_browser_hosts.add(host_key)
+            validate_fetch_url(request.url, allowed_private_hosts=policy.network.allowed_private_hosts)
         except ValueError:
             route.abort()
             return
         route.continue_()
 
-    page.route("**/*", route_request)
+    context.route("**/*", route_request)
+    # Article extraction does not need WebSockets. page.route()/context.route()
+    # do not intercept them, so block the separate transport before navigation
+    # instead of leaving an unchecked path to private hosts.
+    context.route_web_socket(
+        "**/*",
+        lambda web_socket: web_socket.close(code=1008, reason="WebSockets are disabled during page extraction."),
+    )
+    # WebRTC is a third transport route() cannot see: ICE gathering reaches
+    # attacker-named STUN/TURN hosts over UDP/TCP directly. Article extraction
+    # never needs it, so the constructors are removed before any page script
+    # runs, in every frame of this context. Left undefined rather than throwing
+    # because that is the shape pages already handle as "no WebRTC here".
+    context.add_init_script(_DISABLE_WEBRTC_SCRIPT)
     try:
-        response = page.goto(url, wait_until="domcontentloaded", timeout=timeout_seconds * 1000)
+        response = page.goto(url, wait_until="domcontentloaded", timeout=policy.browser_timeout_seconds * 1000)
         if response is not None and response.status >= 400:
             raise RuntimeError(f"browser HTTP {response.status}")
         page.wait_for_timeout(1500)
         final_url = page.url
-        validate_fetch_url(final_url, allow_private_urls=allow_private_urls)
+        validate_fetch_url(final_url, allowed_private_hosts=policy.network.allowed_private_hosts)
         return page.content(), final_url, page.title()
     finally:
-        page.close()
+        context.close()
 
 
 def close_browser() -> None:
@@ -913,13 +1033,29 @@ def close_browser() -> None:
 atexit.register(close_browser)
 
 
-def validate_fetch_url(url: str, allow_private_urls: bool = False) -> None:
+class AllowAllHosts(frozenset):
+    """A frozenset[str] look-alike that treats every hostname as allow-listed.
+
+    Some legacy callers (feedian.config.Config.allow_private_urls,
+    feedian.hatena's export loader) carry a single all-or-nothing flag with no
+    per-host concept, unlike NetworkPolicy.allowed_private_hosts. Wrapping the
+    "allow everything" case in a frozenset subclass lets validate_fetch_url and
+    _validated_create_connection's `hostname in allowed_private_hosts` check
+    keep working unchanged, without teaching either of them a second, looser
+    concept that VaultConfig-driven callers could also reach for.
+    """
+
+    def __contains__(self, item: object) -> bool:
+        return True
+
+
+def validate_fetch_url(url: str, allowed_private_hosts: frozenset[str] = frozenset()) -> None:
     parsed = urlparse(url)
     if parsed.scheme.lower() not in {"http", "https"}:
         raise ValueError("only http and https URLs are allowed")
     if not parsed.hostname:
         raise ValueError("URL does not include a hostname")
-    if allow_private_urls:
+    if parsed.hostname.lower() in allowed_private_hosts:
         return
 
     try:

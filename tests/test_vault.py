@@ -6,8 +6,11 @@ import unittest
 import pytest
 
 from feedian.vault import (
+    FetchPolicy,
     FetchRetrySettings,
+    NetworkPolicy,
     VaultConfig,
+    fetch_policy,
     fetch_retry_settings,
     find_vault_root,
     initialize_vault,
@@ -171,8 +174,6 @@ class FetchRetrySettingsTests(unittest.TestCase):
                 terminal_http_statuses=(404, 410),
                 terminal_failure_kinds=("dns", "timeout"),
                 terminal_kind_failures=3,
-                timeout_seconds=5,
-                browser_timeout_seconds=30,
             ),
         )
 
@@ -183,8 +184,6 @@ class FetchRetrySettingsTests(unittest.TestCase):
         config.fetch["terminal_http_statuses"] = [404, 451]
         config.fetch["terminal_failure_kinds"] = ["dns"]
         config.fetch["terminal_kind_failures"] = 4
-        config.fetch["timeout_seconds"] = 8
-        config.fetch["browser_timeout_seconds"] = 45
 
         settings = fetch_retry_settings(config)
 
@@ -195,8 +194,6 @@ class FetchRetrySettingsTests(unittest.TestCase):
         self.assertEqual(settings.terminal_failure_kinds, ("dns",))
         self.assertIsInstance(settings.terminal_failure_kinds, tuple)
         self.assertEqual(settings.terminal_kind_failures, 4)
-        self.assertEqual(settings.timeout_seconds, 8)
-        self.assertEqual(settings.browser_timeout_seconds, 45)
 
     def test_empty_terminal_http_statuses_disables_the_mechanism(self) -> None:
         config = VaultConfig()
@@ -273,6 +270,59 @@ class FetchRetrySettingsTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "terminal_kind_failures"):
                     fetch_retry_settings(config)
 
+    # timeout_seconds/browser_timeout_seconds validation moved to
+    # FetchPolicyTests below: fetch_retry_settings no longer reads those keys.
+
+
+class FetchPolicyTests(unittest.TestCase):
+    def test_defaults_when_keys_are_absent(self) -> None:
+        policy = fetch_policy(VaultConfig())
+
+        self.assertEqual(
+            policy,
+            FetchPolicy(
+                network=NetworkPolicy(allowed_private_hosts=frozenset()),
+                html_max_bytes=10 * 1024 * 1024,
+                document_max_bytes=100 * 1024 * 1024,
+                timeout_seconds=5,
+                browser_timeout_seconds=30,
+            ),
+        )
+
+    def test_explicit_values_come_through_as_a_dataclass(self) -> None:
+        config = VaultConfig()
+        config.fetch["html_max_bytes"] = 1024
+        config.fetch["document_max_bytes"] = 2048
+        config.fetch["timeout_seconds"] = 8
+        config.fetch["browser_timeout_seconds"] = 45
+        config.fetch["allow_private_hosts"] = ["Internal.Example.Test"]
+
+        policy = fetch_policy(config)
+
+        self.assertEqual(policy.html_max_bytes, 1024)
+        self.assertEqual(policy.document_max_bytes, 2048)
+        self.assertEqual(policy.timeout_seconds, 8)
+        self.assertEqual(policy.browser_timeout_seconds, 45)
+        self.assertEqual(policy.network.allowed_private_hosts, frozenset({"internal.example.test"}))
+
+    def test_html_max_bytes_rejects_invalid_values(self) -> None:
+        for invalid in (1.5, True, "2", 0, -1):
+            with self.subTest(invalid=invalid):
+                config = VaultConfig()
+                config.fetch["html_max_bytes"] = invalid
+
+                with self.assertRaisesRegex(ValueError, "html_max_bytes"):
+                    fetch_policy(config)
+
+    def test_document_max_bytes_rejects_invalid_values(self) -> None:
+        for invalid in (1.5, True, "2", 0, -1):
+            with self.subTest(invalid=invalid):
+                config = VaultConfig()
+                config.fetch["document_max_bytes"] = invalid
+
+                with self.assertRaisesRegex(ValueError, "document_max_bytes"):
+                    fetch_policy(config)
+
     def test_timeout_seconds_rejects_invalid_values(self) -> None:
         for invalid in (1.5, True, "2", 0, -1):
             with self.subTest(invalid=invalid):
@@ -280,7 +330,7 @@ class FetchRetrySettingsTests(unittest.TestCase):
                 config.fetch["timeout_seconds"] = invalid
 
                 with self.assertRaisesRegex(ValueError, "timeout_seconds"):
-                    fetch_retry_settings(config)
+                    fetch_policy(config)
 
     def test_browser_timeout_seconds_rejects_invalid_values(self) -> None:
         for invalid in (1.5, True, "2", 0, -1):
@@ -289,7 +339,48 @@ class FetchRetrySettingsTests(unittest.TestCase):
                 config.fetch["browser_timeout_seconds"] = invalid
 
                 with self.assertRaisesRegex(ValueError, "browser_timeout_seconds"):
-                    fetch_retry_settings(config)
+                    fetch_policy(config)
+
+    def test_allow_private_hosts_with_one_host_only_skips_that_host(self) -> None:
+        config = VaultConfig()
+        config.fetch["allow_private_hosts"] = ["internal.example.test"]
+
+        policy = fetch_policy(config)
+
+        self.assertIn("internal.example.test", policy.network.allowed_private_hosts)
+        self.assertNotIn("other-internal.example.test", policy.network.allowed_private_hosts)
+        self.assertNotIn("localhost", policy.network.allowed_private_hosts)
+
+    def test_allow_private_hosts_trims_lowercases_and_deduplicates(self) -> None:
+        config = VaultConfig()
+        config.fetch["allow_private_hosts"] = [" Internal.Example.Test ", "internal.example.test"]
+
+        policy = fetch_policy(config)
+
+        self.assertEqual(policy.network.allowed_private_hosts, frozenset({"internal.example.test"}))
+
+    def test_allow_private_hosts_rejects_non_array_input(self) -> None:
+        for invalid in ("internal.example.test", 1, {"a": 1}, None):
+            with self.subTest(invalid=invalid):
+                config = VaultConfig()
+                config.fetch["allow_private_hosts"] = invalid
+
+                with self.assertRaisesRegex(ValueError, "allow_private_hosts"):
+                    fetch_policy(config)
+
+    def test_allow_private_hosts_rejects_empty_entries(self) -> None:
+        config = VaultConfig()
+        config.fetch["allow_private_hosts"] = ["   "]
+
+        with self.assertRaisesRegex(ValueError, "allow_private_hosts"):
+            fetch_policy(config)
+
+    def test_allow_private_hosts_rejects_non_string_entries(self) -> None:
+        config = VaultConfig()
+        config.fetch["allow_private_hosts"] = [123]
+
+        with self.assertRaisesRegex(ValueError, "allow_private_hosts"):
+            fetch_policy(config)
 
 
 def _write_config(root, payload: dict) -> None:
@@ -356,3 +447,58 @@ def test_unknown_llm_field_is_still_rejected(tmp_path) -> None:
 
     with pytest.raises(ValueError, match="Unknown llm field"):
         load_vault_config(tmp_path)
+
+
+@pytest.mark.parametrize("value", ["false", "true", 0, 1])
+def test_provider_enabled_is_rejected_when_not_a_json_boolean(tmp_path, value) -> None:
+    """Spec 20260820-fetch-config-integrity-hardening: bool("false") == True, so this must fail-fast."""
+    _write_config(tmp_path, _base_config(providers={"raindrop": {"folder": "Raindrop", "enabled": value}}))
+
+    with pytest.raises(ValueError):
+        load_vault_config(tmp_path)
+
+
+def test_provider_enabled_false_disables_the_provider(tmp_path) -> None:
+    _write_config(tmp_path, _base_config(providers={"raindrop": {"folder": "Raindrop", "enabled": False}}))
+
+    config = load_vault_config(tmp_path)
+
+    assert config.providers["raindrop"].enabled is False
+
+
+@pytest.mark.parametrize("value", ["false", "true", 0, 1])
+def test_rss_feed_enabled_is_rejected_when_not_a_json_boolean(tmp_path, value) -> None:
+    _write_config(
+        tmp_path,
+        _base_config(
+            providers={
+                "rss": {
+                    "folder": "RSS",
+                    "enabled": True,
+                    "feeds": [{"url": "https://example.test/feed.xml", "enabled": value}],
+                }
+            }
+        ),
+    )
+
+    with pytest.raises(ValueError):
+        load_vault_config(tmp_path)
+
+
+def test_rss_feed_enabled_false_round_trips(tmp_path) -> None:
+    _write_config(
+        tmp_path,
+        _base_config(
+            providers={
+                "rss": {
+                    "folder": "RSS",
+                    "enabled": True,
+                    "feeds": [{"url": "https://example.test/feed.xml", "enabled": False}],
+                }
+            }
+        ),
+    )
+
+    config = load_vault_config(tmp_path)
+
+    assert config.providers["rss"].feeds[0].enabled is False

@@ -263,6 +263,57 @@ def test_ingest_dry_run_prints_plan_without_writes(tmp_path, capsys, monkeypatch
         store.close()
 
 
+def test_restore_without_tag_is_rejected_by_argument_parsing(tmp_path) -> None:
+    root = tmp_path / "vault"
+    root.mkdir()
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(["restore", "--vault", str(root), "--archive", "foo.7z"])
+    assert exc_info.value.code == 2
+
+
+def test_restore_with_archive_and_tag_restores_from_the_local_archive(tmp_path, monkeypatch) -> None:
+    root = tmp_path / "vault"
+    root.mkdir()
+    assert main(["init", "--vault", str(root)]) == 0
+
+    captured: list[tuple] = []
+
+    def fake_restore_database(vault_root, archive, tag):
+        captured.append((vault_root, archive, tag))
+        return root / ".feedian" / "feedian.sqlite3"
+
+    def fail_download_and_restore(*_args, **_kwargs):
+        raise AssertionError("download_and_restore must not run when --archive is given")
+
+    monkeypatch.setattr("feedian.cli.restore_database", fake_restore_database)
+    monkeypatch.setattr("feedian.cli.download_and_restore", fail_download_and_restore)
+
+    assert main(["restore", "--vault", str(root), "--archive", "foo.7z", "--tag", "some-tag"]) == 0
+    assert captured == [(root.resolve(), "foo.7z", "some-tag")]
+
+
+def test_restore_with_tag_only_downloads_from_the_release(tmp_path, monkeypatch) -> None:
+    root = tmp_path / "vault"
+    root.mkdir()
+    assert main(["init", "--vault", str(root)]) == 0
+
+    captured: list[tuple] = []
+
+    def fake_download_and_restore(vault_root, tag):
+        captured.append((vault_root, tag))
+        return root / ".feedian" / "feedian.sqlite3"
+
+    def fail_restore_database(*_args, **_kwargs):
+        raise AssertionError("restore_database must not run directly when only --tag is given")
+
+    monkeypatch.setattr("feedian.cli.download_and_restore", fake_download_and_restore)
+    monkeypatch.setattr("feedian.cli.restore_database", fail_restore_database)
+
+    assert main(["restore", "--vault", str(root), "--tag", "some-tag"]) == 0
+    assert captured == [(root.resolve(), "some-tag")]
+
+
 def test_set_default_vault_requires_initialized_vault(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
     root = tmp_path / "vault"

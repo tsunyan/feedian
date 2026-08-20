@@ -5,6 +5,9 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
+from .extract import AllowAllHosts
+from .vault import FetchPolicy, NetworkPolicy, VaultConfig
+
 
 @dataclass
 class Config:
@@ -41,6 +44,11 @@ class Config:
         self.max_output_tokens = max(100, int(self.max_output_tokens))
         if self.openai_reasoning_effort not in {"none", "minimal", "low", "medium", "high", "xhigh", "max"}:
             raise ValueError("openai_reasoning_effort must be a supported reasoning effort.")
+        if not isinstance(self.allow_private_urls, bool):
+            # Coercing would make the JSON string "false" allow every private
+            # address, since bool("false") is True. This flag is the legacy
+            # CLI's only private-host guard, so a typo must fail the load.
+            raise ValueError("allow_private_urls must be true or false.")
         self.max_retries = max(0, min(int(self.max_retries), 5))
         self.retry_base_seconds = max(0.1, float(self.retry_base_seconds))
         self.request_timeout_seconds = max(1, int(self.request_timeout_seconds))
@@ -54,6 +62,27 @@ class Config:
             base_tags=list(self.base_tags or []),
             hatena_base_tags=list(self.hatena_base_tags or []),
         )
+
+
+def fetch_policy_from_config(config: Config) -> FetchPolicy:
+    """Adapt the legacy `--source hatena`-style Config to a FetchPolicy.
+
+    This is the only path Config feeds into fetch_page_text through; it keeps
+    today's CLI behavior unchanged rather than growing a host allow-list
+    concept Config was never designed to carry. html_max_bytes/document_max_bytes/
+    browser_timeout_seconds have no Config equivalent, so this borrows
+    VaultConfig's defaults, matching what every caller already shared before
+    fetch.html_max_bytes etc. were wired up.
+    """
+    defaults = VaultConfig().fetch
+    allowed_private_hosts: frozenset[str] = AllowAllHosts() if config.allow_private_urls else frozenset()
+    return FetchPolicy(
+        network=NetworkPolicy(allowed_private_hosts=allowed_private_hosts),
+        html_max_bytes=defaults["html_max_bytes"],
+        document_max_bytes=defaults["document_max_bytes"],
+        timeout_seconds=config.request_timeout_seconds,
+        browser_timeout_seconds=defaults["browser_timeout_seconds"],
+    )
 
 
 def load_config(path: str | Path) -> Config:

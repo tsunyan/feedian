@@ -15,7 +15,7 @@ from typing import Any, Callable, Iterable, Iterator, TypeVar
 from .canonical import canonical_item_from_metadata
 from .cli import is_modern_command, main as modern_main
 from .cli_ui import print_cli_error
-from .config import Config, load_config
+from .config import Config, fetch_policy_from_config, load_config
 from .estimate import (
     ModelPrice,
     comparison_model,
@@ -553,6 +553,7 @@ def process_bookmarks(
             print(f"vault recovery warning: {exc}")
             return 1
 
+    policy = fetch_policy_from_config(config)
     processed = 0
     created = 0
     renamed = 0
@@ -634,9 +635,8 @@ def process_bookmarks(
         if not args.dry_run and not args.skip_page_fetch and item.get("link"):
             page = fetch_page_text(
                 item["link"],
-                timeout_seconds=config.request_timeout_seconds,
+                policy=policy,
                 max_chars=config.max_article_chars,
-                allow_private_urls=config.allow_private_urls,
             )
             if page.error:
                 report(reporter, f"  page fetch warning: {page.error}", verbose=True)
@@ -802,6 +802,7 @@ def process_hatena_export(
     reporter: ProgressReporter | None = None,
 ) -> int:
     started_at = time.perf_counter()
+    policy = fetch_policy_from_config(config)
     location = (args.source_input or config.hatena_input).strip()
     hatena_id = ""
     hatena_api_key = ""
@@ -895,9 +896,8 @@ def process_hatena_export(
         if not args.dry_run and not args.skip_page_fetch and canonical.url:
             page = fetch_page_text(
                 canonical.url,
-                timeout_seconds=config.request_timeout_seconds,
+                policy=policy,
                 max_chars=config.max_article_chars,
-                allow_private_urls=config.allow_private_urls,
             )
             if page.error:
                 report(reporter, f"  page fetch warning: {page.error}", verbose=True)
@@ -1273,6 +1273,7 @@ def estimate_bookmarks(
     reporter: ProgressReporter | None = None,
 ) -> int:
     started_at = time.perf_counter()
+    policy = fetch_policy_from_config(config)
     raindrop_token = require_env("RAINDROP_TOKEN")
     model = os.environ.get("OPENAI_MODEL", config.openai_model)
     _estimate_progress("phase=refreshing-model-prices", reporter)
@@ -1335,9 +1336,8 @@ def estimate_bookmarks(
         if not args.skip_page_fetch and page.url:
             page = fetch_page_text(
                 page.url,
-                timeout_seconds=config.request_timeout_seconds,
+                policy=policy,
                 max_chars=config.max_article_chars,
-                allow_private_urls=config.allow_private_urls,
             )
             if page.error:
                 failures[page.error] += 1

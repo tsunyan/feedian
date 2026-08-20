@@ -22,6 +22,19 @@ from feedian.extract import (
     should_render_with_browser,
     should_use_recall_fallback,
 )
+from feedian.vault import FetchPolicy, NetworkPolicy
+
+
+def _policy(**overrides) -> FetchPolicy:
+    defaults: dict = dict(
+        network=NetworkPolicy(allowed_private_hosts=frozenset()),
+        html_max_bytes=10 * 1024 * 1024,
+        document_max_bytes=100 * 1024 * 1024,
+        timeout_seconds=5,
+        browser_timeout_seconds=30,
+    )
+    defaults.update(overrides)
+    return FetchPolicy(**defaults)
 
 
 class TextExtractorTests(unittest.TestCase):
@@ -105,7 +118,7 @@ class StagedExtractionTests(unittest.TestCase):
                 return Response(raw)
 
         with patch("feedian.extract.validate_fetch_url"), patch("feedian.extract.build_opener", return_value=Opener()):
-            return fetch_page_text("https://example.com/document", timeout_seconds=1, max_chars=1000)
+            return fetch_page_text("https://example.com/document", _policy(timeout_seconds=1), max_chars=1000)
 
     def test_decode_html_honors_shift_jis_meta(self) -> None:
         html = '<meta charset="Shift_JIS"><article>日本語の本文です。</article>'.encode("cp932")
@@ -201,7 +214,7 @@ class StagedExtractionTests(unittest.TestCase):
             "Rendered",
         )
 
-        result = fetch_page_text("https://example.com/article", 5, 1000)
+        result = fetch_page_text("https://example.com/article", _policy(), 1000)
 
         self.assertEqual(result.fetch_method, "browser")
         self.assertIn("Rendered article body", result.text)
@@ -216,7 +229,7 @@ class StagedExtractionTests(unittest.TestCase):
         )
         browser_fetch.return_value = type("Result", (), {"text": "Browser article"})()
 
-        result = fetch_page_text("https://example.com/article", 5, 1000)
+        result = fetch_page_text("https://example.com/article", _policy(), 1000)
 
         self.assertEqual(result.text, "Browser article")
         browser_fetch.assert_called_once()
@@ -228,7 +241,7 @@ class StagedExtractionTests(unittest.TestCase):
             "https://example.com/article", 404, "Not Found", {}, BytesIO()
         )
 
-        result = fetch_page_text("https://example.com/article", 5, 1000)
+        result = fetch_page_text("https://example.com/article", _policy(), 1000)
 
         self.assertEqual(result.http_status, 404)
         self.assertTrue(result.error)
@@ -244,7 +257,7 @@ class StagedExtractionTests(unittest.TestCase):
         )
         browser_fetch.side_effect = Exception("browser boom")
 
-        result = fetch_page_text("https://example.com/article", 5, 1000)
+        result = fetch_page_text("https://example.com/article", _policy(), 1000)
 
         self.assertEqual(result.http_status, 403)
         self.assertIn("browser fallback failed", result.error or "")
@@ -253,7 +266,7 @@ class StagedExtractionTests(unittest.TestCase):
     def test_blocked_url_leaves_status_unset(self, validate_url) -> None:
         validate_url.side_effect = ValueError("private address")
 
-        result = fetch_page_text("https://example.com/article", 5, 1000)
+        result = fetch_page_text("https://example.com/article", _policy(), 1000)
 
         self.assertIsNone(result.http_status)
         self.assertIn("blocked URL", result.error or "")
@@ -263,7 +276,7 @@ class StagedExtractionTests(unittest.TestCase):
     def test_connection_failure_leaves_status_unset(self, validate_url, build_opener) -> None:
         build_opener.return_value.open.side_effect = URLError("Name or service not known")
 
-        result = fetch_page_text("https://example.com/article", 5, 1000)
+        result = fetch_page_text("https://example.com/article", _policy(), 1000)
 
         self.assertIsNone(result.http_status)
 
@@ -276,7 +289,7 @@ class StagedExtractionTests(unittest.TestCase):
         response.geturl.return_value = "https://example.com/article"
         response.status = 200
 
-        result = fetch_page_text("https://example.com/article", 5, 1000)
+        result = fetch_page_text("https://example.com/article", _policy(), 1000)
 
         self.assertEqual(result.http_status, 200)
 
@@ -284,7 +297,7 @@ class StagedExtractionTests(unittest.TestCase):
     def test_dns_unresolvable_host_sets_dns_failure_kind(self, getaddrinfo) -> None:
         getaddrinfo.side_effect = socket.gaierror("not known")
 
-        result = fetch_page_text("https://dead.example.com/article", 5, 1000)
+        result = fetch_page_text("https://dead.example.com/article", _policy(), 1000)
 
         self.assertEqual(result.failure_kind, "dns")
         self.assertIn("blocked URL", result.error or "")
@@ -292,18 +305,18 @@ class StagedExtractionTests(unittest.TestCase):
     def test_private_address_rejection_leaves_failure_kind_none(self) -> None:
         # 127.0.0.1 resolves locally without a network call, so this exercises
         # the SSRF guard's ValueError branch, not the DNS failure branch.
-        result = fetch_page_text("http://127.0.0.1/secret", 5, 1000)
+        result = fetch_page_text("http://127.0.0.1/secret", _policy(), 1000)
 
         self.assertIsNone(result.failure_kind)
         self.assertIn("blocked URL", result.error or "")
 
     def test_scheme_violation_leaves_failure_kind_none(self) -> None:
-        result = fetch_page_text("ftp://example.com/article", 5, 1000)
+        result = fetch_page_text("ftp://example.com/article", _policy(), 1000)
 
         self.assertIsNone(result.failure_kind)
 
     def test_missing_hostname_leaves_failure_kind_none(self) -> None:
-        result = fetch_page_text("https:///no-host", 5, 1000)
+        result = fetch_page_text("https:///no-host", _policy(), 1000)
 
         self.assertIsNone(result.failure_kind)
 
@@ -319,7 +332,7 @@ class StagedExtractionTests(unittest.TestCase):
             "hostname could not be resolved: redirect.example.com"
         )
 
-        result = fetch_page_text("https://example.com/article", 5, 1000)
+        result = fetch_page_text("https://example.com/article", _policy(), 1000)
 
         self.assertIsNone(result.failure_kind)
 
@@ -328,7 +341,7 @@ class StagedExtractionTests(unittest.TestCase):
     def test_opener_open_timeout_sets_timeout_failure_kind(self, validate_url, build_opener) -> None:
         build_opener.return_value.open.side_effect = URLError(TimeoutError("timed out"))
 
-        result = fetch_page_text("https://example.com/article", 5, 1000)
+        result = fetch_page_text("https://example.com/article", _policy(), 1000)
 
         self.assertEqual(result.failure_kind, "timeout")
 
@@ -339,7 +352,7 @@ class StagedExtractionTests(unittest.TestCase):
         response.headers.get.return_value = "text/html; charset=utf-8"
         response.read.side_effect = TimeoutError("timed out")
 
-        result = fetch_page_text("https://example.com/article", 5, 1000)
+        result = fetch_page_text("https://example.com/article", _policy(), 1000)
 
         self.assertEqual(result.failure_kind, "timeout")
 
@@ -348,7 +361,7 @@ class StagedExtractionTests(unittest.TestCase):
     def test_ssl_failure_leaves_failure_kind_none(self, validate_url, build_opener) -> None:
         build_opener.return_value.open.side_effect = ssl.SSLError("bad handshake")
 
-        result = fetch_page_text("https://example.com/article", 5, 1000)
+        result = fetch_page_text("https://example.com/article", _policy(), 1000)
 
         self.assertIsNone(result.failure_kind)
 
@@ -359,7 +372,7 @@ class StagedExtractionTests(unittest.TestCase):
             "https://example.com/article", 500, "Server Error", {}, BytesIO()
         )
 
-        result = fetch_page_text("https://example.com/article", 5, 1000)
+        result = fetch_page_text("https://example.com/article", _policy(), 1000)
 
         self.assertIsNone(result.failure_kind)
 
@@ -374,9 +387,9 @@ class StagedExtractionTests(unittest.TestCase):
         )
         browser_fetch.return_value = type("Result", (), {"text": "Browser article"})()
 
-        fetch_page_text("https://example.com/article", 5, 1000, browser_timeout_seconds=45)
+        fetch_page_text("https://example.com/article", _policy(browser_timeout_seconds=45), 1000)
 
-        self.assertEqual(browser_fetch.call_args.kwargs["timeout_seconds"], 45)
+        self.assertEqual(browser_fetch.call_args.kwargs["policy"].browser_timeout_seconds, 45)
 
     @patch("feedian.extract.fetch_page_text_with_browser")
     @patch("feedian.extract.build_opener")
@@ -389,9 +402,9 @@ class StagedExtractionTests(unittest.TestCase):
         )
         browser_fetch.return_value = type("Result", (), {"text": "Browser article"})()
 
-        fetch_page_text("https://example.com/article", 5, 1000)
+        fetch_page_text("https://example.com/article", _policy(), 1000)
 
-        self.assertEqual(browser_fetch.call_args.kwargs["timeout_seconds"], 30)
+        self.assertEqual(browser_fetch.call_args.kwargs["policy"].browser_timeout_seconds, 30)
 
     @patch("feedian.extract.render_html_with_browser")
     @patch("feedian.extract.build_opener")
@@ -410,9 +423,9 @@ class StagedExtractionTests(unittest.TestCase):
             "Rendered",
         )
 
-        fetch_page_text("https://example.com/article", 5, 1000, browser_timeout_seconds=45)
+        fetch_page_text("https://example.com/article", _policy(browser_timeout_seconds=45), 1000)
 
-        self.assertEqual(render_browser.call_args.kwargs["timeout_seconds"], 45)
+        self.assertEqual(render_browser.call_args.kwargs["policy"].browser_timeout_seconds, 45)
 
 
 if __name__ == "__main__":
@@ -440,7 +453,7 @@ class DeferredBrowserMergeTests(unittest.TestCase):
             response.read.return_value = self.HTTP_BODY
             response.geturl.return_value = "https://example.com/article"
             response.status = 200
-            return fetch_page_text("https://example.com/article", 5, 1000, allow_browser=False)
+            return fetch_page_text("https://example.com/article", _policy(), 1000, allow_browser=False)
 
     def test_a_worker_defers_the_render_instead_of_running_it(self) -> None:
         with patch("feedian.extract.render_html_with_browser") as render:
@@ -486,7 +499,7 @@ class DeferredBrowserMergeTests(unittest.TestCase):
             ).encode("utf-8")
             response.geturl.return_value = "https://example.com/article"
             response.status = 200
-            page = fetch_page_text("https://example.com/article", 5, 1000, allow_browser=False)
+            page = fetch_page_text("https://example.com/article", _policy(), 1000, allow_browser=False)
 
         self.assertIsNotNone(page.browser_pending)
         with patch("feedian.extract.render_html_with_browser") as render:
@@ -518,7 +531,7 @@ class DeferredBrowserMergeTests(unittest.TestCase):
             "https://example.com/article", 403, "Forbidden", {}, BytesIO()
         )
 
-        page = fetch_page_text("https://example.com/article", 5, 1000, allow_browser=False)
+        page = fetch_page_text("https://example.com/article", _policy(), 1000, allow_browser=False)
 
         self.assertEqual(page.browser_pending.kind, "http-error")
         self.assertEqual(page.browser_pending.initial_error, "HTTP 403")
@@ -536,7 +549,7 @@ class DeferredBrowserMergeTests(unittest.TestCase):
         browser_fetch.side_effect = RuntimeError("no browser")
 
         merged = complete_browser_fallback(
-            fetch_page_text("https://example.com/article", 5, 1000, allow_browser=False)
+            fetch_page_text("https://example.com/article", _policy(), 1000, allow_browser=False)
         )
 
         self.assertEqual(merged.error, "HTTP 403; browser fallback failed: no browser")

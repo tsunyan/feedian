@@ -6,18 +6,39 @@ import shutil
 import sqlite3
 from pathlib import Path
 
-from .snapshots import _find_7zip, _github_repository, _run
+from .snapshots import _find_7zip, _github_repository, _run, _run_git
 from .vault import vault_paths
 
 
-def restore_database(vault_root: str | Path, archive: str | Path) -> Path:
-    """Restore one verified database archive into a Vault with no live database."""
+def restore_database(vault_root: str | Path, archive: str | Path, tag: str) -> Path:
+    """Restore one verified database archive into a Vault with no live database.
+
+    Threat model: verification trusts the Git repository's commit/tag history
+    as the integrity anchor outside the archive being restored -- Git tags and
+    commits are assumed genuine, and Release archives are the only thing that
+    can be corrupted or tampered with. This does not verify Git's own history
+    or require signed tags: a tag name is a mutable reference, not a
+    signature, and a compromised Git repository is out of scope. What this
+    check does close is the archive-only attack, where a tampered database
+    ships alongside a manifest.json rewritten to match it -- that manifest
+    lives inside the same archive being restored and cannot detect tampering
+    on its own, so the archive's own sha256 must be checked against a value
+    recorded outside the archive (the tagged `.feedian/snapshot.json`) before
+    anything is extracted.
+    """
     paths = vault_paths(vault_root)
     if paths.database_path.exists():
         raise FileExistsError(f"Refusing restore because a live database already exists: {paths.database_path}")
     source = Path(archive).resolve()
     if not source.is_file():
         raise FileNotFoundError(f"Snapshot archive not found: {source}")
+    trusted_sha256 = _trusted_archive_sha256(paths.root, tag)
+    actual_sha256 = _sha256(source)
+    if actual_sha256 != trusted_sha256:
+        raise RuntimeError(
+            f"Archive checksum does not match the Git-tagged snapshot manifest for tag {tag!r}: "
+            f"expected {trusted_sha256}, got {actual_sha256}."
+        )
     seven_zip = _find_7zip()
     temporary = paths.state_dir / "tmp" / "restore"
     if temporary.exists():
@@ -48,9 +69,17 @@ def restore_database(vault_root: str | Path, archive: str | Path) -> Path:
 
 
 def download_and_restore(vault_root: str | Path, tag: str) -> Path:
+    """Fetch a Release archive and restore it, ensuring the tag is locally available first.
+
+    A fresh clone, or a tag created and pushed from a different machine, may
+    not have the tag locally yet -- `restore_database` requires `git show
+    <tag>:...` to succeed, so this fetches the tag from origin before doing
+    anything else.
+    """
     root = Path(vault_root).resolve()
     paths = vault_paths(root)
     repository = _github_repository(root)
+    _run_git(root, ["fetch", "origin", "tag", tag])
     temporary = paths.state_dir / "tmp" / "release-download"
     if temporary.exists():
         raise FileExistsError(f"Restore download directory already exists: {temporary}")
@@ -60,9 +89,45 @@ def download_and_restore(vault_root: str | Path, tag: str) -> Path:
         archives = list(temporary.glob("*.sqlite3.7z"))
         if len(archives) != 1:
             raise RuntimeError(f"Expected exactly one SQLite archive in Release {tag}, found {len(archives)}.")
-        return restore_database(root, archives[0])
+        return restore_database(root, archives[0], tag)
     finally:
         shutil.rmtree(temporary, ignore_errors=True)
+
+
+def _trusted_archive_sha256(vault_root: Path, tag: str) -> str:
+    """Read the archive's expected sha256 from the Git-tagged snapshot manifest.
+
+    This is the anchor outside the archive: `.feedian/snapshot.json` as it was
+    committed and tagged by `create_snapshot`, read via `git show`, not from
+    any copy bundled inside the archive itself. Raises if the tag does not
+    exist locally, the path is missing at that tag, or the content is not the
+    expected JSON shape -- there is no fallback.
+    """
+    if not tag or not tag.strip():
+        # `git show ":path"` (empty ref before the colon) reads the local
+        # index instead of failing, which would silently make an untrusted
+        # working-tree file the trust anchor. Reject before it ever reaches
+        # git, rather than relying on git to fail on our behalf.
+        raise ValueError("A non-empty tag is required to verify a restore.")
+    try:
+        # refs/tags/ and not the bare name: any revision expression would
+        # otherwise resolve, so `HEAD`, `@`, or a branch name would let a
+        # mutable ref stand in for the tag this anchor is defined as.
+        result = _run_git(vault_root, ["show", f"refs/tags/{tag}:.feedian/snapshot.json"])
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"Could not read .feedian/snapshot.json at tag {tag!r}. "
+            f"Ensure the tag exists locally (git fetch --tags) and the vault is Git-managed: {exc}"
+        ) from exc
+    try:
+        manifest = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f".feedian/snapshot.json at tag {tag!r} is not valid JSON: {exc}") from exc
+    archive = manifest.get("archive") if isinstance(manifest, dict) else None
+    sha256 = archive.get("sha256") if isinstance(archive, dict) else None
+    if not isinstance(sha256, str) or not sha256:
+        raise ValueError(f".feedian/snapshot.json at tag {tag!r} is missing archive.sha256.")
+    return sha256
 
 
 def _sha256(path: Path) -> str:

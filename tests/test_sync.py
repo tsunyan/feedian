@@ -10,7 +10,7 @@ from feedian.hatena import HatenaEntryDiscussion, HatenaPublicComment
 from feedian.rss import RssItem
 from feedian.store import VaultStore
 from feedian.sync import _provider_items, _select_hatena_comments, sync_vault
-from feedian.vault import ProviderSettings, RssFeedSettings, VaultConfig
+from feedian.vault import NetworkPolicy, ProviderSettings, RssFeedSettings, VaultConfig
 
 
 def test_sync_stores_provider_page_and_hatena_comments(monkeypatch, tmp_path) -> None:
@@ -363,6 +363,24 @@ def test_rss_provider_continues_after_one_feed_fails_and_limits_newest(monkeypat
 
     assert [item.source_id for item, _payload in rows] == ["new"]
     assert errors == [("rss", "https://bad.test/feed.xml", "unavailable")]
+
+
+def test_provider_items_passes_the_network_policy_through_to_rss_fetch(monkeypatch) -> None:
+    """Spec 20260820: sync.py builds one NetworkPolicy from config and threads
+    it to fetch_rss_items instead of a bare allow_private_urls bool."""
+    settings = ProviderSettings(folder="RSS", layout="feed/year/month", feeds=[RssFeedSettings(url="https://good.test/feed.xml")])
+    config = VaultConfig(providers={"rss": settings})
+    network = NetworkPolicy(allowed_private_hosts=frozenset({"good.test"}))
+    captured_kwargs: dict[str, object] = {}
+
+    def fetch(feed_url: str, **kwargs):
+        captured_kwargs.update(kwargs)
+        return []
+
+    monkeypatch.setattr("feedian.sync.fetch_rss_items", fetch)
+    list(_provider_items(config, "rss", None, network=network))
+
+    assert captured_kwargs["network"] is network
 
 
 def test_sync_uses_embedded_rss_content_without_page_fetch(monkeypatch, tmp_path) -> None:
@@ -1212,9 +1230,34 @@ def test_sync_passes_the_configured_timeout_seconds_to_fetch_page_text(monkeypat
     try:
         sync_vault(store, config, source="hatena", quick=False, fetch_comments=False)
 
-        assert captured_kwargs["timeout_seconds"] == 8
-        assert captured_kwargs["timeout_seconds"] != 30
-        assert captured_kwargs["browser_timeout_seconds"] == 45
+        policy = captured_kwargs["policy"]
+        assert policy.timeout_seconds == 8
+        assert policy.timeout_seconds != 30
+        assert policy.browser_timeout_seconds == 45
+    finally:
+        store.close()
+
+
+def test_sync_passes_the_configured_allow_private_hosts_to_fetch_page_text(monkeypatch, tmp_path) -> None:
+    """Spec 20260820: sync.py no longer hardcodes allow_private_urls=False; the
+    host allow-list configured under fetch.allow_private_hosts reaches
+    fetch_page_text through the shared FetchPolicy instance."""
+    item = CanonicalItem(source="hatena", source_id="one", content_key="url:one", url="https://example.test/one", title="A")
+    monkeypatch.setattr("feedian.sync._provider_items", lambda *_args, **_kwargs: iter([(item, b"{}")]))
+    captured_kwargs: dict[str, object] = {}
+    monkeypatch.setattr(
+        "feedian.sync.fetch_page_text",
+        lambda url, **kwargs: captured_kwargs.update(kwargs)
+        or PageFetchResult(url=url, final_url=url, text="body", media_type="text/html"),
+    )
+    config = VaultConfig(providers={"hatena": VaultConfig().providers["hatena"]})
+    config.fetch["allow_private_hosts"] = ["example.test"]
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        sync_vault(store, config, source="hatena", quick=False, fetch_comments=False)
+
+        policy = captured_kwargs["policy"]
+        assert policy.network.allowed_private_hosts == frozenset({"example.test"})
     finally:
         store.close()
 
@@ -1239,8 +1282,9 @@ def test_quick_body_only_pass_also_passes_the_configured_timeout_seconds(monkeyp
 
         sync_vault(store, config, source="hatena", quick=True, fetch_comments=False)
 
-        assert captured_kwargs["timeout_seconds"] == 9
-        assert captured_kwargs["browser_timeout_seconds"] == 41
+        policy = captured_kwargs["policy"]
+        assert policy.timeout_seconds == 9
+        assert policy.browser_timeout_seconds == 41
     finally:
         store.close()
 

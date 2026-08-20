@@ -4,6 +4,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from feedian.canonical import source_id_for_url
+from feedian.extract import _ValidatingHTTPHandler, _ValidatingHTTPSHandler
 from feedian.hatena import (
     clean_hatena_excerpt,
     fetch_hatena_bookmarks,
@@ -198,6 +199,66 @@ class HatenaExportTests(unittest.TestCase):
         self.assertEqual(items[0].comment, "HTML comment")
         self.assertEqual(items[0].tags, ["web", "あとで読む"])
         self.assertTrue(items[0].private)
+
+    def test_http_export_url_still_works_after_validate_fetch_url_was_renamed(self) -> None:
+        """Spec 20260820-fetch-config-integrity-hardening: validate_fetch_url and
+        SafeRedirectHandler took an `allow_private_urls: bool` parameter that
+        was renamed to `allowed_private_hosts: frozenset[str]`. hatena.py has
+        its own independent opener that was not otherwise part of that spec's
+        A/B scope, but it calls both and would raise TypeError/`in` on a bool
+        without this adapter."""
+        atom = """<feed xmlns="http://www.w3.org/2005/Atom"><entry><title>Remote item</title>
+<link rel="related" href="https://example.com/remote" /></entry></feed>"""
+
+        with (
+            patch("feedian.hatena.validate_fetch_url") as validate,
+            patch("feedian.hatena.build_opener") as build_opener,
+        ):
+            response = build_opener.return_value.open.return_value.__enter__.return_value
+            response.read.return_value = atom.encode("utf-8")
+
+            items = load_hatena_export(
+                "https://export.example.test/bookmarks.atom", allow_private_urls=True
+            )
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].title, "Remote item")
+        validate.assert_called_once()
+        self.assertIn("https://export.example.test/bookmarks.atom", validate.call_args.args)
+        allowed = validate.call_args.kwargs["allowed_private_hosts"]
+        self.assertIn("anything.internal", allowed)
+
+    def test_http_export_url_denies_private_hosts_by_default(self) -> None:
+        with self.assertRaisesRegex(ValueError, "non-public address"):
+            load_hatena_export("http://127.0.0.1/bookmarks.atom", allow_private_urls=False)
+
+    def test_http_export_uses_the_validating_handlers_and_no_proxy(self) -> None:
+        """_read_export is a third independent opener alongside extract.py's
+        fetch_page_text and rss.py's fetch_rss_items -- the mock in
+        test_http_export_url_still_works_after_validate_fetch_url_was_renamed
+        replaces build_opener entirely and so cannot catch a regression back to
+        a plain, unvalidated HTTPSHandler. This test checks the handler classes
+        build_opener actually receives."""
+        atom = """<feed xmlns="http://www.w3.org/2005/Atom"><entry><title>Remote item</title>
+<link rel="related" href="https://example.com/remote" /></entry></feed>"""
+
+        with (
+            patch("feedian.hatena.validate_fetch_url"),
+            patch("feedian.hatena.build_opener") as build_opener,
+        ):
+            response = build_opener.return_value.open.return_value.__enter__.return_value
+            response.read.return_value = atom.encode("utf-8")
+
+            load_hatena_export("https://export.example.test/bookmarks.atom", allow_private_urls=False)
+
+        handlers = build_opener.call_args.args
+        http_handlers = [h for h in handlers if isinstance(h, _ValidatingHTTPHandler)]
+        https_handlers = [h for h in handlers if isinstance(h, _ValidatingHTTPSHandler)]
+        self.assertEqual(len(http_handlers), 1)
+        self.assertEqual(len(https_handlers), 1)
+        proxy_handlers = [h for h in handlers if type(h).__name__ == "ProxyHandler"]
+        self.assertEqual(len(proxy_handlers), 1)
+        self.assertEqual(proxy_handlers[0].proxies, {})
 
 
 if __name__ == "__main__":
