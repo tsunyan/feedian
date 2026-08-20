@@ -106,6 +106,37 @@ def test_restore_fails_when_tag_does_not_exist_locally(tmp_path) -> None:
         restore_database(root, archive_path, "does-not-exist")
 
 
+@pytest.mark.parametrize("payload", ["null", "[]", '"oops"', '{"archive": "abc"}', '{"archive": []}'])
+def test_restore_raises_valueerror_not_attributeerror_on_malformed_manifest(tmp_path, monkeypatch, payload) -> None:
+    root = tmp_path / "vault"
+    root.mkdir()
+    initialize_vault(root)
+    archive_path, _archive_sha256 = _build_valid_archive(tmp_path)
+
+    def fake_run_git(_vault_root, args):
+        return subprocess.CompletedProcess(args, 0, stdout=payload, stderr="")
+
+    monkeypatch.setattr("feedian.restore._run_git", fake_run_git)
+
+    with pytest.raises(ValueError, match="missing archive.sha256"):
+        restore_database(root, archive_path, "test-tag")
+
+
+def test_restore_rejects_an_empty_tag_instead_of_reading_the_local_index(tmp_path) -> None:
+    """`git show ":path"` (empty ref before the colon) reads the local index
+    instead of failing, which would silently make an untrusted working-tree
+    file the trust anchor. An empty --tag must be rejected before it reaches git."""
+    root = tmp_path / "vault"
+    root.mkdir()
+    initialize_vault(root)
+    subprocess.run(["git", "init", "--quiet"], cwd=root, check=True, capture_output=True, text=True)
+    archive_path, _archive_sha256 = _build_valid_archive(tmp_path)
+
+    for empty in ("", "   "):
+        with pytest.raises(ValueError, match="non-empty tag is required"):
+            restore_database(root, archive_path, empty)
+
+
 def test_download_and_restore_fetches_the_tag_from_origin_before_restoring(tmp_path, monkeypatch) -> None:
     root = tmp_path / "vault"
     root.mkdir()

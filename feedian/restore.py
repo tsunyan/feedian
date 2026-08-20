@@ -103,6 +103,12 @@ def _trusted_archive_sha256(vault_root: Path, tag: str) -> str:
     exist locally, the path is missing at that tag, or the content is not the
     expected JSON shape -- there is no fallback.
     """
+    if not tag or not tag.strip():
+        # `git show ":path"` (empty ref before the colon) reads the local
+        # index instead of failing, which would silently make an untrusted
+        # working-tree file the trust anchor. Reject before it ever reaches
+        # git, rather than relying on git to fail on our behalf.
+        raise ValueError("A non-empty tag is required to verify a restore.")
     try:
         result = _run_git(vault_root, ["show", f"{tag}:.feedian/snapshot.json"])
     except RuntimeError as exc:
@@ -114,7 +120,8 @@ def _trusted_archive_sha256(vault_root: Path, tag: str) -> str:
         manifest = json.loads(result.stdout)
     except json.JSONDecodeError as exc:
         raise ValueError(f".feedian/snapshot.json at tag {tag!r} is not valid JSON: {exc}") from exc
-    sha256 = (manifest.get("archive") or {}).get("sha256")
+    archive = manifest.get("archive") if isinstance(manifest, dict) else None
+    sha256 = archive.get("sha256") if isinstance(archive, dict) else None
     if not isinstance(sha256, str) or not sha256:
         raise ValueError(f".feedian/snapshot.json at tag {tag!r} is missing archive.sha256.")
     return sha256

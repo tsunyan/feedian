@@ -437,10 +437,10 @@ A real snapshot creates a consistent database backup, archives it, commits manag
 ### `restore`
 
 ```powershell
-feedian restore --vault PATH (--archive FILE | --tag TAG)
+feedian restore --vault PATH --tag TAG [--archive FILE]
 ```
 
-Restore a verified snapshot from a local `.sqlite3.7z` archive or a GitHub Release tag. The destination Vault must not already contain `.feedian/feedian.sqlite3`.
+Restore a verified snapshot. `--tag` is always required: verification reads `.feedian/snapshot.json` as it was committed and tagged in the Vault's own Git history (not the copy bundled inside the archive), and checks the archive's sha256 against that value before extracting anything. With `--archive`, restore from that local `.sqlite3.7z` file, verified against `--tag`'s Git-tagged manifest. Without it, download the archive from `--tag`'s GitHub Release first (fetching the tag from `origin` if it isn't local yet), then restore the same way. The destination Vault must not already contain `.feedian/feedian.sqlite3`.
 
 ## Common recipes
 
