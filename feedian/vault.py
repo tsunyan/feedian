@@ -408,7 +408,7 @@ def _parse_providers(raw: object) -> dict[str, ProviderSettings]:
             raise ValueError(f"providers.{name}.category_routes must map non-empty tags to folders.")
         providers[name] = ProviderSettings(
             folder=folder,
-            enabled=bool(value.get("enabled", True)),
+            enabled=strict_bool_setting(f"providers.{name}.enabled", value.get("enabled", True)),
             collection_id=int(collection_id) if collection_id is not None else None,
             poll_hours=max(1, int(poll_hours)) if poll_hours is not None else None,
             feeds=feeds,
@@ -433,6 +433,17 @@ def positive_int_setting(name: str, value: object) -> int:
         raise ValueError(f"config.{name} must be an integer")
     if value < 1:
         raise ValueError(f"config.{name} must be >= 1")
+    return value
+
+
+def strict_bool_setting(name: str, value: object) -> bool:
+    """Reject anything but an actual JSON boolean.
+
+    bool("false") is True in Python, so coercing here would silently flip a
+    user's intent to disable something into leaving it enabled.
+    """
+    if not isinstance(value, bool):
+        raise ValueError(f"config.{name} must be true or false")
     return value
 
 
@@ -471,7 +482,7 @@ def _parse_rss_feed(value: object, *, index: int) -> RssFeedSettings:
         folder=_relative_folder(folder_value, f"{field_name}.folder") if folder_value else "",
         tags=[tag.strip() for tag in raw_tags],
         route=_relative_folder(route_value, f"{field_name}.route") if route_value else "",
-        enabled=bool(value.get("enabled", True)),
+        enabled=strict_bool_setting(f"{field_name}.enabled", value.get("enabled", True)),
     )
 
 
@@ -556,6 +567,71 @@ def fetch_retry_settings(config: VaultConfig) -> FetchRetrySettings:
         terminal_http_statuses=tuple(deduplicated_statuses),
         terminal_failure_kinds=tuple(deduplicated_kinds),
         terminal_kind_failures=kind_failures,
+        timeout_seconds=timeout_seconds,
+        browser_timeout_seconds=browser_timeout_seconds,
+    )
+
+
+@dataclass(frozen=True)
+class NetworkPolicy:
+    """How to safely make one connection: the SSRF host allow-list.
+
+    Kept separate from FetchPolicy so RSS fetch (its own timeout and XML size
+    limit) can share only this part with page fetch, rather than inheriting
+    page-fetch-specific settings that mean something different for RSS.
+    """
+
+    allowed_private_hosts: frozenset[str]
+
+
+@dataclass(frozen=True)
+class FetchPolicy:
+    network: NetworkPolicy
+    html_max_bytes: int
+    document_max_bytes: int
+    timeout_seconds: int
+    browser_timeout_seconds: int
+
+
+def fetch_policy(config: VaultConfig) -> FetchPolicy:
+    """How to safely perform one page fetch, validated the same way fetch_retry_settings is.
+
+    allow_private_hosts mirrors terminal_failure_kinds's validation: a JSON
+    array of strings only, each entry trimmed, lowercased, and deduplicated,
+    with empty strings rejected. A bare string is rejected rather than iterated
+    character by character.
+    """
+    defaults = VaultConfig().fetch
+
+    html_max_bytes = positive_int_setting(
+        "fetch.html_max_bytes", config.fetch.get("html_max_bytes", defaults["html_max_bytes"])
+    )
+    document_max_bytes = positive_int_setting(
+        "fetch.document_max_bytes", config.fetch.get("document_max_bytes", defaults["document_max_bytes"])
+    )
+    timeout_seconds = positive_int_setting(
+        "fetch.timeout_seconds", config.fetch.get("timeout_seconds", defaults["timeout_seconds"])
+    )
+    browser_timeout_seconds = positive_int_setting(
+        "fetch.browser_timeout_seconds",
+        config.fetch.get("browser_timeout_seconds", defaults["browser_timeout_seconds"]),
+    )
+
+    hosts = config.fetch.get("allow_private_hosts", defaults["allow_private_hosts"])
+    if not isinstance(hosts, list) or not all(isinstance(host, str) for host in hosts):
+        raise ValueError("fetch.allow_private_hosts must be an array of strings.")
+    normalized_hosts: list[str] = []
+    for host in hosts:
+        normalized = host.strip().lower()
+        if not normalized:
+            raise ValueError("fetch.allow_private_hosts entries must not be empty.")
+        if normalized not in normalized_hosts:
+            normalized_hosts.append(normalized)
+
+    return FetchPolicy(
+        network=NetworkPolicy(allowed_private_hosts=frozenset(normalized_hosts)),
+        html_max_bytes=html_max_bytes,
+        document_max_bytes=document_max_bytes,
         timeout_seconds=timeout_seconds,
         browser_timeout_seconds=browser_timeout_seconds,
     )

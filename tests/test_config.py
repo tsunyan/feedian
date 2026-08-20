@@ -3,7 +3,8 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from feedian.config import Config, load_config
+from feedian.config import Config, fetch_policy_from_config, load_config
+from feedian.vault import VaultConfig
 
 
 class ConfigTests(unittest.TestCase):
@@ -26,3 +27,42 @@ class ConfigTests(unittest.TestCase):
 
         self.assertEqual(config.sync_request_interval_seconds, 0.0)
         self.assertEqual(Config(vault_path="vault").sync_request_interval_seconds, 0.5)
+
+
+class FetchPolicyFromConfigTests(unittest.TestCase):
+    """Spec 20260820-fetch-config-integrity-hardening, 改訂2: the legacy
+    `--source hatena`-style CLI keeps Config.allow_private_urls as an
+    all-or-nothing flag rather than growing a per-host allow-list."""
+
+    def test_allow_private_urls_false_allows_no_private_host(self) -> None:
+        config = Config(vault_path="vault", allow_private_urls=False)
+
+        policy = fetch_policy_from_config(config)
+
+        self.assertNotIn("localhost", policy.network.allowed_private_hosts)
+        self.assertNotIn("anything.internal", policy.network.allowed_private_hosts)
+
+    def test_allow_private_urls_true_allows_every_hostname(self) -> None:
+        config = Config(vault_path="vault", allow_private_urls=True)
+
+        policy = fetch_policy_from_config(config)
+
+        self.assertIn("localhost", policy.network.allowed_private_hosts)
+        self.assertIn("anything.internal", policy.network.allowed_private_hosts)
+
+    def test_size_and_browser_timeout_defaults_match_vault_config(self) -> None:
+        config = Config(vault_path="vault")
+        vault_defaults = VaultConfig().fetch
+
+        policy = fetch_policy_from_config(config)
+
+        self.assertEqual(policy.html_max_bytes, vault_defaults["html_max_bytes"])
+        self.assertEqual(policy.document_max_bytes, vault_defaults["document_max_bytes"])
+        self.assertEqual(policy.browser_timeout_seconds, vault_defaults["browser_timeout_seconds"])
+
+    def test_timeout_seconds_comes_from_config_request_timeout(self) -> None:
+        config = Config(vault_path="vault", request_timeout_seconds=17)
+
+        policy = fetch_policy_from_config(config)
+
+        self.assertEqual(policy.timeout_seconds, 17)

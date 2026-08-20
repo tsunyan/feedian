@@ -9,14 +9,15 @@ from email.utils import parsedate_to_datetime
 from html import unescape
 from urllib.parse import urljoin, urlsplit
 from urllib.error import HTTPError
-from urllib.request import HTTPSHandler, Request, build_opener
+from urllib.request import ProxyHandler, Request, build_opener
 
 from lxml import html as lxml_html
 
 from .canonical import CanonicalItem, url_content_key
-from .extract import SafeRedirectHandler, validate_fetch_url
+from .extract import SafeRedirectHandler, _ValidatingHTTPHandler, _ValidatingHTTPSHandler, validate_fetch_url
 from .retry import run_with_retries
 from .store import stable_json
+from .vault import NetworkPolicy
 
 
 FEED_XML_MAX_BYTES = 10 * 1024 * 1024
@@ -32,7 +33,7 @@ def fetch_rss_items(
     feed_url: str,
     *,
     timeout_seconds: int = 30,
-    allow_private_urls: bool = False,
+    network: NetworkPolicy = NetworkPolicy(allowed_private_hosts=frozenset()),
     name: str = "",
     folder: str = "",
     tags: list[str] | None = None,
@@ -43,14 +44,24 @@ def fetch_rss_items(
     max_retries: int = 3,
     retry_base_seconds: float = 1.0,
 ) -> list[RssItem]:
-    validate_fetch_url(feed_url, allow_private_urls=allow_private_urls)
+    validate_fetch_url(feed_url, allowed_private_hosts=network.allowed_private_hosts)
     headers = {"User-Agent": "feedian/0.1 (+https://github.com/tsunyan/feedian)"}
     if etag:
         headers["If-None-Match"] = etag
     if last_modified:
         headers["If-Modified-Since"] = last_modified
     request = Request(feed_url, headers=headers)
-    opener = build_opener(HTTPSHandler(context=ssl.create_default_context()), SafeRedirectHandler(allow_private_urls))
+    # RSS shares only the connection-safety settings (NetworkPolicy) with page
+    # fetch, not FetchPolicy's page-fetch-specific timeout/size limits: this
+    # function keeps its own timeout_seconds default and FEED_XML_MAX_BYTES.
+    opener = build_opener(
+        _ValidatingHTTPHandler(allowed_private_hosts=network.allowed_private_hosts),
+        _ValidatingHTTPSHandler(
+            context=ssl.create_default_context(), allowed_private_hosts=network.allowed_private_hosts
+        ),
+        SafeRedirectHandler(network.allowed_private_hosts),
+        ProxyHandler({}),
+    )
 
     def read_feed() -> tuple[bytes, str, str, str]:
         try:
@@ -110,7 +121,9 @@ def parse_rss_items(
 
     identity_url = identity_feed_url or feed_url
     atom = _local_name(root.tag) == "feed"
-    channel = root if atom else (_first_descendant(root, "channel") or root)
+    channel = root if atom else _first_descendant(root, "channel")
+    if channel is None:
+        channel = root
     feed_title = configured_name or _child_text(channel, "title")
     feed_site = _entry_link(channel, atom=atom, base_url=feed_url)
     resolved_folder = feed_folder or feed_title or _default_feed_folder(identity_url)

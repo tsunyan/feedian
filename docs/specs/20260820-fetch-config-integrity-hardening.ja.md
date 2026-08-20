@@ -8,7 +8,7 @@ ChatGPTによる外部レビューで指摘された5点(SSRF防御のDNS rebind
 
 ### A. SSRF防御のDNS rebinding対策
 
-**閉じる範囲を明確にする。** 目的は「urllibを用いるdirect fetch経路(page fetchとRSS fetchの両方)ではDNS検証と実接続を一致させ、DNS rebindingによるTOCTOUを閉じる」ことに限定する。Browser fallback(Playwright/Chromium)については、恒久的な検証キャッシュを廃止し各requestを再検証するところまでを行うが、Chromium内部の名前解決自体との間のTOCTOUは残存リスクとして受容する(下記「受け入れる不正確さ」)。
+**閉じる範囲を明確にする。** 目的は「urllibを用いるdirect fetch経路(page fetch・RSS fetch・Hatena export fetchの3経路すべて)ではDNS検証と実接続を一致させ、DNS rebindingによるTOCTOUを閉じる」ことに限定する。Browser fallback(Playwright/Chromium)については、恒久的な検証キャッシュを廃止し各requestを再検証するところまでを行うが、Chromium内部の名前解決自体との間のTOCTOUは残存リスクとして受容する(下記「受け入れる不正確さ」)。
 
 **方式は「IPを上位層へ渡す」のではなく、接続クラスの`_create_connection`を差し替える。** `http.client.HTTPConnection.connect()`は`self._create_connection((self.host, self.port), self.timeout, self.source_address)`という差し替え可能なインスタンス属性経由で接続しており、`HTTPSConnection.connect()`も`super().connect()`を通じてこれを使う。`connect()`自体は上書きしない。
 
@@ -47,7 +47,7 @@ def _validated_create_connection(address, timeout, source_address, *, allowed_pr
 
 **リダイレクトは追加の実装を要しない。** `SafeRedirectHandler`(`feedian/extract.py:115-122`)は検証済みURLへ`redirect_request`するだけであり、実際の接続はホップごとに新しい`Request`から新しい接続インスタンスを通るため、ホップごとに独立して解決・検証・接続される。
 
-**page fetchとRSS fetchは共通のtransportを共有するが、共有するのは接続の安全性設定に限る。** `feedian/rss.py`の`fetch_rss_items`(独自の`build_opener(HTTPSHandler(...), SafeRedirectHandler(...))`を持つ)も同じ`_ValidatingHTTPConnection`/`_ValidatingHTTPSConnection`経由のopenerを使う。共通化する設定は`NetworkPolicy`(下記B節)に限り、RSS固有の`timeout_seconds`(既定30秒)や`FEED_XML_MAX_BYTES`(10 MiB)はRSS側の値のまま変更しない。`fetch.timeout_seconds`(既定5秒)・`fetch.document_max_bytes`とは意味が異なる別概念であるため、`FetchPolicy`を丸ごと渡さない。
+**page fetch・RSS fetch・Hatena export fetchは共通のtransportを共有するが、共有するのは接続の安全性設定に限る。** `feedian/rss.py`の`fetch_rss_items`と`feedian/hatena.py`の`_read_export`(いずれも独自の`build_opener(HTTPSHandler(...), SafeRedirectHandler(...))`を持っていた)は、`extract.py`と同じ`_ValidatingHTTPConnection`/`_ValidatingHTTPSConnection`経由のopenerを使う。`feedian/hatena.py`にはこの3つ目の独立したopenerが実装完了後に見つかった経緯があり、改訂3を参照。`_read_entry_json`/`_read_json`(Hatena固有の固定APIエンドポイントを叩くだけで、利用者が指定するURLを扱わない)は対象外のままでよい。共通化する設定は`NetworkPolicy`(下記B節)に限り、RSS固有の`timeout_seconds`(既定30秒)や`FEED_XML_MAX_BYTES`(10 MiB)はRSS側の値のまま変更しない。`fetch.timeout_seconds`(既定5秒)・`fetch.document_max_bytes`とは意味が異なる別概念であるため、`FetchPolicy`を丸ごと渡さない。
 
 **平文HTTPとproxyも対象にする。** `build_opener`へ`_ValidatingHTTPConnection`を使う`HTTPHandler`相当のハンドラも明示的に渡す(既定の`HTTPHandler`を暗黙に使わせない)。あわせて`ProxyHandler({})`を明示し、`HTTP_PROXY`/`HTTPS_PROXY`等の環境変数によるproxy自動利用を止める。Feedianはproxy対応をこれまで文書化しておらず、`build_opener`が既定ハンドラを暗黙に追加する副作用に過ぎなかった。今回のSSRF保証(検証したアドレスに実際に接続する)を成立させるため、Feedian自身のHTTP/RSS fetch transportに限りproxyを非対応とする。ローカルLLM agentへのproxy環境変数の受け渡しとは別問題であり、変更しない。
 
@@ -255,6 +255,28 @@ def _validated_create_connection(address, timeout, source_address, *, allowed_pr
 要件所有者の判断(2026-08-20)により、legacy経路に限り全面フラグを温存し、新規のVaultConfig系統には拡張しないことにした。理由は、この経路がローカルでの単発処理・移行前の後方互換用であり、影響範囲を広げてまで統一する必要がないためである。
 
 **評価の経緯。** implementerへ委譲する前に、`grep -rn "fetch_page_text(" feedian/*.py`で全呼び出し元を確認し、`__main__.py:639,843,900,1340`が`feedian/config.py`の`Config`経由であることを特定した。ユーザーへ選択肢を提示し、「legacy経路に限り全面フラグを温存する」という回答を得た。
+
+### 改訂3 — Claude Code (2026-08-20)
+
+**該当箇所:** A節冒頭の「閉じる範囲を明確にする」段落、および「page fetchとRSS fetchは共通のtransportを共有する」段落。
+
+**(前)**
+
+> **閉じる範囲を明確にする。** 目的は「urllibを用いるdirect fetch経路(page fetchとRSS fetchの両方)ではDNS検証と実接続を一致させ、DNS rebindingによるTOCTOUを閉じる」ことに限定する。(以下略)
+>
+> **page fetchとRSS fetchは共通のtransportを共有するが、共有するのは接続の安全性設定に限る。** `feedian/rss.py`の`fetch_rss_items`(独自の`build_opener(HTTPSHandler(...), SafeRedirectHandler(...))`を持つ)も同じ`_ValidatingHTTPConnection`/`_ValidatingHTTPSConnection`経由のopenerを使う。(以下略)
+
+**(後)**
+
+> **閉じる範囲を明確にする。** 目的は「urllibを用いるdirect fetch経路(page fetch・RSS fetch・Hatena export fetchの3経路すべて)ではDNS検証と実接続を一致させ、DNS rebindingによるTOCTOUを閉じる」ことに限定する。(以下略)
+>
+> **page fetch・RSS fetch・Hatena export fetchは共通のtransportを共有するが、共有するのは接続の安全性設定に限る。** `feedian/rss.py`の`fetch_rss_items`と`feedian/hatena.py`の`_read_export`(いずれも独自の`build_opener(HTTPSHandler(...), SafeRedirectHandler(...))`を持っていた)は、`extract.py`と同じ`_ValidatingHTTPConnection`/`_ValidatingHTTPSConnection`経由のopenerを使う。`_read_entry_json`/`_read_json`(Hatena固有の固定APIエンドポイントを叩くだけで、利用者が指定するURLを扱わない)は対象外のままでよい。(以下略)
+
+**理由。** A+Bをimplementerへ委譲し実装が完了した後、`feedian/hatena.py`にA節が見落としていた3つ目の独立したopenerが存在すると判明した。`_read_export`(Hatenaエクスポート元URLを取得する関数)は`validate_fetch_url`/`SafeRedirectHandler`を呼んではいたが、`extract.py`/`rss.py`と同じ`_ValidatingHTTPHandler`/`_ValidatingHTTPSHandler`/`ProxyHandler({})`は使っておらず、平文の`HTTPSHandler`のままDNS rebinding TOCTOUが残っていた。改訂2の`feedian/config.py`と同様、`allow_private_urls: bool`という全面フラグの経路であることは事前に把握していたが、フラグの扱いにだけ注目し、opener自体がまだ安全化されていない可能性を確認していなかった。
+
+`_read_entry_json`/`_read_json`(`feedian/hatena.py`)はHatenaの固定APIエンドポイント(検索・ブックマーク数など)を叩くだけで、利用者が指定する`location`のようなURLを扱わないため、この改訂の対象には含めない。
+
+**評価の経緯。** implementerからの完了報告に、「`hatena.py`の`_read_export`はクラッシュを直すだけに留め、DNS pinningの拡張は行わなかった。これはA節の範囲(page fetchとRSS fetch)に`hatena.py`が含まれるかどうかというarchitect判断が要る」という明示的なGAPが記載されていた。`grep`で`_read_export`のopener構築(`feedian/hatena.py`)を確認し、平文の`HTTPSHandler`のままであることを確認した。`_read_entry_json`/`_read_json`は固定APIエンドポイントのみを扱うことをコードで確認し、対象外と判断した。`_read_export`のopenerを`rss.py`と同じ構成に修正し、`tests/test_hatena.py`に`build_opener`へ渡るhandlerクラスを直接検証する回帰テストを追加した(既存の`test_http_export_url_still_works_after_validate_fetch_url_was_renamed`は`build_opener`自体をmockしており、handlerの種類までは検証していなかった)。`python -m pytest -q`で505件(504+1)がパスすることを確認した。
 
 ## 草案
 

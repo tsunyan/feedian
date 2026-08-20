@@ -15,11 +15,17 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlparse
-from urllib.request import HTTPSHandler, Request, build_opener
+from urllib.request import HTTPSHandler, ProxyHandler, Request, build_opener
 from xml.etree import ElementTree
 
 from .canonical import CanonicalItem, source_id_for_url, url_content_key
-from .extract import SafeRedirectHandler, validate_fetch_url
+from .extract import (
+    AllowAllHosts,
+    SafeRedirectHandler,
+    _ValidatingHTTPHandler,
+    _ValidatingHTTPSHandler,
+    validate_fetch_url,
+)
 from .retry import run_with_retries
 
 
@@ -472,7 +478,12 @@ def _read_export(location: str, timeout_seconds: int, allow_private_urls: bool) 
     parsed = urlparse(location)
     if parsed.scheme.lower() not in {"http", "https"}:
         return Path(location).expanduser().read_bytes()
-    validate_fetch_url(location, allow_private_urls=allow_private_urls)
+    # allow_private_urls is this loader's own all-or-nothing flag, not a
+    # VaultConfig host allow-list; AllowAllHosts adapts it to the
+    # allowed_private_hosts shape validate_fetch_url/SafeRedirectHandler now take,
+    # the same way feedian.config's legacy adapter does for the CLI's Config.
+    allowed_private_hosts = AllowAllHosts() if allow_private_urls else frozenset()
+    validate_fetch_url(location, allowed_private_hosts=allowed_private_hosts)
     request = Request(
         location,
         headers={"User-Agent": "feedian/0.1 (+https://github.com/tsunyan/feedian)"},
@@ -480,8 +491,12 @@ def _read_export(location: str, timeout_seconds: int, allow_private_urls: bool) 
     )
     try:
         opener = build_opener(
-            HTTPSHandler(context=ssl.create_default_context()),
-            SafeRedirectHandler(allow_private_urls),
+            _ValidatingHTTPHandler(allowed_private_hosts=allowed_private_hosts),
+            _ValidatingHTTPSHandler(
+                context=ssl.create_default_context(), allowed_private_hosts=allowed_private_hosts
+            ),
+            SafeRedirectHandler(allowed_private_hosts),
+            ProxyHandler({}),
         )
         with opener.open(request, timeout=timeout_seconds) as response:
             return response.read()

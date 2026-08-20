@@ -27,8 +27,11 @@ from .raindrop import RaindropClient
 from .rss import RssItem, fetch_rss_items, published_timestamp
 from .store import VaultStore, sha256_bytes, stable_json
 from .vault import (
+    FetchPolicy,
     FetchRetrySettings,
+    NetworkPolicy,
     VaultConfig,
+    fetch_policy,
     fetch_retry_settings,
     normalized_rss_feeds,
     positive_int_setting,
@@ -76,6 +79,7 @@ def sync_vault(
     refresh_days = int(config.fetch.get("refresh_days", 30))
     fetch_workers = positive_int_setting("fetch.workers", config.fetch.get("workers", 8))
     retry_settings = fetch_retry_settings(config)
+    policy = fetch_policy(config)
     fingerprint = sha256_bytes(
         stable_json(
             {
@@ -122,6 +126,7 @@ def sync_vault(
                     known=known,
                     stop_after_known_pages=stop_after_known_pages,
                     on_stopped_early=stopped_early_providers.append,
+                    network=policy.network,
                 ),
                 size=max(1, fetch_workers * 4),
             ):
@@ -175,7 +180,7 @@ def sync_vault(
                         )
                     )
 
-                _fetch_prepared_pages(prepared, retry_settings=retry_settings, workers=fetch_workers)
+                _fetch_prepared_pages(prepared, policy=policy, workers=fetch_workers)
 
                 for entry in prepared:
                     item = entry.item
@@ -258,6 +263,7 @@ def sync_vault(
                     refresh_days=refresh_days,
                     force_fetch=force_fetch,
                     retry_settings=retry_settings,
+                    policy=policy,
                     workers=fetch_workers,
                 )
                 retried += provider_retried
@@ -367,7 +373,7 @@ def _place(
 
 
 def _fetch_prepared_pages(
-    prepared: list[_PreparedItem], *, retry_settings: FetchRetrySettings, workers: int
+    prepared: list[_PreparedItem], *, policy: FetchPolicy, workers: int
 ) -> None:
     """Fetch one chunk's pages, writing each result back onto its entry.
 
@@ -385,12 +391,10 @@ def _fetch_prepared_pages(
             return (
                 fetch_page_text(
                     entry.item.url,
-                    timeout_seconds=retry_settings.timeout_seconds,
+                    policy=policy,
                     max_chars=10_000,
-                    allow_private_urls=False,
                     etag=etag,
                     last_modified=last_modified,
-                    browser_timeout_seconds=retry_settings.browser_timeout_seconds,
                     allow_browser=False,
                 ),
                 None,
@@ -429,6 +433,7 @@ def _provider_items(
     known: set[str] | None = None,
     stop_after_known_pages: int = 1,
     on_stopped_early: Callable[[str], None] | None = None,
+    network: NetworkPolicy = NetworkPolicy(allowed_private_hosts=frozenset()),
 ) -> Iterable[tuple[CanonicalItem, bytes]]:
     if provider == "raindrop":
         token = _required_env("RAINDROP_TOKEN")
@@ -501,6 +506,7 @@ def _provider_items(
             try:
                 entries = fetch_rss_items(
                     feed.url,
+                    network=network,
                     name=feed.name,
                     folder=feed.folder or str(persisted.get("feed_folder") or ""),
                     tags=feed.tags,
@@ -599,6 +605,7 @@ def _run_quick_body_only_pass(
     refresh_days: int,
     force_fetch: bool,
     retry_settings: FetchRetrySettings,
+    policy: FetchPolicy,
     workers: int,
 ) -> tuple[int, int, int]:
     """Retry resources that still have no body, without touching any provider.
@@ -638,7 +645,7 @@ def _run_quick_body_only_pass(
     # unfetched_resources already yields one row per resource, so nothing here
     # needs the chunked deferral the item loop uses.
     for (resource_id, url, _validators, source_item_ids), (page, fetch_error) in zip(
-        due, _fetch_urls(due, retry_settings=retry_settings, workers=workers)
+        due, _fetch_urls(due, policy=policy, workers=workers)
     ):
         try:
             if fetch_error is not None:
@@ -678,7 +685,7 @@ def _run_quick_body_only_pass(
 def _fetch_urls(
     due: list[tuple[str, str, tuple[str, str], list[str]]],
     *,
-    retry_settings: FetchRetrySettings,
+    policy: FetchPolicy,
     workers: int,
 ) -> list[tuple[PageFetchResult | None, Exception | None]]:
     """Fetch the body-only pass's URLs, in the input order the caller stores in."""
@@ -691,12 +698,10 @@ def _fetch_urls(
             return (
                 fetch_page_text(
                     url,
-                    timeout_seconds=retry_settings.timeout_seconds,
+                    policy=policy,
                     max_chars=10_000,
-                    allow_private_urls=False,
                     etag=etag,
                     last_modified=last_modified,
-                    browser_timeout_seconds=retry_settings.browser_timeout_seconds,
                     allow_browser=False,
                 ),
                 None,

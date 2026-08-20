@@ -141,9 +141,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     restore = subparsers.add_parser("restore", help="Restore a verified SQLite snapshot only into a Vault without a database.")
     restore.add_argument("--vault", required=True, help="Vault root that has no .feedian/feedian.sqlite3 yet.")
-    restore_group = restore.add_mutually_exclusive_group(required=True)
-    restore_group.add_argument("--archive", help="Local .sqlite3.7z archive to restore.")
-    restore_group.add_argument("--tag", help="GitHub Release tag to download and restore.")
+    restore.add_argument(
+        "--tag", required=True,
+        help="GitHub Release tag whose Git-tagged .feedian/snapshot.json anchors verification.",
+    )
+    restore.add_argument(
+        "--archive",
+        help="Local .sqlite3.7z archive to restore instead of downloading it from the Release for this tag.",
+    )
 
     schedule = subparsers.add_parser("schedule", help="Manage periodic Windows Task Scheduler jobs for this Vault.")
     schedule_subparsers = schedule.add_subparsers(dest="schedule_command", required=True)
@@ -567,7 +572,7 @@ def _restore(args: argparse.Namespace) -> int:
     root = Path(args.vault).expanduser().resolve()
     paths = vault_paths(root)
     with vault_write_lock(paths.state_dir):
-        database = download_and_restore(root, args.tag) if args.tag else restore_database(root, args.archive)
+        database = restore_database(root, args.archive, args.tag) if args.archive else download_and_restore(root, args.tag)
     print(f"restored: database={database}")
     return 0
 
