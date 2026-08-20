@@ -24,7 +24,7 @@ from .ingest import (
     fallback_maximum_cost,
     resolve_fallback,
 )
-from .llm_backends import BACKEND_IDS, canonical_backend_id, get_backend
+from .llm_backends import BACKEND_IDS, BackendPolicyError, canonical_backend_id, get_backend
 from .notifications import notify_windows
 from .progress import PROGRESS_MODES, ProgressReporter
 from .restore import download_and_restore, restore_database
@@ -681,7 +681,7 @@ def _ingest(args: argparse.Namespace) -> int:
             "openai-responses": "OPENAI_MODEL",
             "manus-api": "MANUS_MODEL",
             "codex-local": "CODEX_MODEL",
-            "claude-code-local": "CLAUDE_CODE_MODEL",
+            "claude-code-local": "ANTHROPIC_MODEL",
         }[backend_id]
         environment_model = os.environ.get(backend_model_environment, "").strip()
         model = args.model or (
@@ -690,6 +690,10 @@ def _ingest(args: argparse.Namespace) -> int:
             or backend.default_model()
         )
         if not model:
+            if backend_id == "claude-code-local":
+                raise BackendPolicyError(
+                    "A model must be explicitly configured for a custom Claude Code endpoint."
+                )
             raise ValueError(f"A model must be configured for backend {backend_id}.")
         if args.limit is not None and args.limit < 0:
             raise ValueError("--limit must be zero or greater.")

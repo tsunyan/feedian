@@ -11,7 +11,9 @@
 - `codex-local`は`CODEX_HOME`をFeedian専用の`~/.feedian/codex-home`へ向ける。`--ignore-user-config`が対象とするのは`config.toml`だけで、同じディレクトリの`AGENTS.md`とskillsは読まれ続けるためである。認証はそのhomeで利用者が一度`codex login`を実行して用意し、既定の`~/.codex`は変更しない。keyring保存だと既定homeと認証を共有し得るので、`cli_auth_credentials_store="file"`をlogin確認と実行の双方でCLI overrideとして渡す。preflightはhomeに`AGENTS.md`、`plugins`、`rules`、`hooks`、`memories`、および`skills/.system`以外のskillが無いことを確認する。
 - 子processの環境変数はallowlistで組み立て、version検出・login確認・`codex exec`へ同一の環境を渡す。providerのAPI keyは渡さない。
 - **既知の制約:** CLI内蔵のsystem instructionsと内蔵skillsカタログは`CODEX_HOME`では除去できない。利用者由来の指示はすべて隔離済みである。
-- `claude-code-local` は将来用に予約するが、CLI契約と隔離ポリシーが定義されるまで利用不可とする。
+- `claude-code-local`はClaude Code CLIを記事ごとのisolated processとして起動するAPI credential専用backendである。公式endpointでは`ANTHROPIC_API_KEY`、`ANTHROPIC_BASE_URL`を設定したAnthropic Messages互換endpointでは`ANTHROPIC_API_KEY`または`ANTHROPIC_AUTH_TOKEN`の片方だけを使う。OAuthとsubscription認証は利用しない。詳細は[Claude Code APIキー対応](docs/specs/20260821-claude-code-api-key-support.ja.md)を参照する。
+- Claude Codeは`--bare`、空の`--tools`、Chrome無効、session非永続化、1 turn、JSON Schema付き構造化出力で実行する。記事とmetadataはstdinだけで渡し、子processには選択credential、互換endpoint、request専用`CLAUDE_CONFIG_DIR`と非必須通信を止める設定だけをallowlistへ追加する。対応CLI versionは`2.1.205`以上`3.0.0`未満である。
+- `ANTHROPIC_BASE_URL`は検証・正規化し、そのSHA-256だけをlogical requestと監査へ保存する。同じbackend・model・本文でもendpoint fingerprintが異なれば結果を再利用しない。公式endpointは`metered-api`、互換endpointは料金を推測せず`unknown`として扱う。
 - Vault設定はformat version 2で`llm.backend`、`llm.model`、`llm.fallback`を持つ。version 1からは`feedian migrate`による明示移行が必要である。
 - fallbackは既定で無効であり、有効化にはbackendとmodelの両方を明示する。実行前のプラン画面に宛先を表示し、無効なら`disabled`と示す。切り替わるのは`BackendUnavailableError`、`BackendRateLimitError`、`BackendTimeoutError`のときだけである。認証、ポリシー、プロトコルの失敗は設定または実装の不具合であり、別backendへの課金で覆い隠さない。fallbackの実行は宛先backendの`llm_run`として別に記録するため、監査上どちらが要約を作ったかが残る。
 - SQLite schema version 6の`llm_run`はbackend、canonical schema version、fingerprint version、auth/billing mode、実装メタデータ、所要時間を監査情報として保存する。新規runの`request_json`は成否にかかわらず`logical`と`actual`の固定envelopeを使う。

@@ -633,6 +633,12 @@ def _candidate(
         max_output_tokens=800, reasoning_effort="low",
         max_article_chars=selected_backend.capabilities.max_article_chars,
     )
+    request_identity = getattr(selected_backend, "request_identity", None)
+    if callable(request_identity):
+        identity = request_identity()
+        if not isinstance(identity, dict):
+            raise BackendPolicyError("Backend request identity must be a JSON object.")
+        request["backend_context"] = identity
     fingerprint = hashlib.sha256(stable_json(request).encode("utf-8")).hexdigest()
     # Rebuild the key exactly as the release before backend IDs wrote it, from a
     # frozen schema, so editing the provider schema cannot silently end the
@@ -849,6 +855,13 @@ def _price_record(
             "model": model,
             "billing_mode": billing_mode,
             "source": "not-metered-api",
+            "estimated_cost_usd": None,
+        }
+    if "input_tokens" not in usage or "output_tokens" not in usage:
+        return {
+            "model": model,
+            "billing_mode": billing_mode,
+            "source": "missing-usage",
             "estimated_cost_usd": None,
         }
     pricing_model = comparison_model(model)

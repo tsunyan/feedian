@@ -22,6 +22,7 @@ from feedian.llm_backends import (
     BackendCapabilities,
     BackendPolicyError,
     BackendRateLimitError,
+    ClaudeCodeLocalBackend,
 )
 from feedian.store import VaultStore
 from feedian.vault import LLMFallbackSettings, VaultConfig, initialize_vault
@@ -114,6 +115,75 @@ def test_ingest_reuses_stored_llm_result_without_calling_api(tmp_path, monkeypat
         assert written == 1
         assert skipped == 0
         assert "## Summary" in next((root / "source").glob("*.md")).read_text(encoding="utf-8")
+    finally:
+        store.close()
+
+
+def test_claude_endpoint_fingerprint_separates_cached_results(tmp_path, monkeypatch) -> None:
+    root = tmp_path / "vault"
+    root.mkdir()
+    initialize_vault(root)
+    store = VaultStore.open(root / ".feedian" / "feedian.sqlite3")
+    try:
+        item = store.upsert_canonical_item(
+            CanonicalItem(
+                source="hatena", source_id="one", content_key="url:one",
+                url="https://example.test", title="Article",
+            )
+        )
+        revision, _ = store.record_resource_revision(
+            item.resource_id or "", content_markdown="Body", title="Article",
+        )
+        model = "gateway/claude-sonnet-5"
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://gateway-a.example/api/")
+        backend_a = ClaudeCodeLocalBackend(version="2.1.205")
+        plan_a = plan_source_notes(
+            store, model=model, backend="claude-code-local", backend_instance=backend_a,
+        )
+        candidate_a = plan_a.candidates[0]
+        run_id = store.start_llm_run(
+            resource_id=item.resource_id or "",
+            resource_revision_id=revision,
+            operation="source-note",
+            model=model,
+            prompt_version="source-note-v1",
+            input_fingerprint=candidate_a.fingerprint,
+            request={"logical": candidate_a.request, "actual": None},
+            backend="claude-code-local",
+            summary_schema_version="1",
+            fingerprint_version=2,
+            auth_mode="api-key",
+            billing_mode="unknown",
+        )
+        store.finish_llm_run(
+            run_id,
+            result={
+                "note_title": "Summary", "summary": "Short", "key_points": [],
+                "tags": ["test"], "content_type": "article",
+            },
+        )
+
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://gateway-a.example:443/api///")
+        normalized_same = plan_source_notes(
+            store,
+            model=model,
+            backend="claude-code-local",
+            backend_instance=ClaudeCodeLocalBackend(version="2.1.205"),
+        )
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://gateway-b.example/api")
+        different = plan_source_notes(
+            store,
+            model=model,
+            backend="claude-code-local",
+            backend_instance=ClaudeCodeLocalBackend(version="2.1.205"),
+        )
+
+        assert normalized_same.reusable == 1
+        assert different.reusable == 0
+        assert candidate_a.fingerprint != different.candidates[0].fingerprint
+        logical = json.dumps(candidate_a.request)
+        assert "endpoint_fingerprint" in logical
+        assert "gateway-a.example" not in logical
     finally:
         store.close()
 

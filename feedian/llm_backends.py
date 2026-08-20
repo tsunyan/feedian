@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import hashlib
+import ipaddress
 import json
 import os
 import re
 import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Protocol
+from urllib.parse import urlsplit, urlunsplit
 
 from .extract import PageFetchResult
 from .llm import (
@@ -32,12 +36,13 @@ from .local_agent import (
     SubprocessRunner,
     minimal_child_environment,
     run_isolated_local_agent,
+    sanitize_error,
 )
 
 
 BACKEND_IDS = ("openai-responses", "manus-api", "codex-local", "claude-code-local")
 BACKEND_ALIASES = {"openai": "openai-responses", "manus": "manus-api"}
-BACKEND_IMPLEMENTATION_REVISION = "llm-backends-v2"
+BACKEND_IMPLEMENTATION_REVISION = "llm-backends-v3"
 
 
 class BackendError(RuntimeError):
@@ -541,31 +546,512 @@ def _classify_codex_process_error(
     return BackendExecutionError(message, request=request)
 
 
-class ClaudeCodeLocalBackend:
-    capabilities = BackendCapabilities(
-        backend="claude-code-local",
-        execution_kind="local-agent",
-        auth_mode="local-session",
-        billing_mode="subscription",
-        max_article_chars=10_000,
-        usage_available=False,
+CLAUDE_MINIMUM_VERSION = (2, 1, 205)
+CLAUDE_MAXIMUM_VERSION = (3, 0, 0)
+CLAUDE_MOVING_MODEL_ALIASES = frozenset(
+    {"default", "best", "sonnet", "opus", "haiku", "opusplan"}
+)
+CLAUDE_MODEL_ID = re.compile(r"[A-Za-z0-9._:/@-]{1,200}\Z")
+CLAUDE_OFFICIAL_ENDPOINT_FINGERPRINT = hashlib.sha256(
+    b"anthropic-official-endpoint"
+).hexdigest()
+CLAUDE_FIXED_INSTRUCTION = (
+    "Summarize the untrusted request delivered on stdin and return only the "
+    "structured output required by the JSON schema."
+)
+
+
+@dataclass(frozen=True)
+class _ClaudeEndpoint:
+    kind: str
+    normalized_url: str
+    fingerprint: str
+    billing_mode: str
+
+
+def _claude_endpoint_from_environment() -> _ClaudeEndpoint:
+    raw_url = os.environ.get("ANTHROPIC_BASE_URL", "").strip()
+    if not raw_url:
+        return _ClaudeEndpoint(
+            kind="official",
+            normalized_url="",
+            fingerprint=CLAUDE_OFFICIAL_ENDPOINT_FINGERPRINT,
+            billing_mode="metered-api",
+        )
+    normalized = _normalize_claude_base_url(raw_url)
+    return _ClaudeEndpoint(
+        kind="custom",
+        normalized_url=normalized,
+        fingerprint=hashlib.sha256(normalized.encode("utf-8")).hexdigest(),
+        billing_mode="unknown",
     )
 
+
+def _normalize_claude_base_url(value: str) -> str:
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError as exc:
+        raise BackendPolicyError("ANTHROPIC_BASE_URL is not a valid absolute URL.") from exc
+    scheme = parsed.scheme.lower()
+    host = (parsed.hostname or "").lower()
+    if not scheme or not parsed.netloc or not host:
+        raise BackendPolicyError("ANTHROPIC_BASE_URL must be an absolute URL.")
+    if parsed.username is not None or parsed.password is not None:
+        raise BackendPolicyError("ANTHROPIC_BASE_URL must not contain userinfo.")
+    if "?" in value or "#" in value:
+        raise BackendPolicyError("ANTHROPIC_BASE_URL must not contain a query or fragment.")
+    if any(character.isspace() for character in host):
+        raise BackendPolicyError("ANTHROPIC_BASE_URL host must not contain whitespace.")
+    if scheme not in {"http", "https"}:
+        raise BackendPolicyError("ANTHROPIC_BASE_URL must use https, or http for loopback.")
+    if scheme == "http":
+        is_loopback = host == "localhost"
+        if not is_loopback:
+            try:
+                is_loopback = ipaddress.ip_address(host).is_loopback
+            except ValueError:
+                is_loopback = False
+        if not is_loopback:
+            raise BackendPolicyError(
+                "Remote ANTHROPIC_BASE_URL endpoints must use https; http is loopback-only."
+            )
+    if ":" in host:
+        rendered_host = f"[{host}]"
+    else:
+        rendered_host = host
+    default_port = (scheme == "https" and port == 443) or (scheme == "http" and port == 80)
+    netloc = rendered_host if port is None or default_port else f"{rendered_host}:{port}"
+    path = parsed.path.rstrip("/")
+    return urlunsplit((scheme, netloc, path, "", ""))
+
+
+class ClaudeCodeLocalBackend:
+    def __init__(
+        self,
+        *,
+        runner: ProcessRunner | None = None,
+        executable: str = "claude",
+        version: str = "",
+        control_runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+    ) -> None:
+        self.runner = runner or SubprocessRunner()
+        self.executable = executable
+        self.version = version
+        self.control_runner = control_runner or subprocess.run
+        self.endpoint = _claude_endpoint_from_environment()
+        self.capabilities = BackendCapabilities(
+            backend="claude-code-local",
+            execution_kind="local-agent",
+            auth_mode="api-key",
+            billing_mode=self.endpoint.billing_mode,
+            max_article_chars=10_000,
+            usage_available=True,
+            max_parallelism=1,
+            min_start_interval_seconds=0.0,
+        )
+        self._resolved_executable = ""
+        self._credential_name = ""
+        self._credential_value = ""
+        self._credential_transport = ""
+        self._preflight_metadata: dict[str, Any] | None = None
+
     def default_model(self) -> str:
-        return ""
+        return "claude-sonnet-5" if self.endpoint.kind == "official" else ""
 
     def supports_model(self, model: str) -> bool:
-        del model
-        return True
+        if model.lower() in CLAUDE_MOVING_MODEL_ALIASES:
+            return False
+        if CLAUDE_MODEL_ID.fullmatch(model) is None:
+            return False
+        return self.endpoint.kind == "custom" or model.startswith("claude-")
+
+    def request_identity(self) -> dict[str, str]:
+        return {
+            "endpoint_kind": self.endpoint.kind,
+            "endpoint_fingerprint": self.endpoint.fingerprint,
+        }
+
+    def _resolve_executable(self) -> str:
+        if self._resolved_executable:
+            return self._resolved_executable
+        resolved = shutil.which(self.executable)
+        if resolved is None:
+            raise BackendUnavailableError(f"Claude Code CLI was not found: {self.executable}")
+        self._resolved_executable = resolved
+        return resolved
+
+    def _select_credential(self) -> None:
+        api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+        auth_token = os.environ.get("ANTHROPIC_AUTH_TOKEN", "").strip()
+        if self.endpoint.kind == "official":
+            if not api_key:
+                raise BackendAuthError("Missing required environment variable: ANTHROPIC_API_KEY")
+            self._credential_name = "ANTHROPIC_API_KEY"
+            self._credential_value = api_key
+            self._credential_transport = "x-api-key"
+            return
+        if bool(api_key) == bool(auth_token):
+            raise BackendAuthError(
+                "A custom ANTHROPIC_BASE_URL requires exactly one of "
+                "ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN."
+            )
+        if api_key:
+            self._credential_name = "ANTHROPIC_API_KEY"
+            self._credential_value = api_key
+            self._credential_transport = "x-api-key"
+        else:
+            self._credential_name = "ANTHROPIC_AUTH_TOKEN"
+            self._credential_value = auth_token
+            self._credential_transport = "bearer-token"
+
+    def child_environment(self, config_dir: Path) -> dict[str, str]:
+        if not self._credential_name:
+            self._select_credential()
+        config_dir.mkdir(parents=True, exist_ok=True)
+        overrides = {
+            self._credential_name: self._credential_value,
+            "CLAUDE_CONFIG_DIR": str(config_dir),
+            "DISABLE_AUTOUPDATER": "1",
+            "DISABLE_TELEMETRY": "1",
+            "DISABLE_ERROR_REPORTING": "1",
+            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+        }
+        if self.endpoint.kind == "custom":
+            overrides["ANTHROPIC_BASE_URL"] = self.endpoint.normalized_url
+        return minimal_child_environment(**overrides)
+
+    def _detect_version(self) -> str:
+        with tempfile.TemporaryDirectory(prefix="feedian-claude-preflight-") as directory:
+            config_dir = Path(directory) / "config"
+            try:
+                completed = self.control_runner(
+                    [self._resolve_executable(), "--version"],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    check=False,
+                    env=self.child_environment(config_dir),
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                raise BackendUnavailableError(f"Could not run the Claude Code CLI: {exc}") from exc
+        if completed.returncode != 0:
+            raise BackendUnavailableError(
+                f"Claude Code CLI version check exited with status {completed.returncode}."
+            )
+        match = re.search(r"(\d+\.\d+\.\d+)", completed.stdout)
+        if match is None:
+            raise BackendPolicyError("Could not read a supported version from Claude Code CLI.")
+        return match.group(1)
 
     def preflight(self) -> dict[str, Any]:
-        raise BackendPolicyError(
-            "claude-code-local is reserved but unavailable until its CLI contract and isolation policy are verified."
+        if self._preflight_metadata is not None:
+            return dict(self._preflight_metadata)
+        resolved = self._resolve_executable()
+        self._select_credential()
+        version = self.version or self._detect_version()
+        match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", version)
+        if match is None:
+            raise BackendPolicyError(f"Claude Code CLI version {version!r} is not interpretable.")
+        version_tuple = tuple(int(part) for part in match.groups())
+        if not (CLAUDE_MINIMUM_VERSION <= version_tuple < CLAUDE_MAXIMUM_VERSION):
+            raise BackendPolicyError(
+                "claude-code-local requires Claude Code CLI >=2.1.205 and <3.0.0; "
+                f"found {version}."
+            )
+        self.version = version
+        self._preflight_metadata = {
+            "implementation_revision": BACKEND_IMPLEMENTATION_REVISION,
+            "cli_version": version,
+            "executable": Path(resolved).name,
+            "auth_mode": "api-key",
+            "billing_mode": self.endpoint.billing_mode,
+            "endpoint_kind": self.endpoint.kind,
+            "endpoint_fingerprint": self.endpoint.fingerprint,
+            "credential_transport": self._credential_transport,
+        }
+        return dict(self._preflight_metadata)
+
+    def summarize(
+        self,
+        *,
+        model: str,
+        item: dict[str, Any],
+        page: PageFetchResult,
+        language: str,
+        timeout_seconds: int,
+        max_output_tokens: int,
+        reasoning_effort: str,
+        max_retries: int,
+        retry_base_seconds: float,
+        temporary_parent: Path,
+    ) -> BackendAudit:
+        del max_retries, retry_base_seconds
+        metadata = self.preflight()
+        if reasoning_effort != "low":
+            raise BackendPolicyError(
+                "claude-code-local currently supports only reasoning_effort='low'."
+            )
+        if not self.supports_model(model):
+            raise BackendPolicyError(f"claude-code-local does not support model {model!r}.")
+        planned = build_summary_request(
+            model=model,
+            item=item,
+            page=page,
+            language=language,
+            max_output_tokens=max_output_tokens,
+            reasoning_effort=reasoning_effort,
+            max_article_chars=self.capabilities.max_article_chars,
+        )
+        prompt = build_untrusted_message(str(planned["input"][0]["content"][0]["text"]))
+        schema_json = json.dumps(
+            PROVIDER_OUTPUT_SCHEMA, ensure_ascii=False, separators=(",", ":"), sort_keys=True,
         )
 
-    def summarize(self, **_kwargs: Any) -> BackendAudit:
-        self.preflight()
-        raise AssertionError("unreachable")
+        def command(_schema_path: Path) -> tuple[str, ...]:
+            return (
+                self._resolve_executable(),
+                "-p",
+                "--bare",
+                "--tools",
+                "",
+                "--no-chrome",
+                "--no-session-persistence",
+                "--max-turns",
+                "1",
+                "--output-format",
+                "json",
+                "--json-schema",
+                schema_json,
+                "--model",
+                model,
+                "--effort",
+                "low",
+                CLAUDE_FIXED_INSTRUCTION,
+            )
+
+        replacements = {schema_json: "<schema>"}
+        private_values = (
+            self._credential_value,
+            self.endpoint.normalized_url,
+            prompt,
+            page.text,
+            *(str(value) for value in item.values() if value is not None),
+        )
+        planned_argv = sanitized_argv(
+            command(Path("<temporary>")), Path("<temporary>"), replacements=replacements,
+        )
+        audit_request: dict[str, Any] = {"mode": "stdin", "argv": list(planned_argv)}
+
+        def environment(temporary_path: Path) -> dict[str, str]:
+            return self.child_environment(temporary_path / "claude-config")
+
+        try:
+            local = run_isolated_local_agent(
+                runner=self.runner,
+                command=command,
+                parse=parse_claude_response,
+                stdin_text=prompt,
+                output_schema=PROVIDER_OUTPUT_SCHEMA,
+                temporary_parent=temporary_parent,
+                timeout_seconds=timeout_seconds,
+                env=environment,
+                audit_argv_replacements=replacements,
+            )
+            audit_private_values = (
+                self._credential_value, self.endpoint.normalized_url, str(Path.home()),
+            )
+            safe_local_result = _redact_private_json(local.result, audit_private_values)
+            safe_response = _redact_private_json(local.response, audit_private_values)
+            safe_local_metadata = _redact_private_json(local.metadata, audit_private_values)
+            try:
+                result = normalize_summary_result(safe_local_result)
+            except RuntimeError as exc:
+                raise BackendProtocolError(str(exc), request=audit_request) from exc
+            audit_request = {"mode": "stdin", "argv": list(local.argv)}
+        except subprocess.TimeoutExpired as exc:
+            raise BackendTimeoutError(
+                f"claude-code-local exceeded {timeout_seconds}s.", request=audit_request,
+            ) from exc
+        except LocalAgentProcessError as exc:
+            raise _classify_claude_process_error(
+                exc,
+                {"mode": "stdin", "argv": list(exc.argv)},
+                private_values=private_values,
+                private_paths=(Path.home(), temporary_parent),
+            ) from exc
+        except BackendError as exc:
+            if exc.request is None:
+                exc.request = audit_request
+            raise
+        except Exception as exc:
+            safe_message = sanitize_error(
+                str(exc), Path.home(), temporary_parent,
+                private_values=private_values,
+            )
+            raise BackendExecutionError(safe_message, request=audit_request) from exc
+        final_metadata = dict(metadata)
+        final_metadata.update(safe_local_metadata)
+        return BackendAudit(
+            result=result,
+            request=audit_request,
+            response=safe_response,
+            usage=local.usage,
+            auth_mode="api-key",
+            billing_mode=self.endpoint.billing_mode,
+            metadata=final_metadata,
+        )
+
+
+def _redact_private_json(value: Any, private_values: tuple[str, ...]) -> Any:
+    if isinstance(value, dict):
+        return {key: _redact_private_json(item, private_values) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact_private_json(item, private_values) for item in value]
+    if isinstance(value, str):
+        sanitized = value
+        for private_value in private_values:
+            if private_value:
+                sanitized = sanitized.replace(private_value, "<redacted>")
+        return sanitized
+    return value
+
+
+def _validate_claude_structured_output(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise BackendProtocolError("Claude Code structured_output was not a JSON object.")
+    schema = PROVIDER_OUTPUT_SCHEMA
+    expected = set(schema["properties"])
+    missing = sorted(set(schema["required"]) - set(value))
+    unexpected = sorted(set(value) - expected)
+    if missing:
+        raise BackendProtocolError(
+            f"Claude Code structured_output is missing field(s): {', '.join(missing)}."
+        )
+    if unexpected:
+        raise BackendProtocolError(
+            f"Claude Code structured_output has unexpected field(s): {', '.join(unexpected)}."
+        )
+    for field_name, rules in schema["properties"].items():
+        field_value = value[field_name]
+        if rules["type"] == "array":
+            if not isinstance(field_value, list):
+                raise BackendProtocolError(
+                    f"Claude Code structured_output field {field_name} was not an array."
+                )
+            if not rules.get("minItems", 0) <= len(field_value) <= rules["maxItems"]:
+                raise BackendProtocolError(
+                    f"Claude Code structured_output field {field_name} had an invalid length."
+                )
+            for item in field_value:
+                if not isinstance(item, str) or len(item) > rules["items"]["maxLength"]:
+                    raise BackendProtocolError(
+                        f"Claude Code structured_output field {field_name} had an invalid item."
+                    )
+            continue
+        limit = rules.get("maxLength")
+        if not isinstance(field_value, str) or (limit is not None and len(field_value) > limit):
+            raise BackendProtocolError(
+                f"Claude Code structured_output field {field_name} was invalid."
+            )
+    return value
+
+
+def parse_claude_response(stdout: str) -> LocalAgentResult:
+    """Parse Claude Code's single JSON result object without accepting log text."""
+    try:
+        response = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        raise BackendProtocolError("Claude Code stdout was not one JSON object.") from exc
+    if not isinstance(response, dict):
+        raise BackendProtocolError("Claude Code stdout was not a JSON object.")
+    if (
+        response.get("type") != "result"
+        or response.get("subtype") != "success"
+        or response.get("is_error") is not False
+    ):
+        raise BackendProtocolError("Claude Code did not report a successful result.")
+    result = _validate_claude_structured_output(response.get("structured_output"))
+    raw_usage = response.get("usage")
+    usage: dict[str, int] = {}
+    if isinstance(raw_usage, dict):
+        for key in (
+            "input_tokens", "cache_creation_input_tokens",
+            "cache_read_input_tokens", "output_tokens",
+        ):
+            value = raw_usage.get(key)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                usage[key] = value
+    metadata: dict[str, object] = {}
+    session_id = response.get("session_id")
+    if isinstance(session_id, str):
+        metadata["session_id"] = session_id[:200]
+    actual_model = response.get("model")
+    model_usage = response.get("modelUsage")
+    if not isinstance(actual_model, str) and isinstance(model_usage, dict) and len(model_usage) == 1:
+        actual_model = next(iter(model_usage))
+    if isinstance(actual_model, str):
+        metadata["actual_model"] = actual_model[:200]
+    elif isinstance(model_usage, dict):
+        actual_models = sorted(
+            str(value)[:200] for value in model_usage if isinstance(value, str)
+        )
+        if actual_models:
+            metadata["actual_models"] = actual_models
+    total_cost = response.get("total_cost_usd")
+    if isinstance(total_cost, (int, float)) and not isinstance(total_cost, bool) and total_cost >= 0:
+        metadata["cli_estimated_cost_usd"] = float(total_cost)
+    audit_response: dict[str, object] = {
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "structured_output": result,
+    }
+    if usage:
+        audit_response["usage"] = usage
+    for key in ("duration_ms", "duration_api_ms", "num_turns"):
+        value = response.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            audit_response[key] = value
+    if isinstance(session_id, str):
+        audit_response["session_id"] = session_id[:200]
+    if isinstance(total_cost, (int, float)) and not isinstance(total_cost, bool) and total_cost >= 0:
+        audit_response["total_cost_usd"] = float(total_cost)
+    return LocalAgentResult(
+        result=result,
+        usage=usage,
+        response=audit_response,
+        metadata=metadata,
+    )
+
+
+def _classify_claude_process_error(
+    error: LocalAgentProcessError,
+    request: dict[str, Any],
+    *,
+    private_values: tuple[str, ...],
+    private_paths: tuple[Path, ...],
+) -> BackendError:
+    detail = sanitize_error(
+        error.diagnostics, *private_paths, private_values=private_values,
+    ).lower()
+    message = f"Claude Code CLI exited with status {error.result.returncode}."
+    if detail:
+        message = f"{message} {detail}"
+    if any(marker in detail for marker in (
+        "api key", "x-api-key", "authorization", "unauthorized", "authentication", "401",
+    )):
+        return BackendAuthError(message, request=request)
+    if any(marker in detail for marker in ("rate limit", "quota", "too many requests", "429")):
+        return BackendRateLimitError(message, request=request)
+    if any(marker in detail for marker in (
+        "connection", "network", "service unavailable", "temporarily unavailable",
+        "overloaded", "502", "503", "504",
+    )):
+        return BackendUnavailableError(message, request=request)
+    if any(marker in detail for marker in ("json", "schema", "structured_output")):
+        return BackendProtocolError(message, request=request)
+    return BackendExecutionError(message, request=request)
 
 
 def canonical_backend_id(value: str) -> str:
