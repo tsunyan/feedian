@@ -511,8 +511,6 @@ class FetchRetrySettings:
     terminal_http_statuses: tuple[int, ...]
     terminal_failure_kinds: tuple[str, ...]
     terminal_kind_failures: int
-    timeout_seconds: int
-    browser_timeout_seconds: int
 
 
 def fetch_retry_settings(config: VaultConfig) -> FetchRetrySettings:
@@ -549,17 +547,10 @@ def fetch_retry_settings(config: VaultConfig) -> FetchRetrySettings:
     if isinstance(kind_failures, bool) or not isinstance(kind_failures, int) or kind_failures < 1:
         raise ValueError("fetch.terminal_kind_failures must be an integer >= 1.")
 
-    timeout_seconds = config.fetch.get("timeout_seconds", defaults["timeout_seconds"])
-    if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, int) or timeout_seconds < 1:
-        raise ValueError("fetch.timeout_seconds must be an integer >= 1.")
-
-    browser_timeout_seconds = config.fetch.get("browser_timeout_seconds", defaults["browser_timeout_seconds"])
-    if (
-        isinstance(browser_timeout_seconds, bool)
-        or not isinstance(browser_timeout_seconds, int)
-        or browser_timeout_seconds < 1
-    ):
-        raise ValueError("fetch.browser_timeout_seconds must be an integer >= 1.")
+    # timeout_seconds/browser_timeout_seconds are validated and read from
+    # FetchPolicy (fetch_policy(), below) instead of here now; keeping a
+    # second copy on this dataclass would duplicate the same config.fetch
+    # keys and validation with no reader of its own.
 
     return FetchRetrySettings(
         retry_base_minutes=base_minutes,
@@ -567,8 +558,6 @@ def fetch_retry_settings(config: VaultConfig) -> FetchRetrySettings:
         terminal_http_statuses=tuple(deduplicated_statuses),
         terminal_failure_kinds=tuple(deduplicated_kinds),
         terminal_kind_failures=kind_failures,
-        timeout_seconds=timeout_seconds,
-        browser_timeout_seconds=browser_timeout_seconds,
     )
 
 

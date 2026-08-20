@@ -174,8 +174,6 @@ class FetchRetrySettingsTests(unittest.TestCase):
                 terminal_http_statuses=(404, 410),
                 terminal_failure_kinds=("dns", "timeout"),
                 terminal_kind_failures=3,
-                timeout_seconds=5,
-                browser_timeout_seconds=30,
             ),
         )
 
@@ -186,8 +184,6 @@ class FetchRetrySettingsTests(unittest.TestCase):
         config.fetch["terminal_http_statuses"] = [404, 451]
         config.fetch["terminal_failure_kinds"] = ["dns"]
         config.fetch["terminal_kind_failures"] = 4
-        config.fetch["timeout_seconds"] = 8
-        config.fetch["browser_timeout_seconds"] = 45
 
         settings = fetch_retry_settings(config)
 
@@ -198,8 +194,6 @@ class FetchRetrySettingsTests(unittest.TestCase):
         self.assertEqual(settings.terminal_failure_kinds, ("dns",))
         self.assertIsInstance(settings.terminal_failure_kinds, tuple)
         self.assertEqual(settings.terminal_kind_failures, 4)
-        self.assertEqual(settings.timeout_seconds, 8)
-        self.assertEqual(settings.browser_timeout_seconds, 45)
 
     def test_empty_terminal_http_statuses_disables_the_mechanism(self) -> None:
         config = VaultConfig()
@@ -276,23 +270,8 @@ class FetchRetrySettingsTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "terminal_kind_failures"):
                     fetch_retry_settings(config)
 
-    def test_timeout_seconds_rejects_invalid_values(self) -> None:
-        for invalid in (1.5, True, "2", 0, -1):
-            with self.subTest(invalid=invalid):
-                config = VaultConfig()
-                config.fetch["timeout_seconds"] = invalid
-
-                with self.assertRaisesRegex(ValueError, "timeout_seconds"):
-                    fetch_retry_settings(config)
-
-    def test_browser_timeout_seconds_rejects_invalid_values(self) -> None:
-        for invalid in (1.5, True, "2", 0, -1):
-            with self.subTest(invalid=invalid):
-                config = VaultConfig()
-                config.fetch["browser_timeout_seconds"] = invalid
-
-                with self.assertRaisesRegex(ValueError, "browser_timeout_seconds"):
-                    fetch_retry_settings(config)
+    # timeout_seconds/browser_timeout_seconds validation moved to
+    # FetchPolicyTests below: fetch_retry_settings no longer reads those keys.
 
 
 class FetchPolicyTests(unittest.TestCase):
@@ -342,6 +321,24 @@ class FetchPolicyTests(unittest.TestCase):
                 config.fetch["document_max_bytes"] = invalid
 
                 with self.assertRaisesRegex(ValueError, "document_max_bytes"):
+                    fetch_policy(config)
+
+    def test_timeout_seconds_rejects_invalid_values(self) -> None:
+        for invalid in (1.5, True, "2", 0, -1):
+            with self.subTest(invalid=invalid):
+                config = VaultConfig()
+                config.fetch["timeout_seconds"] = invalid
+
+                with self.assertRaisesRegex(ValueError, "timeout_seconds"):
+                    fetch_policy(config)
+
+    def test_browser_timeout_seconds_rejects_invalid_values(self) -> None:
+        for invalid in (1.5, True, "2", 0, -1):
+            with self.subTest(invalid=invalid):
+                config = VaultConfig()
+                config.fetch["browser_timeout_seconds"] = invalid
+
+                with self.assertRaisesRegex(ValueError, "browser_timeout_seconds"):
                     fetch_policy(config)
 
     def test_allow_private_hosts_with_one_host_only_skips_that_host(self) -> None:
