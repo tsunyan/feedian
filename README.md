@@ -21,19 +21,20 @@ fast and worth running.
 Raindrop / Hatena / RSS
 |
 v
-feedian sync                 no LLM
+feedian sync                             no LLM
 |
 v
-.feedian/feedian.sqlite3     canonical local archive
-|              |
-|              v
-|          feedian enrich-images (optional image classification and OCR)
+.feedian/feedian.sqlite3 <-----------+   canonical local archive
+|              |                     |
+|              |                     |   feedian enrich-images
+|              |                     +-- reads stored image URLs and writes
+|              |                         image OCR back into the archive
+|              |                         (optional; uses the LLM)
+v              v
+feedian render feedian ingest            ingest uses the LLM
 |              |
 v              v
-feedian render  feedian ingest
-|                    |       the LLM is used by enrich-images and ingest
-v                    v
-raw/                source/
+raw/           source/
 ```
 
 - `.feedian/feedian.sqlite3` is the canonical local archive.
@@ -146,6 +147,8 @@ Exactly one of `--limit N` or `--all` is required. Start with a limit; use `feed
 
 Stored OCR is included as untrusted original-language context in later `ingest` requests. Running `ingest` without this optional step is also supported.
 
+Adding OCR to a resource that already has a summary changes its request, so the stored summary is no longer reused. Refresh those with `feedian ingest --stale`; `--auto` skips resources that already have a source note, and a plain `--limit` takes the oldest resources rather than the changed ones.
+
 ### 6. Preview and run LLM ingest
 
 ```powershell
@@ -194,7 +197,7 @@ The active provider and model are shown in the ingest preview and execution head
 
 ```json
 {
-  "format_version": 1,
+  "format_version": 3,
   "raw_folder": "raw",
   "source_folder": "source",
   "review_folder": "review",
@@ -282,8 +285,8 @@ The active provider and model are shown in the ingest preview and execution head
 | `image_ocr.workers` | Global parallel workers for image fetching and analysis across all resources. Defaults to 8 and is capped further by the selected backend. |
 | `image_ocr.timeout_seconds` | Per-request image download timeout. Defaults to 15 seconds. |
 | `image_ocr.max_bytes` | Maximum downloaded bytes per image. Defaults to 20 MiB. |
-| `image_ocr.max_pixels` | Maximum decoded pixels per raster image. Defaults to 40,000,000. |
-| `image_ocr.min_short_edge_pixels` | Ignore raster images whose shorter edge is below this size. Defaults to 200 pixels. |
+| `image_ocr.max_pixels` | Maximum pixels declared by a raster image header. Defaults to 40,000,000. Image bytes are never decoded. |
+| `image_ocr.min_short_edge_pixels` | Ignore raster images, and SVG files that declare a size, whose shorter edge is below this. Defaults to 200 pixels. |
 | `image_ocr.max_ocr_chars_per_image` | Maximum stored OCR characters per image. Defaults to 2,000; truncated results are marked for later inspection. |
 | `image_ocr.max_ocr_images_per_resource` | Maximum explanatory-image OCR results supplied to one `ingest` request. Defaults to 8. |
 | `image_ocr.max_ocr_chars_per_resource` | Maximum total OCR characters supplied for one resource. Defaults to 10,000. |
@@ -391,7 +394,7 @@ Render SQLite records as Obsidian Markdown. Without `--apply`, output goes to `.
 
 ```powershell
 feedian ingest [--vault PATH] [--provider openai|manus] [--model MODEL] [--language LANGUAGE] [--limit N]
-               [--dry-run] [--auto] [--force]
+               [--dry-run] [--auto | --stale] [--force]
                [--progress auto|rich|plain|off]
 ```
 
@@ -405,10 +408,11 @@ Create LLM-derived `source/` notes from resources already stored by `sync`.
 | `--limit N` | Maximum candidates to process. Without `--auto`, omitted means all stored resources. |
 | `--dry-run` | Show selection, token counts, and cost estimates without API calls or writes. |
 | `--auto` | Choose representative resources, prioritizing uncovered fields and then large fields. Source tags are used first, with title terms and domain as fallbacks. |
+| `--stale` | Choose only resources with no reusable result for the current request, including those whose stored image OCR changed. Mutually exclusive with `--auto`. |
 | `--force` | Ignore reusable successful LLM results and call the API again. This can incur duplicate cost. |
 | `--progress` | Select Rich, plain, automatic, or disabled progress output. |
 
-`--auto` defaults to 20 candidates when `--limit` is omitted. A normal run reuses a matching successful result for the same content revision, model, prompt version, and request fingerprint. Each completed resource is marked in SQLite, allowing repeated stop-and-resume runs to advance without duplicating completed work.
+`--auto` defaults to 20 candidates when `--limit` is omitted. A normal run reuses a matching successful result for the same content revision, model, prompt version, and request fingerprint. Because stored image OCR is part of that fingerprint, a resource enriched after its last summary no longer matches; `--stale` selects exactly those. Plain `--limit N` takes the oldest N resources rather than the changed ones, and `--auto` skips every resource that already has a source note, so neither refreshes newly enriched summaries. Each completed resource is marked in SQLite, allowing repeated stop-and-resume runs to advance without duplicating completed work.
 
 LLM tags are stored in the `source/` note frontmatter and `## Tags` section. Provider tags collected by `sync` remain separate in raw metadata and are also supplied to the LLM as context.
 
