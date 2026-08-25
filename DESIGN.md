@@ -11,7 +11,9 @@
 - `codex-local`は`CODEX_HOME`をFeedian専用の`~/.feedian/codex-home`へ向ける。`--ignore-user-config`が対象とするのは`config.toml`だけで、同じディレクトリの`AGENTS.md`とskillsは読まれ続けるためである。認証はそのhomeで利用者が一度`codex login`を実行して用意し、既定の`~/.codex`は変更しない。keyring保存だと既定homeと認証を共有し得るので、`cli_auth_credentials_store="file"`をlogin確認と実行の双方でCLI overrideとして渡す。preflightはhomeに`AGENTS.md`、`plugins`、`rules`、`hooks`、`memories`、および`skills/.system`以外のskillが無いことを確認する。
 - 子processの環境変数はallowlistで組み立て、version検出・login確認・`codex exec`へ同一の環境を渡す。providerのAPI keyは渡さない。
 - **既知の制約:** CLI内蔵のsystem instructionsと内蔵skillsカタログは`CODEX_HOME`では除去できない。利用者由来の指示はすべて隔離済みである。
-- `claude-code-local` は将来用に予約するが、CLI契約と隔離ポリシーが定義されるまで利用不可とする。
+- `claude-code-local`はClaude Code CLIを記事ごとのisolated processとして起動するAPI credential専用backendである。公式endpointでは`ANTHROPIC_API_KEY`、`ANTHROPIC_BASE_URL`を設定したAnthropic Messages互換endpointでは`ANTHROPIC_API_KEY`または`ANTHROPIC_AUTH_TOKEN`の片方だけを使う。OAuthとsubscription認証は利用しない。詳細は[Claude Code APIキー対応](docs/specs/20260821-claude-code-api-key-support.ja.md)を参照する。
+- Claude Codeは`--bare`、空の`--tools`、Chrome無効、session非永続化、1 turn、JSON Schema付き構造化出力で実行する。記事とmetadataはstdinだけで渡し、子processには選択credential、互換endpoint、request専用`CLAUDE_CONFIG_DIR`と非必須通信を止める設定だけをallowlistへ追加する。対応CLI versionは`2.1.205`以上`3.0.0`未満である。
+- `ANTHROPIC_BASE_URL`は検証・正規化し、そのSHA-256だけをlogical requestと監査へ保存する。同じbackend・model・本文でもendpoint fingerprintが異なれば結果を再利用しない。公式endpointは`metered-api`、互換endpointは料金を推測せず`unknown`として扱う。
 - Vault設定はformat version 2で`llm.backend`、`llm.model`、`llm.fallback`を持つ。version 1からは`feedian migrate`による明示移行が必要である。
 - fallbackは既定で無効であり、有効化にはbackendとmodelの両方を明示する。実行前のプラン画面に宛先を表示し、無効なら`disabled`と示す。切り替わるのは`BackendUnavailableError`、`BackendRateLimitError`、`BackendTimeoutError`のときだけである。認証、ポリシー、プロトコルの失敗は設定または実装の不具合であり、別backendへの課金で覆い隠さない。fallbackの実行は宛先backendの`llm_run`として別に記録するため、監査上どちらが要約を作ったかが残る。
 - SQLite schema version 6の`llm_run`はbackend、canonical schema version、fingerprint version、auth/billing mode、実装メタデータ、所要時間を監査情報として保存する。新規runの`request_json`は成否にかかわらず`logical`と`actual`の固定envelopeを使う。
@@ -61,6 +63,16 @@ Webページ・RSS・Hatena exportの取得とsnapshot復元は、外部入力�
 - **課金へのcommit境界はFutureのRUNNING遷移であり、wire送信時刻ではない。** `cancel()` に成功したFutureはbackendを呼ばないので課金されず、対応する `llm_run` をmain threadが失敗終端する。`cancel()` に失敗したFutureは開始済みとして扱い、まだ送信していなくてもCtrl-C後に送られ得る。`ThreadPoolExecutor` はRUNNINGへ遷移させてからcallableを呼ぶため、この窓は必ず残る。窓に残るのはpayload組み立てだけで待機は無く、送られ得る件数はその時点のRUNNING Future数以下、すなわち利用者が選んだ並列度を超えない。`shutdown(cancel_futures=True)` はどのFutureをcancelしたか返さないため使わない。開始間隔が保証するのはscheduler投入時刻の間隔である。
 - main threadは、自分が開いた `llm_run` のうち監査結果を保存できなかったものを全て失敗終端してから `KeyboardInterrupt` を再送出する。`start_llm_run` とsubmitの間で中断されFutureを持たないrunも含む。強制終了で残った `running` は次回ingest開始時に `fail_interrupted_llm_runs()` が回収する。`vault_write_lock` の内側で呼ぶため、別processの有効なrunには触れない。
 - 並列度は対象ごとに別の設定を持つ。`fetch.workers`（本文取得、既定8）、`fetch.comment_workers`（Hatenaコメント、既定8）、`llm.workers`（ingest、既定8）。同一ホストへの同時取得は制限しない。通常のWebブラウザはHTML本文以外のリソースを同時に要求するため、8本は極端な数ではない。
+
+## 画像OCRとSourceノート名
+
+画像OCRと完全UUIDのSourceファイル名の判断理由・受け入れ基準は [画像OCRとSourceノートの完全UUIDファイル名](docs/specs/20260825-image-ocr-source-filenames.ja.md) を参照する。
+
+- `sync`はcurrent本文から抽出した画像URLとaltだけを`resource_image`へ差分保存する。URLが継続する行はIDとOCR現在値を維持し、抽出結果が0件なら既存行を削除しない。画像bytesはSQLiteへ保存しない。
+- `feedian enrich-images`は`--limit N`か`--all`を必須とする独立工程である。本文取得と同じDNS pinning・redirect検証を使い、Browserを使わない。全resource共通の`image_ocr.workers`（既定8）で取得し、名前・既知endpoint・MIME・形式・アニメーション・寸法を厳しめにgateする。rasterは対応backendで説明画像判定と原文OCRを1 requestで行い、SVGは安全なXML解析で`text` / `tspan`だけを抽出する。`image_ocr.timeout_seconds`（既定15秒）は画像HTTP取得だけに適用し、画像LLM解析は60秒を使う。DNS解決失敗は一過性失敗として次回1回だけ再試行する。
+- 取得は`source_url`単位、解析は正規化した`(source_url, alt_text)`単位で1実行内共有し、結果を選択外を含む同じcurrent行へ伝播する。1つのglobal executorへ空き枠分だけ投入し、取得済み一時fileと取得中URLの合計も`image_ocr.workers`以内に保つ。解析可能になった画像から取得と並行して処理し、画像ごとの完了時に一時fileを削除する。backend枠はmain threadが投入前に判定するため、待機だけのworkerを作らない。workerはSQLiteを触らず、`duration_ms`はworker内の実処理時間だけを記録する。失敗試行は現在値と別に記録し、既存OCRを先に消さない。
+- `ingest`はcurrent revisionの`resource_image`から`analysis_status='completed'`かつ`image_kind='explanatory'`の非空OCRをposition順に最大8枚・合計10,000文字まで読む。本文は従来の`max_article_chars`で先に切り、各画像OCRは本文と別のescape済みuntrusted blockへ入れる。`BackendCapabilities.max_message_chars`はmessage総文字数の上限を表し、`None`は上限なしである。Manusは4,500文字を宣言し、固定指示・metadata・本文・wrapperを含む完成messageの残りへ収まるOCRだけをblock単位で追加する。他backendは上限なしで10,000文字をそのまま使う。実際にOCRが1文字以上入るrequestだけ`source-note-v2`になり、入らないrequestは従来の`source-note-v1`と同一である。`--stale`は現在requestを再利用できないresourceだけを選ぶ。
+- Sourceノート名は`{60文字までのsanitized title} - {完全なresource_id}.md`である。canonical pathの同一ID管理ファイルだけをatomic更新する。旧pathはDBのcurrent Markdownと改行正規化後に一致し、同内容のcanonical fileが存在する場合だけ削除する。編集済み旧fileは保護し、別ID・非管理・解析不能なcanonical衝突は終了失敗にする。
 
 ## 本文取得の再試行抑制
 

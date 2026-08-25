@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import html
 import json
 import re
 import threading
@@ -249,6 +250,7 @@ def summarize_bookmark(
     retry_base_seconds: float,
     max_article_chars: int = 10000,
     provider: str = "openai",
+    max_message_chars: int | None = None,
 ) -> dict[str, Any]:
     audit = summarize_bookmark_with_audit(
         api_key=api_key,
@@ -263,6 +265,7 @@ def summarize_bookmark(
         retry_base_seconds=retry_base_seconds,
         max_article_chars=max_article_chars,
         provider=provider,
+        max_message_chars=max_message_chars,
     )
     result = dict(audit.result)
     result[USAGE_FIELD] = audit.usage
@@ -283,7 +286,13 @@ def summarize_bookmark_with_audit(
     max_article_chars: int = 10000,
     provider: str = "openai",
     pace_starts: bool = True,
+    max_message_chars: int | None = None,
 ) -> SummaryAudit:
+    effective_message_chars = (
+        MANUS_MAX_MESSAGE_CHARS
+        if provider == "manus" and max_message_chars is None
+        else max_message_chars
+    )
     payload = build_summary_request(
         model=model,
         item=item,
@@ -292,11 +301,13 @@ def summarize_bookmark_with_audit(
         max_output_tokens=max_output_tokens,
         reasoning_effort=reasoning_effort,
         max_article_chars=max_article_chars,
+        max_message_chars=effective_message_chars,
     )
     if provider == "manus":
         return _summarize_with_manus(
             api_key, payload, timeout_seconds, max_retries, retry_base_seconds,
             pace_starts=pace_starts,
+            max_message_chars=effective_message_chars or MANUS_MAX_MESSAGE_CHARS,
         )
     if provider != "openai":
         raise ValueError(f"Unsupported LLM provider: {provider}")
@@ -344,6 +355,7 @@ def _summarize_with_manus(
     retry_base_seconds: float,
     *,
     pace_starts: bool = True,
+    max_message_chars: int = MANUS_MAX_MESSAGE_CHARS,
 ) -> SummaryAudit:
     if pace_starts:
         # ingest paces starts in its scheduler instead, before it hands the work
@@ -352,7 +364,10 @@ def _summarize_with_manus(
         # stop the request from being sent.
         _wait_for_manus_create_slot()
     manus_payload = {
-        "message": {"content": build_manus_message(payload["input"][0]["content"][0]["text"])},
+        "message": {"content": build_manus_message(
+            payload["input"][0]["content"][0]["text"],
+            max_message_chars=max_message_chars,
+        )},
         "agent_profile": payload["model"] if payload["model"].startswith("manus-") else "manus-1.6",
         "share_visibility": "private",
         "structured_output_schema": _manus_schema(payload["text"]["format"]["schema"]),
@@ -431,14 +446,16 @@ def _manus_failure(task_identity: str, message: str) -> RuntimeError:
     )
 
 
-def build_manus_message(prompt: str) -> str:
+def build_manus_message(
+    prompt: str, *, max_message_chars: int = MANUS_MAX_MESSAGE_CHARS,
+) -> str:
     """Wrap the prompt for Manus, which has no separate system-instruction field.
 
     The instructions are repeated after the untrusted material, and truncation
     keeps the closing tag, so the untrusted block can never be left open for the
     reminder to fall inside.
     """
-    return build_untrusted_message(prompt, max_message_chars=MANUS_MAX_MESSAGE_CHARS)
+    return build_untrusted_message(prompt, max_message_chars=max_message_chars)
 
 
 def build_untrusted_message(prompt: str, *, max_message_chars: int | None = None) -> str:
@@ -447,8 +464,25 @@ def build_untrusted_message(prompt: str, *, max_message_chars: int | None = None
     if max_message_chars is not None:
         budget = max_message_chars - len(SUMMARY_INSTRUCTIONS) - len(UNTRUSTED_INPUT_REMINDER) - 4
         if len(prompt) > budget:
-            marker = "\n[Source text truncated.]\n</untrusted_page_text>"
-            prompt = prompt[: max(0, budget - len(marker))].rstrip() + marker
+            marker = "\n[Source text truncated.]"
+            tags = (
+                "untrusted_bookmark_metadata", "untrusted_page_title",
+                "untrusted_page_text", "untrusted_image_ocr",
+            )
+            closing_reserve = max(len(f"\n</{tag}>") for tag in tags)
+            prefix = prompt[: max(0, budget - len(marker) - closing_reserve)]
+            open_tag = ""
+            for tag in tags:
+                if prefix.rfind(f"<{tag}>") > prefix.rfind(f"</{tag}>"):
+                    open_tag = tag
+            closing = f"\n</{open_tag}>" if open_tag else ""
+            # `prefix` guards the loop: a budget smaller than the marker and the
+            # closing tag can never be met, and dropping characters from an empty
+            # string would spin forever. Overshooting a budget that cannot hold
+            # even the marker is the lesser failure.
+            while prefix and len(prefix.rstrip()) + len(marker) + len(closing) > budget:
+                prefix = prefix[:-1]
+            prompt = prefix.rstrip() + marker + closing
     return f"{SUMMARY_INSTRUCTIONS}\n\n{prompt}\n\n{UNTRUSTED_INPUT_REMINDER}"
 
 
@@ -535,8 +569,12 @@ def build_summary_request(
     max_output_tokens: int,
     reasoning_effort: str,
     max_article_chars: int = 10000,
+    max_message_chars: int | None = None,
 ) -> dict[str, Any]:
-    prompt = build_prompt(item=item, page=page, language=language, max_article_chars=max_article_chars)
+    prompt = build_prompt(
+        item=item, page=page, language=language, max_article_chars=max_article_chars,
+        max_message_chars=max_message_chars,
+    )
     return {
         "model": model,
         "instructions": SUMMARY_INSTRUCTIONS,
@@ -573,6 +611,7 @@ def build_prompt(
     page: PageFetchResult,
     language: str,
     max_article_chars: int | None = None,
+    max_message_chars: int | None = None,
 ) -> str:
     metadata = {
         "source": item.get("_feedian_source") or "raindrop",
@@ -592,7 +631,7 @@ def build_prompt(
         content = content[:max_article_chars]
     if page.error and not content:
         content = f"Page text unavailable. Fetch error: {page.error}"
-    return (
+    prompt = (
         f"Output language: {language}\n"
         "Create an Obsidian-ready summary for this bookmark.\n"
         "The `tags` field should contain short lowercase tags without leading #. "
@@ -607,6 +646,60 @@ def build_prompt(
         f"{content}\n"
         "</untrusted_page_text>"
     )
+    image_ocr_texts = fit_image_ocr_texts(
+        prompt, page.image_ocr_texts, max_message_chars=max_message_chars,
+    )
+    if not image_ocr_texts:
+        return prompt
+    blocks = []
+    for index, ocr_text in enumerate(image_ocr_texts, start=1):
+        blocks.append(_image_ocr_block(index, ocr_text))
+    return f"{prompt}\n\n" + "\n\n".join(blocks)
+
+
+def _image_ocr_block(index: int, ocr_text: str) -> str:
+    return (
+        "<untrusted_image_ocr>\n"
+        f"Image {index} OCR (original-language text):\n"
+        f"{html.escape(ocr_text, quote=False)}\n"
+        "</untrusted_image_ocr>"
+    )
+
+
+def fit_image_ocr_texts(
+    base_prompt: str, image_ocr_texts: tuple[str, ...], *, max_message_chars: int | None,
+) -> tuple[str, ...]:
+    """Fit ordered OCR text into the backend's complete wrapped-message budget."""
+
+    if max_message_chars is None:
+        return image_ocr_texts
+    if isinstance(max_message_chars, bool) or max_message_chars <= 0:
+        raise ValueError("max_message_chars must be a positive integer or None.")
+    selected: list[str] = []
+
+    def fits(texts: list[str]) -> bool:
+        blocks = "\n\n".join(
+            _image_ocr_block(index, text) for index, text in enumerate(texts, start=1)
+        )
+        prompt = f"{base_prompt}\n\n{blocks}" if blocks else base_prompt
+        return len(build_untrusted_message(prompt)) <= max_message_chars
+
+    for text in image_ocr_texts:
+        if fits([*selected, text]):
+            selected.append(text)
+            continue
+        lower = 0
+        upper = len(text)
+        while lower < upper:
+            middle = (lower + upper + 1) // 2
+            if fits([*selected, text[:middle]]):
+                lower = middle
+            else:
+                upper = middle - 1
+        if lower:
+            selected.append(text[:lower])
+        break
+    return tuple(selected)
 
 
 def extract_output_text(data: dict[str, Any]) -> str:

@@ -24,7 +24,8 @@ from .ingest import (
     fallback_maximum_cost,
     resolve_fallback,
 )
-from .llm_backends import BACKEND_IDS, canonical_backend_id, get_backend
+from .image_ocr import enrich_images, report_line
+from .llm_backends import BACKEND_IDS, BackendPolicyError, canonical_backend_id, get_backend
 from .notifications import notify_windows
 from .progress import PROGRESS_MODES, ProgressReporter
 from .restore import download_and_restore, restore_database
@@ -38,6 +39,7 @@ from .snapshots import create_snapshot
 from .search import rebuild_search_index, search_index_generation
 from .store import SCHEMA_VERSION
 from .vault import (
+    VAULT_CONFIG_VERSION,
     fetch_retry_settings,
     find_vault_root,
     initialize_vault,
@@ -49,7 +51,7 @@ from .vault import (
 )
 
 
-COMMANDS = frozenset({"init", "config", "status", "migrate", "sync", "reextract", "enrich-stars", "render", "run", "snapshot", "restore", "schedule", "auth", "ingest", "search"})
+COMMANDS = frozenset({"init", "config", "status", "migrate", "sync", "reextract", "enrich-stars", "enrich-images", "render", "run", "snapshot", "restore", "schedule", "auth", "ingest", "search"})
 
 
 def is_modern_command(argv: list[str]) -> bool:
@@ -124,6 +126,17 @@ def build_parser() -> argparse.ArgumentParser:
     stars.add_argument("--force", action="store_true", help="Refresh every stored Hatena comment now.")
     stars.add_argument("--progress", choices=PROGRESS_MODES, default="auto", help="Progress display mode.")
 
+    images = subparsers.add_parser(
+        "enrich-images", help="Classify explanatory images and store original-language OCR.",
+    )
+    images.add_argument("--vault", help="Vault root. Defaults to the current or configured Vault.")
+    image_scope = images.add_mutually_exclusive_group(required=True)
+    image_scope.add_argument("--limit", type=int, help="Maximum resources, oldest revision first.")
+    image_scope.add_argument("--all", action="store_true", help="Process every currently eligible resource.")
+    images.add_argument("--force", action="store_true", help="Re-fetch and re-analyze selected candidates; gates still apply.")
+    images.add_argument("--dry-run", action="store_true", help="Show the read-only plan without requests or writes.")
+    images.add_argument("--progress", choices=PROGRESS_MODES, default="auto", help="Progress display mode.")
+
     render = subparsers.add_parser("render", help="Render SQLite records as Obsidian Markdown.")
     render.add_argument("--vault", help="Vault root. Defaults to the current or configured Vault.")
     render.add_argument("--apply", action="store_true", help="Write to raw/. The default writes to .feedian/staging/raw/.")
@@ -179,9 +192,14 @@ def build_parser() -> argparse.ArgumentParser:
     ingest.add_argument("--limit", type=int)
     ingest.add_argument("--force", action="store_true", help="Ignore matching successful LLM results and run again.")
     ingest.add_argument("--dry-run", action="store_true", help="Show targets, token estimate, and maximum cost without writes or API calls.")
-    ingest.add_argument(
+    ingest_selection = ingest.add_mutually_exclusive_group()
+    ingest_selection.add_argument(
         "--auto", action="store_true",
         help="Select representative resources from uncovered and largest fields (default limit: 20).",
+    )
+    ingest_selection.add_argument(
+        "--stale", action="store_true",
+        help="Select only resources without a reusable result for the current request, including new OCR.",
     )
     ingest.add_argument("--progress", choices=PROGRESS_MODES, default="auto", help="Progress display mode.")
 
@@ -227,6 +245,8 @@ def main(argv: list[str]) -> int:
             return _reextract(args)
         if args.command == "enrich-stars":
             return _enrich_stars(args)
+        if args.command == "enrich-images":
+            return _enrich_images(args)
         if args.command == "render":
             return _render(args)
         if args.command == "run":
@@ -291,7 +311,10 @@ def _migrate(explicit_vault: str | None) -> int:
     backup_path: Path | None = None
     with vault_write_lock(paths.state_dir):
         if migrate_vault_config(root):
-            print(f"migration: vault config upgraded to format_version=2: {paths.config_path}")
+            print(
+                f"migration: vault config upgraded to format_version={VAULT_CONFIG_VERSION}: "
+                f"{paths.config_path}"
+            )
         if paths.database_path.exists() and _database_schema_version(paths.database_path) < SCHEMA_VERSION:
             backup_path = paths.state_dir / "tmp" / f"migration-v{_database_schema_version(paths.database_path)}.sqlite3"
             print(f"migration: creating temporary safety backup: {backup_path}")
@@ -527,6 +550,72 @@ def _enrich_stars(args: argparse.Namespace) -> int:
         store.close()
 
 
+def _enrich_images(args: argparse.Namespace) -> int:
+    if args.limit is not None and args.limit < 1:
+        raise ValueError("--limit must be a positive integer.")
+    root = find_vault_root(explicit=args.vault)
+    config = load_vault_config(root)
+    paths = vault_paths(root)
+    if not paths.database_path.exists():
+        raise FileNotFoundError(f"Database not found: {paths.database_path}; run feedian sync first.")
+    store = VaultStore.open(paths.database_path)
+    try:
+        if store.schema_version() < SCHEMA_VERSION:
+            raise RuntimeError("Database migration is required; run `feedian migrate --vault ...`.")
+        reporter = ProgressReporter(args.progress)
+
+        def print_plan(plan) -> None:
+            historical = (
+                f"{plan.historical_seconds_per_image:.3f}"
+                if plan.historical_seconds_per_image is not None else "unknown"
+            )
+            expected = f"{plan.expected_seconds:.1f}" if plan.expected_seconds is not None else "unknown"
+            print(
+                f"enrich-images-plan: remaining_resources={plan.remaining_resources} "
+                f"resources={plan.resources} candidate_rows={plan.candidate_rows} "
+                f"fetch_urls={plan.fetch_urls} analysis_groups={plan.analysis_groups} "
+                f"reused_existing={plan.reused_existing} llm_parallelism={plan.llm_parallelism} "
+                f"historical_seconds_per_image={historical} expected_seconds={expected}"
+            )
+            if not args.dry_run:
+                reporter.start_task("enrich-images: processing resources", total=plan.resources)
+
+        if args.dry_run:
+            report = enrich_images(
+                store, root, config, limit=args.limit, all_resources=args.all,
+                force=args.force, dry_run=True, planning=print_plan,
+            )
+        else:
+            with reporter:
+                with vault_write_lock(paths.state_dir):
+                    store.fail_interrupted_llm_runs()
+                    try:
+                        report = enrich_images(
+                            store, root, config, limit=args.limit, all_resources=args.all,
+                            force=args.force, planning=print_plan,
+                            progress=lambda _completed, _total: reporter.advance(),
+                        )
+                    except BaseException:
+                        store.fail_interrupted_llm_runs()
+                        temporary_root = paths.state_dir / "tmp"
+                        if temporary_root.exists():
+                            for temporary_image in temporary_root.glob("feedian-image-*"):
+                                if temporary_image.is_file():
+                                    temporary_image.unlink(missing_ok=True)
+                        raise
+        print(
+            f"enrich-images: remaining_resources={report.remaining_resources} "
+            f"{report_line(report)}"
+        )
+        for reason, count in sorted(report.ignored_reasons.items()):
+            print(f"  ignored_reason[{reason}]={count}")
+        for kind, count in sorted(report.failure_kinds.items()):
+            print(f"  failure_kind[{kind}]={count}")
+        return 1 if report.failed else 0
+    finally:
+        store.close()
+
+
 def _snapshot(args: argparse.Namespace) -> int:
     root = find_vault_root(explicit=args.vault)
     config = load_vault_config(root)
@@ -681,7 +770,7 @@ def _ingest(args: argparse.Namespace) -> int:
             "openai-responses": "OPENAI_MODEL",
             "manus-api": "MANUS_MODEL",
             "codex-local": "CODEX_MODEL",
-            "claude-code-local": "CLAUDE_CODE_MODEL",
+            "claude-code-local": "ANTHROPIC_MODEL",
         }[backend_id]
         environment_model = os.environ.get(backend_model_environment, "").strip()
         model = args.model or (
@@ -690,16 +779,28 @@ def _ingest(args: argparse.Namespace) -> int:
             or backend.default_model()
         )
         if not model:
+            if backend_id == "claude-code-local":
+                raise BackendPolicyError(
+                    "A model must be explicitly configured for a custom Claude Code endpoint."
+                )
             raise ValueError(f"A model must be configured for backend {backend_id}.")
         if args.limit is not None and args.limit < 0:
             raise ValueError("--limit must be zero or greater.")
         if args.dry_run:
             plan = plan_source_notes(
                 store, model=model, language=args.language, limit=args.limit,
-                force=args.force, auto=args.auto, backend=backend_id, backend_instance=backend,
+                force=args.force, auto=args.auto, stale=args.stale, backend=backend_id,
+                backend_instance=backend, image_ocr=config.image_ocr,
             )
             print_ingest_plan(
                 plan, backend=backend_id, fallback=fallback_label, fallback_max_cost_usd=fallback_maximum_cost(plan, fallback), model=model, dry_run=True, command=args._invocation,
+            )
+            source_report = render_source_notes(store, root, config, dry_run=True)
+            print(
+                f"source-plan: source_written={source_report.written} "
+                f"source_skipped={source_report.skipped} source_migrated={source_report.migrated} "
+                f"source_protected={source_report.protected} "
+                f"source_blocking_conflicts={source_report.blocking_conflicts}"
             )
             return 0
 
@@ -707,7 +808,8 @@ def _ingest(args: argparse.Namespace) -> int:
         with vault_write_lock(paths.state_dir):
             plan = plan_source_notes(
                 store, model=model, language=args.language, limit=args.limit,
-                force=args.force, auto=args.auto, backend=backend_id, backend_instance=backend,
+                force=args.force, auto=args.auto, stale=args.stale, backend=backend_id,
+                backend_instance=backend, image_ocr=config.image_ocr,
             )
             print_ingest_plan(
                 plan, backend=backend_id, fallback=fallback_label, fallback_max_cost_usd=fallback_maximum_cost(plan, fallback), model=model, dry_run=False, command=args._invocation,
@@ -736,18 +838,21 @@ def _ingest(args: argparse.Namespace) -> int:
                 report = ingest_source_notes(
                     store, root, config, model=model, language=args.language,
                     limit=args.limit, force=args.force, auto=args.auto,
+                    stale=args.stale,
                     progress=ingest_progress, plan=plan, backend=backend_id,
                     backend_instance=backend,
                 )
-                written, skipped = render_source_notes(store, root, config)
+                source_report = render_source_notes(store, root, config)
         print(
             f"ingest: processed={report.processed} created={report.created} reused={report.reused} "
             f"failed={report.failed} input_tokens={report.input_tokens} output_tokens={report.output_tokens} "
             f"unmetered_requests={report.unmetered_requests} cost_usd={ingest_cost_value(report)} "
             f"unpriced_requests={report.unpriced_requests} "
-            f"source_written={written} source_skipped={skipped}"
+            f"source_written={source_report.written} source_skipped={source_report.skipped} "
+            f"source_migrated={source_report.migrated} source_protected={source_report.protected} "
+            f"source_blocking_conflicts={source_report.blocking_conflicts}"
         )
-        return 1 if report.failed else 0
+        return 1 if report.failed or source_report.blocking_conflicts else 0
     finally:
         store.close()
 

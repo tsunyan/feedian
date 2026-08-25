@@ -22,7 +22,10 @@ from feedian.llm_backends import (
     BackendCapabilities,
     BackendPolicyError,
     BackendRateLimitError,
+    ClaudeCodeLocalBackend,
 )
+from feedian.ids import uuid7
+from feedian.markdown import utc_now
 from feedian.store import VaultStore
 from feedian.vault import LLMFallbackSettings, VaultConfig, initialize_vault
 
@@ -37,6 +40,7 @@ class FakeBackend:
         execution_kind: str = "http",
         billing_mode: str = "metered-api",
         error: Exception | None = None,
+        max_message_chars: int | None = None,
     ) -> None:
         self.audit = audit
         self.error = error
@@ -49,6 +53,7 @@ class FakeBackend:
             billing_mode=billing_mode,
             max_article_chars=3_000 if backend == "manus-api" else 10_000,
             usage_available=bool(getattr(audit, "usage", {})),
+            max_message_chars=max_message_chars,
         )
 
     def default_model(self) -> str:
@@ -74,6 +79,57 @@ class FakeBackend:
             billing_mode=self.capabilities.billing_mode,
             metadata={"implementation_revision": "test"},
         )
+
+
+def test_only_completed_image_ocr_switches_the_summary_request_to_v2(tmp_path) -> None:
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    backend = FakeBackend(type("Audit", (), {"usage": {}, "result": {}, "request": {}, "response": {}})())
+    try:
+        item = store.upsert_canonical_item(CanonicalItem(
+            source="hatena", source_id="ocr", content_key="url:ocr",
+            url="https://example.test/ocr", title="OCR article",
+        ))
+        resource_id = item.resource_id or ""
+        revision_id, _ = store.record_resource_revision(
+            resource_id, content_markdown="B" * 12_000, title="OCR article",
+        )
+        without_ocr = plan_source_notes(
+            store, model="model", backend_instance=backend,
+        ).candidates[0]
+        store.replace_resource_images(
+            resource_id=resource_id, resource_revision_id=revision_id,
+            images=[("https://example.test/diagram.png", "Diagram")],
+        )
+        image_id = str(store.connection.execute(
+            "SELECT resource_image_id FROM resource_image WHERE resource_id = ?", (resource_id,),
+        ).fetchone()[0])
+        store.apply_image_analysis([image_id], {
+            "analysis_status": "completed", "analysis_method": "llm", "image_kind": "explanatory",
+            "ocr_text": "Original labels", "ocr_truncated": 0, "ocr_char_limit": 2_000,
+        })
+        with_ocr = plan_source_notes(
+            store, model="model", backend_instance=backend,
+        ).candidates[0]
+        no_room = plan_source_notes(
+            store, model="model", backend_instance=FakeBackend(None, max_message_chars=1),
+        ).candidates[0]
+        store.apply_image_analysis([image_id], {"analysis_status": "pending"})
+        pending = plan_source_notes(
+            store, model="model", backend_instance=backend,
+        ).candidates[0]
+    finally:
+        store.close()
+
+    assert without_ocr.prompt_version == "source-note-v1"
+    assert with_ocr.prompt_version == "source-note-v2"
+    prompt = str(with_ocr.request["input"][0]["content"][0]["text"])
+    assert "B" * 10_000 in prompt
+    assert "B" * 10_001 not in prompt
+    assert "Original labels" in prompt
+    assert no_room.prompt_version == "source-note-v1"
+    assert no_room.request == without_ocr.request
+    assert pending.prompt_version == "source-note-v1"
+    assert pending.request == without_ocr.request
 
 
 def test_ingest_reuses_stored_llm_result_without_calling_api(tmp_path, monkeypatch) -> None:
@@ -103,7 +159,7 @@ def test_ingest_reuses_stored_llm_result_without_calling_api(tmp_path, monkeypat
         second = ingest_source_notes(
             store, root, VaultConfig(), model="gpt-5.6-terra", backend_instance=backend
         )
-        written, skipped = render_source_notes(store, root, VaultConfig())
+        source_report = render_source_notes(store, root, VaultConfig())
 
         assert first.created == 1
         assert first.input_tokens == 1
@@ -111,9 +167,78 @@ def test_ingest_reuses_stored_llm_result_without_calling_api(tmp_path, monkeypat
         assert first.cost_usd > 0
         assert len(progress) == 1
         assert second.reused == 1
-        assert written == 1
-        assert skipped == 0
+        assert source_report.written == 1
+        assert source_report.skipped == 0
         assert "## Summary" in next((root / "source").glob("*.md")).read_text(encoding="utf-8")
+    finally:
+        store.close()
+
+
+def test_claude_endpoint_fingerprint_separates_cached_results(tmp_path, monkeypatch) -> None:
+    root = tmp_path / "vault"
+    root.mkdir()
+    initialize_vault(root)
+    store = VaultStore.open(root / ".feedian" / "feedian.sqlite3")
+    try:
+        item = store.upsert_canonical_item(
+            CanonicalItem(
+                source="hatena", source_id="one", content_key="url:one",
+                url="https://example.test", title="Article",
+            )
+        )
+        revision, _ = store.record_resource_revision(
+            item.resource_id or "", content_markdown="Body", title="Article",
+        )
+        model = "gateway/claude-sonnet-5"
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://gateway-a.example/api/")
+        backend_a = ClaudeCodeLocalBackend(version="2.1.205")
+        plan_a = plan_source_notes(
+            store, model=model, backend="claude-code-local", backend_instance=backend_a,
+        )
+        candidate_a = plan_a.candidates[0]
+        run_id = store.start_llm_run(
+            resource_id=item.resource_id or "",
+            resource_revision_id=revision,
+            operation="source-note",
+            model=model,
+            prompt_version="source-note-v1",
+            input_fingerprint=candidate_a.fingerprint,
+            request={"logical": candidate_a.request, "actual": None},
+            backend="claude-code-local",
+            summary_schema_version="1",
+            fingerprint_version=2,
+            auth_mode="api-key",
+            billing_mode="unknown",
+        )
+        store.finish_llm_run(
+            run_id,
+            result={
+                "note_title": "Summary", "summary": "Short", "key_points": [],
+                "tags": ["test"], "content_type": "article",
+            },
+        )
+
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://gateway-a.example:443/api///")
+        normalized_same = plan_source_notes(
+            store,
+            model=model,
+            backend="claude-code-local",
+            backend_instance=ClaudeCodeLocalBackend(version="2.1.205"),
+        )
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://gateway-b.example/api")
+        different = plan_source_notes(
+            store,
+            model=model,
+            backend="claude-code-local",
+            backend_instance=ClaudeCodeLocalBackend(version="2.1.205"),
+        )
+
+        assert normalized_same.reusable == 1
+        assert different.reusable == 0
+        assert candidate_a.fingerprint != different.candidates[0].fingerprint
+        logical = json.dumps(candidate_a.request)
+        assert "endpoint_fingerprint" in logical
+        assert "gateway-a.example" not in logical
     finally:
         store.close()
 
@@ -1079,5 +1204,75 @@ def test_a_dry_run_leaves_another_process_running_llm_run_alone(tmp_path, monkey
             "SELECT COUNT(*) FROM llm_run WHERE status = 'running'"
         ).fetchone()[0]
         assert still_running == 1, "planning and a dry run must not touch it"
+    finally:
+        store.close()
+
+
+def test_render_source_notes_rejects_a_resource_id_that_is_not_a_bare_uuid(tmp_path) -> None:
+    """resource_id is unrestricted TEXT but is interpolated into the output path.
+
+    A value carrying separators would be read as directory structure, letting a
+    note land outside the configured Source folder.
+    """
+
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        item = store.upsert_canonical_item(CanonicalItem(
+            source="hatena", source_id="bad", content_key="url:bad",
+            url="https://example.test/bad", title="Title",
+        ))
+        resource_id = item.resource_id or ""
+        store.record_resource_revision(resource_id, content_markdown="body", title="Title")
+        store.put_source_note(resource_id=resource_id, llm_run_id=None, markdown="---\nx\n")
+        # Rewrite both sides together: the archive stores resource_id as
+        # unrestricted TEXT, so a malformed value is reachable even though no
+        # Feedian code path writes one today.
+        store.connection.execute("PRAGMA foreign_keys=OFF")
+        store.connection.execute(
+            "UPDATE resource SET resource_id = ? WHERE resource_id = ?",
+            ("../../../outside", resource_id),
+        )
+        store.connection.execute(
+            "UPDATE source_note SET resource_id = ? WHERE resource_id = ?",
+            ("../../../outside", resource_id),
+        )
+        store.connection.commit()
+        store.connection.execute("PRAGMA foreign_keys=ON")
+
+        report = render_source_notes(store, tmp_path, VaultConfig())
+
+        assert report.written == 0
+        assert report.blocking_conflicts == 1
+        assert not list(tmp_path.parent.glob("outside*"))
+        assert not list((tmp_path / VaultConfig().source_folder).glob("*.md"))
+    finally:
+        store.close()
+
+
+def test_render_source_notes_rejects_every_duplicate_current_note(tmp_path) -> None:
+    """The second duplicate removed the plan entry, so a third row re-entered it."""
+
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        item = store.upsert_canonical_item(CanonicalItem(
+            source="hatena", source_id="dup", content_key="url:dup",
+            url="https://example.test/dup", title="Title",
+        ))
+        resource_id = item.resource_id or ""
+        store.record_resource_revision(resource_id, content_markdown="body", title="Title")
+        store.put_source_note(resource_id=resource_id, llm_run_id=None, markdown="first")
+        for body in ("second", "third"):
+            store.connection.execute(
+                "INSERT INTO source_note(source_note_id, resource_id, llm_run_id, markdown,"
+                " markdown_hash, created_at) VALUES (?, ?, NULL, ?, ?, ?)",
+                (uuid7(), resource_id, body, body, utc_now()),
+            )
+        store.connection.commit()
+
+        report = render_source_notes(store, tmp_path, VaultConfig())
+
+        assert report.written == 0
+        assert report.blocking_conflicts == 1
+        assert not list((tmp_path / VaultConfig().source_folder).glob("*.md"))
     finally:
         store.close()

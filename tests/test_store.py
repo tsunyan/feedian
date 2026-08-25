@@ -64,11 +64,82 @@ def test_store_creates_schema_and_deduplicates_payload(tmp_path) -> None:
         second = store.put_payload(b"<html>same</html>", media_type="text/html")
 
         assert first == second
-        assert store.schema_version() == 9
+        assert store.schema_version() == 10
         assert store.quick_check() == "ok"
         assert store.integrity_check() == "ok"
     finally:
         store.close()
+
+
+def test_resource_image_diff_update_preserves_ocr_and_empty_extraction(tmp_path) -> None:
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        item = store.upsert_canonical_item(_item())
+        resource_id = item.resource_id or ""
+        first_revision, _ = store.record_resource_revision(resource_id, content_markdown="First")
+        store.replace_resource_images(
+            resource_id=resource_id, resource_revision_id=first_revision,
+            images=[("https://example.test/chart.png", "Old alt")],
+        )
+        image_id = str(store.connection.execute(
+            "SELECT resource_image_id FROM resource_image WHERE resource_id = ?", (resource_id,),
+        ).fetchone()[0])
+        store.apply_image_analysis([image_id], {
+            "analysis_status": "completed", "analysis_method": "llm", "image_kind": "explanatory",
+            "ocr_text": "Stored OCR", "ocr_truncated": 0, "ocr_char_limit": 2_000,
+        })
+
+        second_revision, _ = store.record_resource_revision(resource_id, content_markdown="Second")
+        store.replace_resource_images(
+            resource_id=resource_id, resource_revision_id=second_revision,
+            images=[("https://example.test/chart.png", "New alt")],
+        )
+        store.replace_resource_images(
+            resource_id=resource_id, resource_revision_id=second_revision, images=[],
+        )
+        row = store.connection.execute(
+            "SELECT * FROM resource_image WHERE resource_id = ?", (resource_id,),
+        ).fetchone()
+
+        assert row["resource_image_id"] == image_id
+        assert row["resource_revision_id"] == second_revision
+        assert row["alt_text"] == "New alt"
+        assert row["analysis_status"] == "completed"
+        assert row["ocr_text"] == "Stored OCR"
+    finally:
+        store.close()
+
+
+def test_v9_to_v10_rebuild_preserves_image_rows_and_adds_ocr_foreign_key(tmp_path) -> None:
+    path = tmp_path / "feedian.sqlite3"
+    store = VaultStore.open(path)
+    try:
+        item = store.upsert_canonical_item(_item())
+        resource_id = item.resource_id or ""
+        revision_id, _ = store.record_resource_revision(resource_id, content_markdown="Body")
+        store.replace_resource_images(
+            resource_id=resource_id, resource_revision_id=revision_id,
+            images=[("https://example.test/diagram.png", "Diagram")],
+        )
+        image_id = str(store.connection.execute("SELECT resource_image_id FROM resource_image").fetchone()[0])
+        store.connection.execute("UPDATE schema_meta SET value = '9' WHERE key = 'schema_version'")
+        store.connection.commit()
+    finally:
+        store.close()
+
+    migrated = VaultStore.open(path, allow_migration=True)
+    try:
+        row = migrated.connection.execute("SELECT * FROM resource_image").fetchone()
+        foreign_keys = migrated.connection.execute("PRAGMA foreign_key_list(resource_image)").fetchall()
+        assert migrated.schema_version() == 10
+        assert row["resource_image_id"] == image_id
+        assert row["analysis_status"] == "pending"
+        assert row["ocr_text"] == ""
+        assert any(key[2] == "llm_run" and key[3] == "ocr_llm_run_id" for key in foreign_keys)
+        assert migrated.quick_check() == "ok"
+        assert migrated.integrity_check() == "ok"
+    finally:
+        migrated.close()
 
 
 def test_store_keeps_source_items_separate_and_shares_resource_by_url(tmp_path) -> None:
@@ -343,7 +414,7 @@ def test_v1_migration_prunes_history_images_and_inline_fts(tmp_path) -> None:
 
     migrated = VaultStore.open(path, allow_migration=True)
     try:
-        assert migrated.schema_version() == 9
+        assert migrated.schema_version() == 10
         assert migrated.status_counts()["source_item_revision"] == 1
         assert migrated.status_counts()["resource_revision"] == 1
         assert migrated.connection.execute("SELECT COUNT(*) FROM fetch_capture").fetchone()[0] == 1
@@ -469,7 +540,7 @@ def test_v4_migration_adds_fetch_validators_and_commits(tmp_path) -> None:
             str(row[1]) for row in migrated.connection.execute("PRAGMA table_info(fetch_capture)")
         }
         assert {"response_etag", "response_last_modified"} <= columns
-        assert migrated.schema_version() == 9
+        assert migrated.schema_version() == 10
     finally:
         migrated.close()
 
@@ -526,7 +597,7 @@ def test_v5_migration_backfills_llm_backend_audit_columns(tmp_path) -> None:
             """,
             (run_id,),
         ).fetchone()
-        assert migrated.schema_version() == 9
+        assert migrated.schema_version() == 10
         assert tuple(row) == (
             "openai-responses",
             "1",
@@ -579,7 +650,7 @@ def test_a_migrated_database_has_the_same_llm_run_columns_as_a_fresh_one(tmp_pat
     def llm_run_columns(path) -> dict[str, tuple]:
         store = VaultStore.open(path, allow_migration=True)
         try:
-            assert store.schema_version() == 9
+            assert store.schema_version() == 10
             rows = store.connection.execute("PRAGMA table_info(llm_run)").fetchall()
             return {row[1]: (row[2], row[3], row[5]) for row in rows}
         finally:
@@ -1032,7 +1103,7 @@ def test_v6_migration_backfills_full_mode_on_existing_sync_runs(tmp_path) -> Non
 
     migrated = VaultStore.open(path, allow_migration=True)
     try:
-        assert migrated.schema_version() == 9
+        assert migrated.schema_version() == 10
         mode = migrated.connection.execute(
             "SELECT mode FROM sync_run WHERE sync_run_id = ?", (run_id,)
         ).fetchone()["mode"]
@@ -1297,7 +1368,7 @@ def test_v7_migration_backfills_retry_state_on_a_failed_capture(tmp_path) -> Non
 
     migrated = VaultStore.open(path, allow_migration=True)
     try:
-        assert migrated.schema_version() == 9
+        assert migrated.schema_version() == 10
         columns = {
             str(row[1]) for row in migrated.connection.execute("PRAGMA table_info(fetch_capture)")
         }
@@ -1680,7 +1751,7 @@ def test_v8_migration_resets_high_consecutive_failures_to_one(tmp_path) -> None:
 
     migrated = VaultStore.open(path, allow_migration=True)
     try:
-        assert migrated.schema_version() == 9
+        assert migrated.schema_version() == 10
         rows = {
             resource_id: migrated.connection.execute(
                 "SELECT consecutive_failures, failure_kind FROM fetch_capture WHERE resource_id = ?",
@@ -1784,7 +1855,7 @@ def test_a_migrated_database_has_the_same_fetch_capture_columns_as_a_fresh_one(t
     def fetch_capture_columns(path) -> dict[str, tuple]:
         store = VaultStore.open(path, allow_migration=True)
         try:
-            assert store.schema_version() == 9
+            assert store.schema_version() == 10
             rows = store.connection.execute("PRAGMA table_info(fetch_capture)").fetchall()
             return {row[1]: (row[2], row[3], row[5]) for row in rows}
         finally:

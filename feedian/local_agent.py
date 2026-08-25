@@ -7,7 +7,7 @@ import shutil
 import signal
 import subprocess
 import tempfile
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Mapping, Protocol, Sequence
 
@@ -166,14 +166,25 @@ class LocalAgentResult:
     result: dict[str, object]
     usage: dict[str, int]
     argv: tuple[str, ...] = ()
+    response: dict[str, object] = field(default_factory=dict)
+    metadata: dict[str, object] = field(default_factory=dict)
 
 
-def sanitized_argv(argv: Sequence[str], temporary_path: Path) -> tuple[str, ...]:
+def sanitized_argv(
+    argv: Sequence[str],
+    temporary_path: Path,
+    *,
+    replacements: Mapping[str, str] | None = None,
+) -> tuple[str, ...]:
     """Strip machine-specific paths from a real argv so it can be audited."""
     placeholder = "<temporary>"
+    replacements = replacements or {}
     sanitized = [Path(str(argv[0])).name]
     for argument in argv[1:]:
-        sanitized.append(str(argument).replace(str(temporary_path), placeholder))
+        rendered = str(argument)
+        sanitized.append(
+            replacements.get(rendered, rendered.replace(str(temporary_path), placeholder))
+        )
     return tuple(sanitized)
 
 
@@ -186,14 +197,17 @@ def run_isolated_local_agent(
     output_schema: dict[str, object],
     temporary_parent: Path,
     timeout_seconds: float,
-    env: Mapping[str, str],
+    env: Mapping[str, str] | Callable[[Path], Mapping[str, str]],
+    audit_argv_replacements: Mapping[str, str] | None = None,
 ) -> LocalAgentResult:
     """Run one local-agent process without placing untrusted input in argv.
 
     The caller supplies the command builder and the event parser, because flags
     and event formats belong to each CLI rather than to this runner. Only the
-    schema path is exposed to the child; the article and prompt are delivered
-    exclusively through stdin.
+    schema path is exposed to CLIs that require one; adapters with an inline
+    schema replace that argument in the audit copy. The article and prompt are
+    delivered exclusively through stdin. An environment factory may derive a
+    per-request config directory from the isolated temporary path.
     """
 
     temporary_parent = temporary_parent.resolve()
@@ -214,14 +228,17 @@ def run_isolated_local_agent(
         argv = tuple(str(value) for value in command(schema_path))
         if stdin_text and any(stdin_text in argument for argument in argv):
             raise RuntimeError("Untrusted local-agent input must not appear in argv.")
+        child_environment = env(temporary_path) if callable(env) else env
         completed = runner.run(
             argv,
             stdin_text=stdin_text,
             cwd=temporary_path,
             timeout_seconds=timeout_seconds,
-            env=env,
+            env=child_environment,
         )
-        audit_argv = sanitized_argv(argv, temporary_path)
+        audit_argv = sanitized_argv(
+            argv, temporary_path, replacements=audit_argv_replacements,
+        )
         if completed.returncode != 0:
             raise LocalAgentProcessError(completed, audit_argv)
         parsed = parse(completed.stdout)
@@ -242,7 +259,7 @@ def sanitize_error(
         if private_value:
             sanitized = sanitized.replace(private_value, "<redacted-content>")
     sanitized = re.sub(
-        r"(?i)(Authorization:\s*Bearer\s+|Bearer\s+|x-manus-api-key:\s*)\S+",
+        r"(?i)(Authorization:\s*(?:Bearer\s+)?|Bearer\s+|x-(?:manus-)?api-key:\s*|api[_ -]?key[=:]\s*)\S+",
         lambda match: f"{match.group(1)}<redacted>",
         sanitized,
     )
