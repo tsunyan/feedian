@@ -1204,3 +1204,44 @@ def test_a_dry_run_leaves_another_process_running_llm_run_alone(tmp_path, monkey
         assert still_running == 1, "planning and a dry run must not touch it"
     finally:
         store.close()
+
+
+def test_render_source_notes_rejects_a_resource_id_that_is_not_a_bare_uuid(tmp_path) -> None:
+    """resource_id is unrestricted TEXT but is interpolated into the output path.
+
+    A value carrying separators would be read as directory structure, letting a
+    note land outside the configured Source folder.
+    """
+
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        item = store.upsert_canonical_item(CanonicalItem(
+            source="hatena", source_id="bad", content_key="url:bad",
+            url="https://example.test/bad", title="Title",
+        ))
+        resource_id = item.resource_id or ""
+        store.record_resource_revision(resource_id, content_markdown="body", title="Title")
+        store.put_source_note(resource_id=resource_id, llm_run_id=None, markdown="---\nx\n")
+        # Rewrite both sides together: the archive stores resource_id as
+        # unrestricted TEXT, so a malformed value is reachable even though no
+        # Feedian code path writes one today.
+        store.connection.execute("PRAGMA foreign_keys=OFF")
+        store.connection.execute(
+            "UPDATE resource SET resource_id = ? WHERE resource_id = ?",
+            ("../../../outside", resource_id),
+        )
+        store.connection.execute(
+            "UPDATE source_note SET resource_id = ? WHERE resource_id = ?",
+            ("../../../outside", resource_id),
+        )
+        store.connection.commit()
+        store.connection.execute("PRAGMA foreign_keys=ON")
+
+        report = render_source_notes(store, tmp_path, VaultConfig())
+
+        assert report.written == 0
+        assert report.blocking_conflicts == 1
+        assert not list(tmp_path.parent.glob("outside*"))
+        assert not list((tmp_path / VaultConfig().source_folder).glob("*.md"))
+    finally:
+        store.close()

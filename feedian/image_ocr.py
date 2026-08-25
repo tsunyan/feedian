@@ -624,6 +624,14 @@ def enrich_images(
         return report
     if not backend.capabilities.image_analysis:
         raise BackendPolicyError(f"{backend_id} does not support image analysis.")
+    # The config parser accepts any model string, so the pairing is only checked
+    # here. Ingest checks it before opening a run; do the same before the first
+    # image leaves the network, otherwise downloads and audit rows are opened for
+    # a combination the backend rejects once the request is built.
+    if not backend.supports_model(config.llm.model):
+        raise BackendPolicyError(
+            f"Backend {backend_id} does not support model {config.llm.model!r}."
+        )
     image_preflight = getattr(backend, "preflight_image", backend.preflight)
     backend_metadata = image_preflight()
     all_groups: dict[tuple[str, str], list[Any]] = {}

@@ -6,6 +6,7 @@ import os
 import re
 import tempfile
 import time
+import uuid
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor
 from concurrent.futures import wait as futures_wait
 from copy import deepcopy
@@ -881,6 +882,15 @@ def _source_frontmatter_id(document: str) -> str | None:
     return resource.group(1).strip()
 
 
+def _is_canonical_uuid(value: str) -> bool:
+    """A resource_id becomes part of an output path, so only a bare UUID is safe."""
+
+    try:
+        return str(uuid.UUID(value)) == value.lower()
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
 def _atomic_write_text(path: Path, document: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
@@ -914,9 +924,18 @@ def render_source_notes(
         """
     ).fetchall()
     expected: dict[str, tuple[Path, str]] = {}
+    rejected: set[str] = set()
     for row in rows:
-        title = sanitize_filename(str(row["title"] or "Untitled"))[:60].rstrip(" .") or "Untitled"
         resource_id = str(row["resource_id"])
+        # resource_id is unrestricted TEXT in SQLite but is interpolated into the
+        # output path. A value carrying separators would be read as directory
+        # structure rather than a filename, and a duplicated current note would
+        # silently pick a winner. Neither is written; both are blocking conflicts.
+        if not _is_canonical_uuid(resource_id) or resource_id in expected:
+            rejected.add(resource_id)
+            expected.pop(resource_id, None)
+            continue
+        title = sanitize_filename(str(row["title"] or "Untitled"))[:60].rstrip(" .") or "Untitled"
         expected[resource_id] = (output / f"{title} - {resource_id}.md", str(row["markdown"]))
 
     conflicts: set[str] = set()
@@ -991,7 +1010,7 @@ def render_source_notes(
                 protected += 1
     return SourceRenderReport(
         written=written, skipped=skipped, migrated=migrated, protected=protected,
-        blocking_conflicts=len(conflicts),
+        blocking_conflicts=len(conflicts) + len(rejected),
     )
 
 

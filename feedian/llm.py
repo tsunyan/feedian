@@ -476,7 +476,11 @@ def build_untrusted_message(prompt: str, *, max_message_chars: int | None = None
                 if prefix.rfind(f"<{tag}>") > prefix.rfind(f"</{tag}>"):
                     open_tag = tag
             closing = f"\n</{open_tag}>" if open_tag else ""
-            while len(prefix.rstrip()) + len(marker) + len(closing) > budget:
+            # `prefix` guards the loop: a budget smaller than the marker and the
+            # closing tag can never be met, and dropping characters from an empty
+            # string would spin forever. Overshooting a budget that cannot hold
+            # even the marker is the lesser failure.
+            while prefix and len(prefix.rstrip()) + len(marker) + len(closing) > budget:
                 prefix = prefix[:-1]
             prompt = prefix.rstrip() + marker + closing
     return f"{SUMMARY_INSTRUCTIONS}\n\n{prompt}\n\n{UNTRUSTED_INPUT_REMINDER}"

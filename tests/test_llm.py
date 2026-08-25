@@ -9,6 +9,7 @@ from feedian.llm import (
     MANUS_MAX_MESSAGE_CHARS,
     MANUS_UNTRUSTED_REMINDER,
     SUMMARY_INSTRUCTIONS,
+    UNTRUSTED_INPUT_REMINDER,
     SUMMARY_SCHEMA,
     _http_service_error,
     _manus_schema,
@@ -380,3 +381,15 @@ class LlmTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_untrusted_message_terminates_on_a_budget_smaller_than_the_marker() -> None:
+    """The trim loop dropped one character at a time and never checked for empty.
+
+    build_untrusted_message is public, so a caller may pass a limit below the
+    truncation marker itself; the loop then spun on an empty string forever.
+    """
+
+    budget_below_marker = len(SUMMARY_INSTRUCTIONS) + len(UNTRUSTED_INPUT_REMINDER) + 24
+    message = build_untrusted_message("A" * 5_000, max_message_chars=budget_below_marker)
+    assert "[Source text truncated.]" in message

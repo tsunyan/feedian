@@ -35,6 +35,7 @@ from feedian.llm_backends import (
     CodexLocalBackend,
     canonical_backend_id,
     get_backend,
+    normalize_image_result,
     parse_claude_response,
 )
 from feedian.local_agent import ProcessResult, isolated_local_agent_parent, sanitize_error
@@ -128,7 +129,10 @@ def test_backend_reports_an_incompatible_model_without_being_asked_to_run() -> N
     assert not CodexLocalBackend().supports_model("manus-1.6")
 
 
-def test_only_manus_declares_a_total_message_character_limit() -> None:
+def test_only_manus_declares_a_total_message_character_limit(monkeypatch) -> None:
+    # ClaudeCodeLocalBackend reads ANTHROPIC_BASE_URL when constructed and rejects a
+    # bad value, which would fail this test for an unrelated reason.
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
     assert get_backend("manus-api").capabilities.max_message_chars == MANUS_MAX_MESSAGE_CHARS
     assert get_backend("openai-responses").capabilities.max_message_chars is None
     assert get_backend("codex-local").capabilities.max_message_chars is None
@@ -831,3 +835,70 @@ def test_codex_home_check_separates_cli_managed_skills_from_installed_ones(tmp_p
     )
     with pytest.raises(BackendPolicyError, match="skills/my-own-skill"):
         backend.preflight()
+
+
+def test_normalize_image_result_rejects_a_non_string_image_kind() -> None:
+    """`kind not in allowed` would raise TypeError for an unhashable value.
+
+    The enrichment loop records TypeError as a transient failure, so a schema
+    violation would be retried and then suppressed instead of reported.
+    """
+
+    for bad in ({"a": 1}, ["explanatory"], 7, None):
+        with pytest.raises(BackendProtocolError):
+            normalize_image_result(
+                {"image_kind": bad, "ocr_text": "text", "ocr_truncated": False}, 2_000,
+            )
+    with pytest.raises(BackendProtocolError):
+        normalize_image_result(["not", "an", "object"], 2_000)
+
+
+def test_codex_image_gate_is_independent_of_the_isolation_gate(monkeypatch, tmp_path) -> None:
+    """CODEX_VERIFIED_VERSIONS pins the isolation denylist, not `--image` support.
+
+    Both sets hold the same version today, so this drives the image gate with a
+    version the isolation gate accepts. The gate exists for the release where the
+    denylist is re-measured before `--image` is.
+    """
+
+    monkeypatch.setattr(llm_backends_module, "CODEX_IMAGE_VERIFIED_VERSIONS", frozenset())
+    home = logged_in_home(tmp_path)
+    backend = CodexLocalBackend(
+        runner=FakeRunner(),
+        control_runner=successful_control_runner,
+        version=CODEX_VERIFIED_VERSIONS[0],
+        home=home,
+    )
+    backend.preflight()
+    with pytest.raises(BackendPolicyError) as excinfo:
+        backend.preflight_image()
+    assert "image input" in str(excinfo.value)
+
+
+def test_claude_image_failure_is_classified_and_redacted(monkeypatch, tmp_path) -> None:
+    """The image path once omitted the classifier's keyword-only redaction arguments.
+
+    That raised TypeError, so the enrichment loop stored a transient TypeError
+    instead of the real authentication failure, and no redaction ran.
+    """
+
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "super-secret-key")
+    monkeypatch.setattr(llm_backends_module.shutil, "which", lambda _name: "C:/tools/claude.exe")
+
+    def control_runner(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 0, stdout="2.1.237 (Claude Code)", stderr="")
+
+    image = tmp_path / "diagram.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
+    backend = ClaudeCodeLocalBackend(
+        runner=FailedRunner("invalid api key: super-secret-key"),
+        control_runner=control_runner,
+    )
+    with pytest.raises(BackendAuthError) as excinfo:
+        backend.analyze_image(
+            model="claude-sonnet-5", image_path=image, media_type="image/png",
+            source_url="https://example.test/d.png", alt_text="diagram",
+            max_ocr_chars=2_000, timeout_seconds=60, temporary_parent=tmp_path,
+        )
+    assert "super-secret-key" not in str(excinfo.value)

@@ -186,10 +186,17 @@ def image_ocr_prompt(*, source_url: str, alt_text: str, max_chars: int) -> str:
     )
 
 
-def normalize_image_result(result: dict[str, Any], max_chars: int) -> dict[str, Any]:
+def normalize_image_result(result: Any, max_chars: int) -> dict[str, Any]:
+    # Types are checked before the membership test: an unhashable image_kind such
+    # as a dict would make `kind not in allowed` raise TypeError, which the caller
+    # records as a transient failure instead of the protocol error it is.
+    if not isinstance(result, dict):
+        raise BackendProtocolError("Image OCR result was not a JSON object.")
     kind = result.get("image_kind")
     allowed = set(IMAGE_OCR_SCHEMA["properties"]["image_kind"]["enum"])
-    if kind not in allowed or not isinstance(result.get("ocr_text"), str):
+    if not isinstance(kind, str) or kind not in allowed:
+        raise BackendProtocolError("Image OCR result did not match the required schema.")
+    if not isinstance(result.get("ocr_text"), str):
         raise BackendProtocolError("Image OCR result did not match the required schema.")
     text = str(result["ocr_text"])
     truncated = bool(result.get("ocr_truncated")) or len(text) > max_chars
@@ -407,6 +414,12 @@ CODEX_DISABLED_FEATURES = (
 # another default-on tool would reopen the surface silently. Re-run the check in
 # the review document before adding a version here.
 CODEX_VERIFIED_VERSIONS = ("0.147.0",)
+# Separate from CODEX_VERIFIED_VERSIONS, which pins the tool-isolation denylist.
+# This records the versions whose `--image` initial input was measured to reach
+# the model with view_image disabled and the sandbox read-only. Without the gate
+# a CLI that silently ignored --image would still return a schema-shaped result,
+# and a transcription produced without ever seeing the image would be stored.
+CODEX_IMAGE_VERIFIED_VERSIONS = frozenset({"0.147.0"})
 # Codex looks for the global AGENTS.md, skills, plugins, rules and hooks under
 # CODEX_HOME, and --ignore-user-config excludes only config.toml from it. Pointing
 # CODEX_HOME at a home Feedian owns is what actually keeps a personal instruction
@@ -538,7 +551,14 @@ class CodexLocalBackend:
         return dict(self._preflight_metadata)
 
     def preflight_image(self) -> dict[str, Any]:
-        return self.preflight()
+        metadata = self.preflight()
+        if self.version not in CODEX_IMAGE_VERIFIED_VERSIONS:
+            raise BackendPolicyError(
+                "codex-local image input requires a measured Codex CLI version; "
+                f"{self.version!r} has not been verified. Verified: "
+                f"{', '.join(sorted(CODEX_IMAGE_VERIFIED_VERSIONS))}."
+            )
+        return metadata
 
     def _control_executable(self) -> str:
         if isinstance(self.runner, SubprocessRunner):
@@ -705,11 +725,18 @@ class CodexLocalBackend:
                 output_schema=IMAGE_OCR_SCHEMA, temporary_parent=temporary_parent,
                 timeout_seconds=timeout_seconds, env=self.child_environment(),
             )
+            # Inside the try so a schema violation carries the request the way the
+            # summary path does; complete_group needs it to record the real request
+            # on the audit run.
+            result = normalize_image_result(local.result, max_ocr_chars)
         except subprocess.TimeoutExpired as exc:
             raise BackendTimeoutError(f"codex-local exceeded {timeout_seconds}s.") from exc
         except LocalAgentProcessError as exc:
             raise _classify_codex_process_error(exc, {"mode": "image"}) from exc
-        result = normalize_image_result(local.result, max_ocr_chars)
+        except BackendError as exc:
+            if exc.request is None:
+                exc.request = {"mode": "image", "source_url": source_url, "alt_text": alt_text}
+            raise
         return BackendAudit(
             result=result,
             request={"mode": "image", "source_url": source_url, "alt_text": alt_text,
@@ -1156,7 +1183,14 @@ class ClaudeCodeLocalBackend:
         except subprocess.TimeoutExpired as exc:
             raise BackendTimeoutError(f"claude-code-local exceeded {timeout_seconds}s.") from exc
         except LocalAgentProcessError as exc:
-            raise _classify_claude_process_error(exc, {"mode": "image"}) from exc
+            raise _classify_claude_process_error(
+                exc,
+                {"mode": "image"},
+                private_values=(
+                    self._credential_value, self.endpoint.normalized_url, prompt, image_data,
+                ),
+                private_paths=(Path.home(), temporary_parent),
+            ) from exc
         return BackendAudit(
             result=local.result,
             request={"mode": "image", "source_url": source_url, "alt_text": alt_text,

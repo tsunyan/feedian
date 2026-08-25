@@ -36,6 +36,9 @@ class FakeImageBackend:
             image_analysis=True, max_parallelism=8,
         )
 
+    def supports_model(self, model: str) -> bool:
+        return True
+
     def preflight(self):
         return {"implementation_revision": "test"}
 
