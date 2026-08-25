@@ -137,6 +137,11 @@ def plan_source_notes(
     backend_instance: LLMBackend | None = None,
     image_ocr: ImageOCRSettings | None = None,
 ) -> IngestPlan:
+    # Checked before any candidate is built: constructing them reads every current
+    # resource and builds a request for each, so a contradiction found afterwards
+    # makes the caller wait for work that is thrown away.
+    if auto and stale:
+        raise ValueError("auto and stale selection are mutually exclusive.")
     backend_id = canonical_backend_id(provider or backend)
     selected_backend = backend_instance or get_backend(backend_id)
     image_settings = image_ocr or ImageOCRSettings()
@@ -154,8 +159,6 @@ def plan_source_notes(
         )
         for row in rows
     ]
-    if auto and stale:
-        raise ValueError("auto and stale selection are mutually exclusive.")
     if stale:
         stale_candidates = [candidate for candidate in all_candidates if candidate.cached_result is None]
         candidates = stale_candidates if limit is None else stale_candidates[:limit]

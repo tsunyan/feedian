@@ -192,11 +192,12 @@ def build_parser() -> argparse.ArgumentParser:
     ingest.add_argument("--limit", type=int)
     ingest.add_argument("--force", action="store_true", help="Ignore matching successful LLM results and run again.")
     ingest.add_argument("--dry-run", action="store_true", help="Show targets, token estimate, and maximum cost without writes or API calls.")
-    ingest.add_argument(
+    ingest_selection = ingest.add_mutually_exclusive_group()
+    ingest_selection.add_argument(
         "--auto", action="store_true",
         help="Select representative resources from uncovered and largest fields (default limit: 20).",
     )
-    ingest.add_argument(
+    ingest_selection.add_argument(
         "--stale", action="store_true",
         help="Select only resources without a reusable result for the current request, including new OCR.",
     )
