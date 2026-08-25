@@ -71,6 +71,22 @@ commit構成も規約どおりである。`git rev-parse ffb2e77^`は`454521e`�
 - 回帰テストで、escape後のOCRを含む完成messageが4,500文字以内となり、後段の安全用切り詰めを発動しないことを確認した。
 - 回帰テストで、OCRが1文字も入らない上限では`source-note-v1`を維持し、OCRなしrequestと一致することを確認した。
 
+## 観察
+
+`eb20fd6`の再レビュー時に気付いた点を記録する。いずれも指摘には起こさない。修正を要する欠陥ではなく、後で判断材料になりうる性質のものである。
+
+### `fit_image_ocr_texts`が切り詰めたOCRに印が付かない
+
+message予算に収まらないOCRは`text[:lower]`で切られ、modelには途中で終わった転記がそのまま渡る。切れたことを示す文字列は付かない。DBの`ocr_truncated`は`max_ocr_chars_per_image`による生成時の切り詰めを表すもので、この配信時の切り詰めは記録されない。
+
+本文側も`max_article_chars`で無印のまま切られるので、既存の挙動とは一貫している。ただし図表の転記が途中で終わると、本文と違って読み手が欠落に気付きにくい。`[OCR truncated.]`相当を付けるかどうかは、実運用でOCRが切られる頻度を見てから判断すればよい。現状で切り詰めが起きるのは`manus-api`だけで、そのbackendは画像解析非対応であるため、OCRを持つVaultで`llm.backend`をmanusへ切り替えた場合に限られる。
+
+### OCRを持たない候補でも`base_prompt`を構築している
+
+`_candidate`は`raw_image_ocr_texts`が空でも、また`max_message_chars`が`None`（`openai-responses`、`codex-local`、`claude-code-local`、すなわち既定の全backend）でも`base_prompt`を組んでから`fit_image_ocr_texts`の早期returnに入る。
+
+計測したところ、参照Vault規模の7,342候補に相当する`build_prompt`の追加呼び出しは0.02秒であった。実害は無い。早期returnを`base_prompt`構築より前へ出せる余地がある、という程度である。
+
 ## 規約化した項目
 
 現時点では無し。
