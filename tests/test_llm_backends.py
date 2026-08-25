@@ -853,6 +853,24 @@ def test_normalize_image_result_rejects_a_non_string_image_kind() -> None:
         normalize_image_result(["not", "an", "object"], 2_000)
 
 
+def test_normalize_image_result_rejects_a_non_boolean_truncation_flag() -> None:
+    """Coercion read the string "false" as True.
+
+    That marks the stored row truncated, so raising max_ocr_chars_per_image
+    later selects it for a paid reanalysis it never needed.
+    """
+
+    for bad in ("false", "true", 0, 1, None):
+        with pytest.raises(BackendProtocolError):
+            normalize_image_result(
+                {"image_kind": "explanatory", "ocr_text": "text", "ocr_truncated": bad}, 2_000,
+            )
+    accepted = normalize_image_result(
+        {"image_kind": "explanatory", "ocr_text": "text", "ocr_truncated": False}, 2_000,
+    )
+    assert accepted["ocr_truncated"] is False
+
+
 def test_codex_image_gate_is_independent_of_the_isolation_gate(monkeypatch, tmp_path) -> None:
     """CODEX_VERIFIED_VERSIONS pins the isolation denylist, not `--image` support.
 

@@ -931,7 +931,14 @@ def render_source_notes(
         # output path. A value carrying separators would be read as directory
         # structure rather than a filename, and a duplicated current note would
         # silently pick a winner. Neither is written; both are blocking conflicts.
-        if not _is_canonical_uuid(resource_id) or resource_id in expected:
+        # `rejected` is part of the guard, not only its record: the second
+        # duplicate removes the first plan entry, so without it a third row for
+        # the same id finds nothing in `expected` and re-enters the plan.
+        if (
+            not _is_canonical_uuid(resource_id)
+            or resource_id in expected
+            or resource_id in rejected
+        ):
             rejected.add(resource_id)
             expected.pop(resource_id, None)
             continue

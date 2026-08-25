@@ -24,6 +24,8 @@ from feedian.llm_backends import (
     BackendRateLimitError,
     ClaudeCodeLocalBackend,
 )
+from feedian.ids import uuid7
+from feedian.markdown import utc_now
 from feedian.store import VaultStore
 from feedian.vault import LLMFallbackSettings, VaultConfig, initialize_vault
 
@@ -1242,6 +1244,35 @@ def test_render_source_notes_rejects_a_resource_id_that_is_not_a_bare_uuid(tmp_p
         assert report.written == 0
         assert report.blocking_conflicts == 1
         assert not list(tmp_path.parent.glob("outside*"))
+        assert not list((tmp_path / VaultConfig().source_folder).glob("*.md"))
+    finally:
+        store.close()
+
+
+def test_render_source_notes_rejects_every_duplicate_current_note(tmp_path) -> None:
+    """The second duplicate removed the plan entry, so a third row re-entered it."""
+
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        item = store.upsert_canonical_item(CanonicalItem(
+            source="hatena", source_id="dup", content_key="url:dup",
+            url="https://example.test/dup", title="Title",
+        ))
+        resource_id = item.resource_id or ""
+        store.record_resource_revision(resource_id, content_markdown="body", title="Title")
+        store.put_source_note(resource_id=resource_id, llm_run_id=None, markdown="first")
+        for body in ("second", "third"):
+            store.connection.execute(
+                "INSERT INTO source_note(source_note_id, resource_id, llm_run_id, markdown,"
+                " markdown_hash, created_at) VALUES (?, ?, NULL, ?, ?, ?)",
+                (uuid7(), resource_id, body, body, utc_now()),
+            )
+        store.connection.commit()
+
+        report = render_source_notes(store, tmp_path, VaultConfig())
+
+        assert report.written == 0
+        assert report.blocking_conflicts == 1
         assert not list((tmp_path / VaultConfig().source_folder).glob("*.md"))
     finally:
         store.close()

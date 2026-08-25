@@ -198,8 +198,14 @@ def normalize_image_result(result: Any, max_chars: int) -> dict[str, Any]:
         raise BackendProtocolError("Image OCR result did not match the required schema.")
     if not isinstance(result.get("ocr_text"), str):
         raise BackendProtocolError("Image OCR result did not match the required schema.")
+    # The schema declares ocr_truncated as a required boolean, and a local agent's
+    # parser checks only the key set. Coercing would read "false" as True, which
+    # marks the row truncated and buys a paid reanalysis the next time the
+    # per-image character limit is raised.
+    if not isinstance(result.get("ocr_truncated"), bool):
+        raise BackendProtocolError("Image OCR result did not match the required schema.")
     text = str(result["ocr_text"])
-    truncated = bool(result.get("ocr_truncated")) or len(text) > max_chars
+    truncated = result["ocr_truncated"] or len(text) > max_chars
     if kind != "explanatory":
         text = ""
         truncated = False
