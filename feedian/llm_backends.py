@@ -19,6 +19,7 @@ from urllib.request import Request, urlopen
 from .extract import PageFetchResult
 from .llm import (
     MANUS_CREATE_INTERVAL_SECONDS,
+    MANUS_MAX_MESSAGE_CHARS,
     LLMAuthError,
     LLMProtocolError,
     LLMRateLimitError,
@@ -47,7 +48,7 @@ from .local_agent import (
 
 BACKEND_IDS = ("openai-responses", "manus-api", "codex-local", "claude-code-local")
 BACKEND_ALIASES = {"openai": "openai-responses", "manus": "manus-api"}
-BACKEND_IMPLEMENTATION_REVISION = "llm-backends-v4"
+BACKEND_IMPLEMENTATION_REVISION = "llm-backends-v5"
 
 
 class BackendError(RuntimeError):
@@ -99,7 +100,7 @@ class BackendCapabilities:
     max_article_chars: int
     usage_available: bool
     image_analysis: bool = False
-    message_size_limit_bytes: int | None = None
+    max_message_chars: int | None = None
     max_parallelism: int = 1
     min_start_interval_seconds: float = 0.0
 
@@ -211,6 +212,7 @@ class ApiBackend:
         max_parallelism: int = 1,
         min_start_interval_seconds: float = 0.0,
         image_analysis: bool = False,
+        max_message_chars: int | None = None,
     ) -> None:
         self.provider = provider
         self.api_key_name = api_key_name
@@ -222,6 +224,7 @@ class ApiBackend:
             billing_mode="metered-api",
             max_article_chars=max_article_chars,
             usage_available=usage_available,
+            max_message_chars=max_message_chars,
             max_parallelism=max_parallelism,
             min_start_interval_seconds=min_start_interval_seconds,
             image_analysis=image_analysis,
@@ -279,6 +282,7 @@ class ApiBackend:
                 provider=self.provider,
                 # The scheduler already waited out this backend's start interval.
                 pace_starts=False,
+                max_message_chars=self.capabilities.max_message_chars,
             )
         except LLMAuthError as exc:
             raise BackendAuthError(str(exc)) from exc
@@ -600,6 +604,7 @@ class CodexLocalBackend:
             max_output_tokens=max_output_tokens,
             reasoning_effort=reasoning_effort,
             max_article_chars=self.capabilities.max_article_chars,
+            max_message_chars=self.capabilities.max_message_chars,
         )
         prompt = build_untrusted_message(str(planned["input"][0]["content"][0]["text"]))
 
@@ -1004,6 +1009,7 @@ class ClaudeCodeLocalBackend:
             max_output_tokens=max_output_tokens,
             reasoning_effort=reasoning_effort,
             max_article_chars=self.capabilities.max_article_chars,
+            max_message_chars=self.capabilities.max_message_chars,
         )
         prompt = build_untrusted_message(str(planned["input"][0]["content"][0]["text"]))
         schema_json = json.dumps(
@@ -1350,6 +1356,7 @@ def get_backend(value: str) -> LLMBackend:
             model_name=os.environ.get("MANUS_MODEL", "manus-1.6"),
             max_article_chars=3_000,
             usage_available=False,
+            max_message_chars=MANUS_MAX_MESSAGE_CHARS,
             # Concurrency buys nothing on task creation, which this interval
             # paces; it buys the window in which several created tasks are
             # polled at once.

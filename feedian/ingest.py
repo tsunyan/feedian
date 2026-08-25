@@ -20,7 +20,9 @@ from .llm import (
     CANONICAL_SUMMARY_SCHEMA_VERSION,
     LEGACY_V1_PROVIDER_SCHEMA,
     SUMMARY_INSTRUCTIONS,
+    build_prompt,
     build_summary_request,
+    fit_image_ocr_texts,
 )
 from .llm_backends import BackendPolicyError, LLMBackend, canonical_backend_id, get_backend
 from .local_agent import isolated_local_agent_parent, sanitize_error
@@ -314,6 +316,7 @@ def ingest_source_notes(
             fallback_candidate = _candidate(
                 store, job.row, model=fallback.model, language=language, force=force,
                 backend=fallback.backend_id, backend_instance=fallback.backend,
+                image_ocr=config.image_ocr,
             )
             if fallback_candidate.cached_result is not None:
                 store.put_source_note(
@@ -671,13 +674,23 @@ def _candidate(
         str(row["resource_id"]), max_images=image_settings.max_ocr_images_per_resource,
         max_chars=image_settings.max_ocr_chars_per_resource,
     )
-    image_ocr_texts = tuple(str(image["ocr_text"]) for image in ocr_rows)
+    raw_image_ocr_texts = tuple(str(image["ocr_text"]) for image in ocr_rows)
+    base_page = _page(row, metadata)
+    base_prompt = build_prompt(
+        metadata, base_page, language,
+        max_article_chars=selected_backend.capabilities.max_article_chars,
+    )
+    image_ocr_texts = fit_image_ocr_texts(
+        base_prompt, raw_image_ocr_texts,
+        max_message_chars=selected_backend.capabilities.max_message_chars,
+    )
     prompt_version = OCR_PROMPT_VERSION if image_ocr_texts else PROMPT_VERSION
     request = build_summary_request(
         model=model, item=metadata, page=_page(row, metadata, image_ocr_texts=image_ocr_texts),
         language=language,
         max_output_tokens=800, reasoning_effort="low",
         max_article_chars=selected_backend.capabilities.max_article_chars,
+        max_message_chars=selected_backend.capabilities.max_message_chars,
     )
     request_identity = getattr(selected_backend, "request_identity", None)
     if callable(request_identity):

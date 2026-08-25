@@ -38,6 +38,7 @@ class FakeBackend:
         execution_kind: str = "http",
         billing_mode: str = "metered-api",
         error: Exception | None = None,
+        max_message_chars: int | None = None,
     ) -> None:
         self.audit = audit
         self.error = error
@@ -50,6 +51,7 @@ class FakeBackend:
             billing_mode=billing_mode,
             max_article_chars=3_000 if backend == "manus-api" else 10_000,
             usage_available=bool(getattr(audit, "usage", {})),
+            max_message_chars=max_message_chars,
         )
 
     def default_model(self) -> str:
@@ -106,6 +108,9 @@ def test_only_completed_image_ocr_switches_the_summary_request_to_v2(tmp_path) -
         with_ocr = plan_source_notes(
             store, model="model", backend_instance=backend,
         ).candidates[0]
+        no_room = plan_source_notes(
+            store, model="model", backend_instance=FakeBackend(None, max_message_chars=1),
+        ).candidates[0]
         store.apply_image_analysis([image_id], {"analysis_status": "pending"})
         pending = plan_source_notes(
             store, model="model", backend_instance=backend,
@@ -119,6 +124,8 @@ def test_only_completed_image_ocr_switches_the_summary_request_to_v2(tmp_path) -
     assert "B" * 10_000 in prompt
     assert "B" * 10_001 not in prompt
     assert "Original labels" in prompt
+    assert no_room.prompt_version == "source-note-v1"
+    assert no_room.request == without_ocr.request
     assert pending.prompt_version == "source-note-v1"
     assert pending.request == without_ocr.request
 

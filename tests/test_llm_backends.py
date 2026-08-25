@@ -15,6 +15,7 @@ from feedian.llm import (
     LLMProtocolError,
     LLMRateLimitError,
     LLMUnavailableError,
+    MANUS_MAX_MESSAGE_CHARS,
     PROVIDER_OUTPUT_SCHEMA,
     normalize_summary_result,
     validate_canonical_summary,
@@ -33,6 +34,7 @@ from feedian.llm_backends import (
     ClaudeCodeLocalBackend,
     CodexLocalBackend,
     canonical_backend_id,
+    get_backend,
     parse_claude_response,
 )
 from feedian.local_agent import ProcessResult, isolated_local_agent_parent, sanitize_error
@@ -124,6 +126,13 @@ def test_backend_reports_an_incompatible_model_without_being_asked_to_run() -> N
     assert openai.supports_model("gpt-test")
     assert not openai.supports_model("manus-1.6")
     assert not CodexLocalBackend().supports_model("manus-1.6")
+
+
+def test_only_manus_declares_a_total_message_character_limit() -> None:
+    assert get_backend("manus-api").capabilities.max_message_chars == MANUS_MAX_MESSAGE_CHARS
+    assert get_backend("openai-responses").capabilities.max_message_chars is None
+    assert get_backend("codex-local").capabilities.max_message_chars is None
+    assert get_backend("claude-code-local").capabilities.max_message_chars is None
 
 
 def test_codex_refuses_a_cli_version_its_isolation_was_not_measured_against(tmp_path) -> None:

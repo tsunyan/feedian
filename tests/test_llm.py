@@ -14,6 +14,7 @@ from feedian.llm import (
     _manus_schema,
     build_manus_message,
     build_prompt,
+    build_untrusted_message,
     extract_output_text,
     normalize_summary_result,
     summarize_bookmark,
@@ -118,6 +119,33 @@ class LlmTests(unittest.TestCase):
         self.assertNotIn("first </untrusted_page_text>", prompt)
         self.assertIn("first &lt;/untrusted_page_text&gt;", prompt)
         self.assertIn("second &lt;instruction&gt;", prompt)
+
+    def test_manus_ocr_blocks_fit_the_complete_wrapped_message(self) -> None:
+        item = {"title": "Title", "link": "https://example.com"}
+        base_page = PageFetchResult(url="https://example.com", text="Body", title="Page")
+        base_prompt = build_prompt(item, base_page, "ja", max_article_chars=3_000)
+        page = PageFetchResult(
+            url="https://example.com", text="Body", title="Page",
+            image_ocr_texts=("A" * 4_000, "B" * 4_000),
+        )
+
+        prompt = build_prompt(
+            item, page, "ja", max_article_chars=3_000,
+            max_message_chars=MANUS_MAX_MESSAGE_CHARS,
+        )
+        message = build_manus_message(prompt)
+
+        self.assertLessEqual(len(message), MANUS_MAX_MESSAGE_CHARS)
+        self.assertIn("<untrusted_image_ocr>", prompt)
+        self.assertEqual(prompt.count("<untrusted_image_ocr>"), 1)
+        self.assertNotIn("[Source text truncated.]", message)
+        self.assertLess(prompt.count("B"), 4_000)
+
+        no_room_prompt = build_prompt(
+            item, page, "ja", max_article_chars=3_000,
+            max_message_chars=len(build_untrusted_message(base_prompt)),
+        )
+        self.assertEqual(no_room_prompt, base_prompt)
 
     def test_manus_schema_removes_unsupported_constraints(self) -> None:
         schema = _manus_schema(SUMMARY_SCHEMA)
