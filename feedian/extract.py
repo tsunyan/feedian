@@ -30,7 +30,7 @@ from trafilatura import extract as extract_main_text
 from trafilatura import extract_metadata, html2txt
 from w3lib.encoding import html_to_unicode
 
-from .vault import FetchPolicy
+from .vault import FetchPolicy, NetworkPolicy
 
 
 MIN_HIGH_CONFIDENCE_CHARS = 200
@@ -231,6 +231,17 @@ class _ValidatingHTTPSHandler(HTTPSHandler):
         return self.do_open(connection_class, req, context=self._context)
 
 
+def build_safe_opener(policy: NetworkPolicy):
+    """Build the DNS-pinning, redirect-validating opener shared by fetchers."""
+    context = ssl.create_default_context()
+    return build_opener(
+        _ValidatingHTTPHandler(allowed_private_hosts=policy.allowed_private_hosts),
+        _ValidatingHTTPSHandler(context=context, allowed_private_hosts=policy.allowed_private_hosts),
+        SafeRedirectHandler(policy.allowed_private_hosts),
+        ProxyHandler({}),
+    )
+
+
 class TextExtractor(HTMLParser):
     block_tags = {
         "article", "blockquote", "br", "dd", "div", "dt", "figcaption", "h1", "h2", "h3",
@@ -381,13 +392,7 @@ def fetch_page_text(
         method="GET",
     )
     try:
-        context = ssl.create_default_context()
-        opener = build_opener(
-            _ValidatingHTTPHandler(allowed_private_hosts=policy.network.allowed_private_hosts),
-            _ValidatingHTTPSHandler(context=context, allowed_private_hosts=policy.network.allowed_private_hosts),
-            SafeRedirectHandler(policy.network.allowed_private_hosts),
-            ProxyHandler({}),
-        )
+        opener = build_safe_opener(policy.network)
         with opener.open(request, timeout=policy.timeout_seconds) as response:
             content_type = response.headers.get("Content-Type", "")
             is_html = "text/html" in content_type or "application/xhtml" in content_type

@@ -77,6 +77,49 @@ class FakeBackend:
         )
 
 
+def test_only_completed_image_ocr_switches_the_summary_request_to_v2(tmp_path) -> None:
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    backend = FakeBackend(type("Audit", (), {"usage": {}, "result": {}, "request": {}, "response": {}})())
+    try:
+        item = store.upsert_canonical_item(CanonicalItem(
+            source="hatena", source_id="ocr", content_key="url:ocr",
+            url="https://example.test/ocr", title="OCR article",
+        ))
+        resource_id = item.resource_id or ""
+        revision_id, _ = store.record_resource_revision(
+            resource_id, content_markdown="Original body", title="OCR article",
+        )
+        without_ocr = plan_source_notes(
+            store, model="model", backend_instance=backend,
+        ).candidates[0]
+        store.replace_resource_images(
+            resource_id=resource_id, resource_revision_id=revision_id,
+            images=[("https://example.test/diagram.png", "Diagram")],
+        )
+        image_id = str(store.connection.execute(
+            "SELECT resource_image_id FROM resource_image WHERE resource_id = ?", (resource_id,),
+        ).fetchone()[0])
+        store.apply_image_analysis([image_id], {
+            "analysis_status": "completed", "analysis_method": "llm", "image_kind": "explanatory",
+            "ocr_text": "Original labels", "ocr_truncated": 0, "ocr_char_limit": 2_000,
+        })
+        with_ocr = plan_source_notes(
+            store, model="model", backend_instance=backend,
+        ).candidates[0]
+        store.apply_image_analysis([image_id], {"analysis_status": "pending"})
+        pending = plan_source_notes(
+            store, model="model", backend_instance=backend,
+        ).candidates[0]
+    finally:
+        store.close()
+
+    assert without_ocr.prompt_version == "source-note-v1"
+    assert with_ocr.prompt_version == "source-note-v2"
+    assert "Original labels" in str(with_ocr.request)
+    assert pending.prompt_version == "source-note-v1"
+    assert pending.request == without_ocr.request
+
+
 def test_ingest_reuses_stored_llm_result_without_calling_api(tmp_path, monkeypatch) -> None:
     root = tmp_path / "vault"
     root.mkdir()
@@ -104,7 +147,7 @@ def test_ingest_reuses_stored_llm_result_without_calling_api(tmp_path, monkeypat
         second = ingest_source_notes(
             store, root, VaultConfig(), model="gpt-5.6-terra", backend_instance=backend
         )
-        written, skipped = render_source_notes(store, root, VaultConfig())
+        source_report = render_source_notes(store, root, VaultConfig())
 
         assert first.created == 1
         assert first.input_tokens == 1
@@ -112,8 +155,8 @@ def test_ingest_reuses_stored_llm_result_without_calling_api(tmp_path, monkeypat
         assert first.cost_usd > 0
         assert len(progress) == 1
         assert second.reused == 1
-        assert written == 1
-        assert skipped == 0
+        assert source_report.written == 1
+        assert source_report.skipped == 0
         assert "## Summary" in next((root / "source").glob("*.md")).read_text(encoding="utf-8")
     finally:
         store.close()

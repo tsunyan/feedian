@@ -33,7 +33,7 @@ def test_initialize_vault_creates_portable_config(tmp_path) -> None:
     ignored = (root / ".feedian" / ".gitignore").read_text(encoding="utf-8").splitlines()
     assert {"staging/", "tmp/", "scheduled-run.cmd"}.issubset(ignored)
     assert config.raw_folder == "raw"
-    assert config.format_version == 2
+    assert config.format_version == 3
     assert config.llm.backend == "openai-responses"
     assert config.provider_output_folder("hatena").as_posix() == "raw/Hatena"
     assert "vault_path" not in json.loads(paths.config_path.read_text(encoding="utf-8"))
@@ -71,7 +71,7 @@ def test_load_vault_config_accepts_rss_feeds(tmp_path) -> None:
     initialize_vault(root)
     config_path = root / ".feedian" / "config.json"
     config_path.write_text(
-        '{"format_version":2,"providers":{"rss":{"folder":"RSS","enabled":true,"poll_hours":6,"feeds":["https://example.test/feed.xml"]}}}',
+        '{"format_version":3,"providers":{"rss":{"folder":"RSS","enabled":true,"poll_hours":6,"feeds":["https://example.test/feed.xml"]}}}',
         encoding="utf-8",
     )
     config = load_vault_config(root)
@@ -86,7 +86,7 @@ def test_load_vault_config_accepts_rss_feed_routing(tmp_path) -> None:
     config_path = root / ".feedian" / "config.json"
     config_path.write_text(
         """{
-          "format_version": 2,
+          "format_version": 3,
           "providers": {
             "rss": {
               "folder": "RSS",
@@ -128,10 +128,47 @@ def test_v1_config_requires_explicit_migration(tmp_path) -> None:
 
     assert migrate_vault_config(root) is True
     config = load_vault_config(root)
-    assert config.format_version == 2
+    assert config.format_version == 3
     assert config.source_folder == "notes"
     assert config.llm.backend == "openai-responses"
     assert migrate_vault_config(root) is False
+
+
+def test_v2_config_migrates_to_image_ocr_defaults(tmp_path) -> None:
+    root = tmp_path / "vault"
+    root.mkdir()
+    initialize_vault(root)
+    config_path = root / ".feedian" / "config.json"
+    config_path.write_text(
+        '{"format_version":2,"source_folder":"notes",'
+        '"llm":{"backend":"openai-responses","model":"gpt-test"}}',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="migration is required"):
+        load_vault_config(root)
+
+    assert migrate_vault_config(root) is True
+    config = load_vault_config(root)
+    rendered = json.loads(render_vault_config(config))
+
+    assert config.format_version == 3
+    assert config.image_ocr.workers == 8
+    assert config.image_ocr.max_ocr_chars_per_image == 2_000
+    assert rendered["image_ocr"]["max_ocr_images_per_resource"] == 8
+
+
+@pytest.mark.parametrize("field", [
+    "workers", "timeout_seconds", "max_bytes", "max_pixels", "min_short_edge_pixels",
+    "max_ocr_chars_per_image", "max_ocr_images_per_resource", "max_ocr_chars_per_resource",
+])
+@pytest.mark.parametrize("value", [0, -1, True, 1.5, "8"])
+def test_image_ocr_positive_integer_settings_are_validated(tmp_path, field, value) -> None:
+    payload = _base_config(image_ocr={field: value})
+    _write_config(tmp_path, payload)
+
+    with pytest.raises(ValueError):
+        load_vault_config(tmp_path)
 
 
 def test_enabled_fallback_requires_both_a_backend_and_a_model(tmp_path) -> None:
@@ -142,7 +179,7 @@ def test_enabled_fallback_requires_both_a_backend_and_a_model(tmp_path) -> None:
     initialize_vault(root)
     config_path = root / ".feedian" / "config.json"
     config_path.write_text(
-        '{"format_version":2,"llm":{"backend":"codex-local","model":"gpt-test",'
+        '{"format_version":3,"llm":{"backend":"codex-local","model":"gpt-test",'
         '"fallback":{"enabled":true,"backend":"openai-responses"}}}',
         encoding="utf-8",
     )
@@ -151,7 +188,7 @@ def test_enabled_fallback_requires_both_a_backend_and_a_model(tmp_path) -> None:
         load_vault_config(root)
 
     config_path.write_text(
-        '{"format_version":2,"llm":{"backend":"codex-local","model":"gpt-test",'
+        '{"format_version":3,"llm":{"backend":"codex-local","model":"gpt-test",'
         '"fallback":{"enabled":true,"backend":"openai-responses","model":"gpt-5.6-terra"}}}',
         encoding="utf-8",
     )
@@ -392,7 +429,7 @@ def _write_config(root, payload: dict) -> None:
 
 def _base_config(**overrides) -> dict:
     payload = {
-        "format_version": 2,
+        "format_version": 3,
         "raw_folder": "raw",
         "source_folder": "source",
         "review_folder": "review",
@@ -430,7 +467,7 @@ def test_llm_workers_round_trips_without_a_format_version_bump(tmp_path) -> None
 
     assert config.llm.workers == 3
     assert rendered["llm"]["workers"] == 3, "always emitted, so the setting is visible in the file"
-    assert rendered["format_version"] == 2, "an optional key with a default needs no migration"
+    assert rendered["format_version"] == 3, "an optional key with a default needs no migration"
 
 
 def test_a_config_written_before_llm_workers_existed_takes_the_default(tmp_path) -> None:

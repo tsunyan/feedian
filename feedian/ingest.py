@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import tempfile
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor
 from concurrent.futures import wait as futures_wait
@@ -24,10 +26,11 @@ from .llm_backends import BackendPolicyError, LLMBackend, canonical_backend_id, 
 from .local_agent import isolated_local_agent_parent, sanitize_error
 from .markdown import escape_markdown_heading, sanitize_filename, yaml_frontmatter
 from .store import VaultStore, stable_json
-from .vault import VaultConfig, vault_paths
+from .vault import ImageOCRSettings, VaultConfig, vault_paths
 
 
 PROMPT_VERSION = "source-note-v1"
+OCR_PROMPT_VERSION = "source-note-v2"
 
 
 @dataclass(frozen=True)
@@ -49,6 +52,22 @@ class IngestReport:
 
 
 @dataclass(frozen=True)
+class SourceRenderReport:
+    written: int = 0
+    skipped: int = 0
+    migrated: int = 0
+    protected: int = 0
+    blocking_conflicts: int = 0
+
+    def __iter__(self):
+        yield self.written
+        yield self.skipped
+        yield self.migrated
+        yield self.protected
+        yield self.blocking_conflicts
+
+
+@dataclass(frozen=True)
 class IngestCandidate:
     row: Any
     metadata: dict[str, Any]
@@ -58,6 +77,7 @@ class IngestCandidate:
     cached_result: dict[str, Any] | None
     input_tokens: int
     topic: str
+    ocr_text: str = ""
     reason: str = "all"
     topic_count: int = 1
 
@@ -77,6 +97,10 @@ class IngestCandidate:
         )
         safe_native_id = re.sub(r"\s+", " ", native_id).strip()[:120]
         return f"{provider}:{safe_native_id}"
+
+    @property
+    def prompt_version(self) -> str:
+        return OCR_PROMPT_VERSION if self.ocr_text else PROMPT_VERSION
 
 
 @dataclass(frozen=True)
@@ -105,12 +129,15 @@ def plan_source_notes(
     limit: int | None = None,
     force: bool = False,
     auto: bool = False,
+    stale: bool = False,
     backend: str = "openai-responses",
     provider: str | None = None,
     backend_instance: LLMBackend | None = None,
+    image_ocr: ImageOCRSettings | None = None,
 ) -> IngestPlan:
     backend_id = canonical_backend_id(provider or backend)
     selected_backend = backend_instance or get_backend(backend_id)
+    image_settings = image_ocr or ImageOCRSettings()
     rows = _source_rows(store)
     all_candidates = [
         _candidate(
@@ -121,10 +148,16 @@ def plan_source_notes(
             force=force,
             backend=backend_id,
             backend_instance=selected_backend,
+            image_ocr=image_settings,
         )
         for row in rows
     ]
-    if auto:
+    if auto and stale:
+        raise ValueError("auto and stale selection are mutually exclusive.")
+    if stale:
+        stale_candidates = [candidate for candidate in all_candidates if candidate.cached_result is None]
+        candidates = stale_candidates if limit is None else stale_candidates[:limit]
+    elif auto:
         effective_limit = 20 if limit is None else limit
         candidates = _select_auto_candidates(store, all_candidates, effective_limit)
     else:
@@ -171,6 +204,7 @@ def ingest_source_notes(
     limit: int | None = None,
     force: bool = False,
     auto: bool = False,
+    stale: bool = False,
     dry_run: bool = False,
     progress: IngestProgress | None = None,
     plan: IngestPlan | None = None,
@@ -188,8 +222,10 @@ def ingest_source_notes(
         limit=limit,
         force=force,
         auto=auto,
+        stale=stale,
         backend=backend_id,
         backend_instance=selected_backend,
+        image_ocr=config.image_ocr,
     )
     if dry_run:
         return IngestReport(processed=len(plan.candidates), reused=plan.reusable)
@@ -305,7 +341,7 @@ def ingest_source_notes(
             # rewritten here, where the vault write lock is held.
             store.promote_legacy_fingerprint(
                 resource_revision_id=str(row["resource_revision_id"]), operation="source-note",
-                model=model, prompt_version=PROMPT_VERSION,
+                model=model, prompt_version=candidate.prompt_version,
                 input_fingerprint=candidate.fingerprint,
                 legacy_fingerprint=candidate.legacy_fingerprint,
                 backend=backend_id, summary_schema_version=CANONICAL_SUMMARY_SCHEMA_VERSION,
@@ -505,7 +541,7 @@ def _open_run(store: VaultStore, job: _Job) -> None:
     job.run_id = store.start_llm_run(
         resource_id=job.candidate.resource_id,
         resource_revision_id=str(job.row["resource_revision_id"]),
-        operation="source-note", model=job.model, prompt_version=PROMPT_VERSION,
+        operation="source-note", model=job.model, prompt_version=job.candidate.prompt_version,
         input_fingerprint=job.candidate.fingerprint,
         request={"logical": job.candidate.request, "actual": None},
         backend=job.backend_id,
@@ -522,7 +558,8 @@ def _execute_job(job: _Job, *, language: str) -> _Job:
     """The only part that runs off the main thread: the provider call itself."""
     try:
         job.audit = job.backend.summarize(
-            model=job.model, item=job.metadata, page=_page(job.row, job.metadata),
+            model=job.model, item=job.metadata,
+            page=_page(job.row, job.metadata, ocr_text=job.candidate.ocr_text),
             language=language, timeout_seconds=60, max_output_tokens=800,
             reasoning_effort="low", max_retries=3, retry_base_seconds=1.0,
             temporary_parent=job.temporary_parent,
@@ -624,12 +661,25 @@ def _candidate(
     force: bool,
     backend: str = "openai-responses",
     backend_instance: LLMBackend | None = None,
+    image_ocr: ImageOCRSettings | None = None,
 ) -> IngestCandidate:
     backend_id = canonical_backend_id(backend)
     selected_backend = backend_instance or get_backend(backend_id)
     metadata = json.loads(str(row["metadata_json"]))
+    image_settings = image_ocr or ImageOCRSettings()
+    ocr_rows = store.completed_image_ocr(
+        str(row["resource_id"]), max_images=image_settings.max_ocr_images_per_resource,
+        max_chars=image_settings.max_ocr_chars_per_resource,
+    )
+    ocr_text = ""
+    if ocr_rows:
+        ocr_text = "\n\n".join(
+            f"[Image {index + 1} OCR; untrusted original-language text]\n{str(image['ocr_text'])}"
+            for index, image in enumerate(ocr_rows)
+        )
+    prompt_version = OCR_PROMPT_VERSION if ocr_text else PROMPT_VERSION
     request = build_summary_request(
-        model=model, item=metadata, page=_page(row, metadata), language=language,
+        model=model, item=metadata, page=_page(row, metadata, ocr_text=ocr_text), language=language,
         max_output_tokens=800, reasoning_effort="low",
         max_article_chars=selected_backend.capabilities.max_article_chars,
     )
@@ -650,20 +700,24 @@ def _candidate(
     legacy_fingerprint = hashlib.sha256(stable_json(legacy_request).encode("utf-8")).hexdigest()
     cached = None if force else store.successful_llm_result(
         resource_revision_id=str(row["resource_revision_id"]), operation="source-note", model=model,
-        prompt_version=PROMPT_VERSION, input_fingerprint=fingerprint, backend=backend_id,
+        prompt_version=prompt_version, input_fingerprint=fingerprint, backend=backend_id,
         summary_schema_version=CANONICAL_SUMMARY_SCHEMA_VERSION,
         legacy_fingerprint=legacy_fingerprint,
     )
     prompt = str(request["input"][0]["content"][0]["text"])
     input_tokens, _ = count_prompt_tokens(f"{SUMMARY_INSTRUCTIONS}\n\n{prompt}", model)
     return IngestCandidate(
-        row, metadata, request, fingerprint, legacy_fingerprint, cached, input_tokens, _topics(metadata)[0]
+        row, metadata, request, fingerprint, legacy_fingerprint, cached, input_tokens,
+        _topics(metadata)[0], ocr_text,
     )
 
 
-def _page(row: Any, metadata: dict[str, Any]) -> PageFetchResult:
+def _page(row: Any, metadata: dict[str, Any], *, ocr_text: str = "") -> PageFetchResult:
+    content = str(row["content_markdown"] or "")
+    if ocr_text:
+        content = f"{content}\n\n<feedian_image_ocr>\n{ocr_text}\n</feedian_image_ocr>".strip()
     return PageFetchResult(
-        url=str(metadata.get("link") or ""), text=str(row["content_markdown"] or ""),
+        url=str(metadata.get("link") or ""), text=content,
         title=str(row["title"] or metadata.get("title") or ""),
         discussion_text=str(row["discussion_text"] or ""),
     )
@@ -702,7 +756,7 @@ def _select_auto_candidates(
         selected = IngestCandidate(
             candidate.row, candidate.metadata, candidate.request, candidate.fingerprint,
             candidate.legacy_fingerprint, candidate.cached_result, candidate.input_tokens, topic,
-            reason=reason, topic_count=topic_counts[topic],
+            ocr_text=candidate.ocr_text, reason=reason, topic_count=topic_counts[topic],
         )
         buckets.setdefault(topic, []).append(selected)
     for bucket in buckets.values():
@@ -797,7 +851,43 @@ def _usage_count(value: Any) -> int:
     return value if isinstance(value, int) and value >= 0 else 0
 
 
-def render_source_notes(store: VaultStore, vault_root: str | Path, config: VaultConfig) -> tuple[int, int]:
+def _normalized_markdown(document: str) -> str:
+    return document.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _source_frontmatter_id(document: str) -> str | None:
+    block = re.match(r"\A---\r?\n(.*?)\r?\n---\s*(?:\r?\n|\Z)", document, re.DOTALL)
+    if block is None:
+        return None
+    frontmatter = block.group(1)
+    managed = re.search(r'(?m)^feedian_managed:\s*(?:true|"true")\s*$', frontmatter)
+    kind = re.search(r'(?m)^feedian_kind:\s*"?source"?\s*$', frontmatter)
+    resource = re.search(r'(?m)^resource_id:\s*"?([^\n"]+)"?\s*$', frontmatter)
+    if managed is None or kind is None or resource is None:
+        return None
+    return resource.group(1).strip()
+
+
+def _atomic_write_text(path: Path, document: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent,
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
+            stream.write(_normalized_markdown(document))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def render_source_notes(
+    store: VaultStore, vault_root: str | Path, config: VaultConfig, *, dry_run: bool = False,
+) -> SourceRenderReport:
     root = Path(vault_root).resolve()
     output = root / config.source_folder
     rows = store.connection.execute(
@@ -810,18 +900,86 @@ def render_source_notes(store: VaultStore, vault_root: str | Path, config: Vault
         ORDER BY sn.created_at
         """
     ).fetchall()
-    written = skipped = 0
+    expected: dict[str, tuple[Path, str]] = {}
     for row in rows:
         title = sanitize_filename(str(row["title"] or "Untitled"))[:60].rstrip(" .") or "Untitled"
-        path = output / f"{title} - {str(row['resource_id'])[:8]}.md"
-        document = str(row["markdown"])
-        if path.exists() and path.read_text(encoding="utf-8") == document:
+        resource_id = str(row["resource_id"])
+        expected[resource_id] = (output / f"{title} - {resource_id}.md", str(row["markdown"]))
+
+    conflicts: set[str] = set()
+    for resource_id, (path, _) in expected.items():
+        if not path.exists():
+            continue
+        try:
+            existing_id = _source_frontmatter_id(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError):
+            existing_id = None
+        if existing_id != resource_id:
+            conflicts.add(resource_id)
+
+    written = skipped = 0
+    for resource_id, (path, document) in expected.items():
+        if resource_id in conflicts:
+            continue
+        normalized = _normalized_markdown(document)
+        if path.exists() and _normalized_markdown(path.read_text(encoding="utf-8")) == normalized:
             skipped += 1
             continue
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(document, encoding="utf-8", newline="\n")
         written += 1
-    return written, skipped
+        if not dry_run:
+            _atomic_write_text(path, normalized)
+
+    if not dry_run:
+        for resource_id, (path, document) in expected.items():
+            if resource_id in conflicts:
+                continue
+            try:
+                canonical = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                conflicts.add(resource_id)
+                continue
+            if (
+                _source_frontmatter_id(canonical) != resource_id
+                or _normalized_markdown(canonical) != _normalized_markdown(document)
+            ):
+                conflicts.add(resource_id)
+
+    migrated = protected = 0
+    if output.exists():
+        expected_paths = {path.resolve() for path, _ in expected.values()}
+        for path in sorted(output.rglob("*.md")):
+            if path.resolve() in expected_paths:
+                continue
+            try:
+                document = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                protected += 1
+                continue
+            resource_id = _source_frontmatter_id(document)
+            current = expected.get(resource_id or "")
+            if current is None or resource_id in conflicts:
+                protected += 1
+                continue
+            canonical_path, canonical_document = current
+            canonical_ready = dry_run or (
+                canonical_path.exists()
+                and _normalized_markdown(canonical_path.read_text(encoding="utf-8"))
+                == _normalized_markdown(canonical_document)
+            )
+            safe = (
+                canonical_ready
+                and _normalized_markdown(document) == _normalized_markdown(canonical_document)
+            )
+            if safe:
+                migrated += 1
+                if not dry_run:
+                    path.unlink()
+            else:
+                protected += 1
+    return SourceRenderReport(
+        written=written, skipped=skipped, migrated=migrated, protected=protected,
+        blocking_conflicts=len(conflicts),
+    )
 
 
 def render_source_note(row: Any, metadata: dict[str, Any], result: dict[str, Any], *, model: str) -> str:

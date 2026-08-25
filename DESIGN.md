@@ -64,6 +64,16 @@ Webページ・RSS・Hatena exportの取得とsnapshot復元は、外部入力�
 - main threadは、自分が開いた `llm_run` のうち監査結果を保存できなかったものを全て失敗終端してから `KeyboardInterrupt` を再送出する。`start_llm_run` とsubmitの間で中断されFutureを持たないrunも含む。強制終了で残った `running` は次回ingest開始時に `fail_interrupted_llm_runs()` が回収する。`vault_write_lock` の内側で呼ぶため、別processの有効なrunには触れない。
 - 並列度は対象ごとに別の設定を持つ。`fetch.workers`（本文取得、既定8）、`fetch.comment_workers`（Hatenaコメント、既定8）、`llm.workers`（ingest、既定8）。同一ホストへの同時取得は制限しない。通常のWebブラウザはHTML本文以外のリソースを同時に要求するため、8本は極端な数ではない。
 
+## 画像OCRとSourceノート名
+
+画像OCRと完全UUIDのSourceファイル名の判断理由・受け入れ基準は [画像OCRとSourceノートの完全UUIDファイル名](docs/specs/20260825-image-ocr-source-filenames.ja.md) を参照する。
+
+- `sync`はcurrent本文から抽出した画像URLとaltだけを`resource_image`へ差分保存する。URLが継続する行はIDとOCR現在値を維持し、抽出結果が0件なら既存行を削除しない。画像bytesはSQLiteへ保存しない。
+- `feedian enrich-images`は`--limit N`か`--all`を必須とする独立工程である。本文取得と同じDNS pinning・redirect検証を使い、Browserを使わない。全resource共通の`image_ocr.workers`（既定8）で取得し、名前・既知endpoint・MIME・形式・アニメーション・寸法を厳しめにgateする。rasterは対応backendで説明画像判定と原文OCRを1 requestで行い、SVGは安全なXML解析で`text` / `tspan`だけを抽出する。
+- 取得は`source_url`単位、解析は正規化した`(source_url, alt_text)`単位で1実行内共有し、結果を選択外を含む同じcurrent行へ伝播する。workerはSQLiteを触らず、LLM呼び出しはbackendの`max_parallelism`も守る。失敗試行は現在値と別に記録し、既存OCRを先に消さない。
+- `ingest`は`analysis_status='completed'`かつ`image_kind='explanatory'`の非空OCRをposition順に最大8枚・合計10,000文字まで読む。OCRが無いrequestは従来の`source-note-v1`と同一で、OCRがあるrequestだけ`source-note-v2`になる。`--stale`は現在requestを再利用できないresourceだけを選ぶ。
+- Sourceノート名は`{60文字までのsanitized title} - {完全なresource_id}.md`である。canonical pathの同一ID管理ファイルだけをatomic更新する。旧pathはDBのcurrent Markdownと改行正規化後に一致し、同内容のcanonical fileが存在する場合だけ削除する。編集済み旧fileは保護し、別ID・非管理・解析不能なcanonical衝突は終了失敗にする。
+
 ## 本文取得の再試行抑制
 
 取得に失敗し続けるresourceは、再試行の間隔が伸びるか、まったく再試行されなくなる。判断理由と却下した代替案は [本文取得の再試行抑制](docs/specs/20260818-fetch-retry-suppression.ja.md) を参照する。

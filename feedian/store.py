@@ -13,7 +13,7 @@ from .canonical import CanonicalItem, canonicalize_url
 from .ids import uuid7
 
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 
 def utc_now() -> str:
@@ -166,6 +166,10 @@ class VaultStore:
             if current == 8:
                 _migrate_v8_to_v9(self.connection)
                 current = 9
+                continue
+            if current == 9:
+                _migrate_v9_to_v10(self.connection)
+                current = 10
                 continue
             raise RuntimeError(f"No migration path from database schema {current}.")
 
@@ -1260,21 +1264,99 @@ class VaultStore:
                 continue
             seen_urls.add(normalized_url)
             unique_images.append((normalized_url, alt.strip()))
+        if not unique_images:
+            # Empty extraction is ambiguous (a truly imageless page and an
+            # extractor miss look the same). Preserve known OCR instead of
+            # deleting data that cannot be reconstructed locally.
+            return 0
         with self.transaction() as connection:
-            connection.execute("DELETE FROM resource_image WHERE resource_id = ?", (resource_id,))
             now = utc_now()
             connection.executemany(
                 """
                 INSERT INTO resource_image(resource_image_id, resource_id, resource_revision_id, source_url,
                                            alt_text, position, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(resource_id, source_url) DO UPDATE SET
+                    resource_revision_id = excluded.resource_revision_id,
+                    alt_text = excluded.alt_text,
+                    position = excluded.position,
+                    updated_at = excluded.updated_at
                 """,
                 [
                     (uuid7(), resource_id, resource_revision_id, url, alt, position, now)
                     for position, (url, alt) in enumerate(unique_images)
                 ],
             )
+            placeholders = ",".join("?" for _ in unique_images)
+            connection.execute(
+                f"DELETE FROM resource_image WHERE resource_id = ? AND source_url NOT IN ({placeholders})",
+                (resource_id, *(url for url, _ in unique_images)),
+            )
         return len(unique_images)
+
+    def resource_images_for_enrichment(self) -> list[sqlite3.Row]:
+        return self.connection.execute(
+            """
+            SELECT ri.*, rr.created_at AS revision_created_at
+            FROM resource_image AS ri
+            JOIN resource AS r ON r.resource_id = ri.resource_id
+            JOIN resource_revision AS rr ON rr.resource_revision_id = r.current_revision_id
+            WHERE r.removed_at IS NULL AND ri.resource_revision_id = r.current_revision_id
+            ORDER BY rr.created_at, ri.resource_id, ri.position, ri.resource_image_id
+            """
+        ).fetchall()
+
+    def completed_image_ocr(
+        self, resource_id: str, *, max_images: int, max_chars: int,
+    ) -> list[sqlite3.Row]:
+        rows = self.connection.execute(
+            """
+            SELECT source_url, alt_text, position, ocr_text, ocr_truncated
+            FROM resource_image
+            WHERE resource_id = ? AND analysis_status = 'completed'
+              AND image_kind = 'explanatory' AND ocr_text <> ''
+            ORDER BY position, resource_image_id
+            LIMIT ?
+            """,
+            (resource_id, max_images),
+        ).fetchall()
+        remaining = max_chars
+        selected: list[sqlite3.Row] = []
+        for row in rows:
+            if remaining <= 0:
+                break
+            text = str(row["ocr_text"] or "")
+            if len(text) > remaining:
+                copy = dict(row)
+                copy["ocr_text"] = text[:remaining]
+                selected.append(copy)  # type: ignore[arg-type]
+                break
+            selected.append(row)
+            remaining -= len(text)
+        return selected
+
+    def apply_image_analysis(self, resource_image_ids: list[str], values: dict[str, Any]) -> int:
+        if not resource_image_ids:
+            return 0
+        allowed = {
+            "image_sha256", "analysis_status", "analysis_method", "image_kind", "ocr_text",
+            "ocr_truncated", "ocr_char_limit", "ignored_reason", "ocr_llm_run_id",
+            "analysis_input_fingerprint", "analysis_backend", "analysis_model", "analyzed_at",
+            "last_attempt_target", "last_attempt_fingerprint", "last_attempt_status",
+            "last_failure_kind", "transient_retry_used", "last_attempt_at", "analysis_warning",
+        }
+        unknown = set(values) - allowed
+        if unknown:
+            raise ValueError(f"Unknown resource_image update columns: {', '.join(sorted(unknown))}")
+        assignments = ", ".join(f"{name} = ?" for name in values)
+        placeholders = ",".join("?" for _ in resource_image_ids)
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                f"UPDATE resource_image SET {assignments}, updated_at = ? "
+                f"WHERE resource_image_id IN ({placeholders})",
+                (*values.values(), utc_now(), *resource_image_ids),
+            )
+        return int(cursor.rowcount)
 
     def comment_bookmark_count(self, resource_id: str, *, provider: str = "hatena") -> int | None:
         row = self.connection.execute(
@@ -1522,6 +1604,32 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             source_url TEXT NOT NULL,
             alt_text TEXT NOT NULL DEFAULT '',
             position INTEGER NOT NULL DEFAULT 0,
+            image_sha256 TEXT,
+            analysis_status TEXT NOT NULL DEFAULT 'pending'
+                CHECK(analysis_status IN ('pending', 'completed', 'ignored', 'failed')),
+            analysis_method TEXT CHECK(analysis_method IN ('llm', 'svg_text')),
+            image_kind TEXT CHECK(image_kind IS NULL OR image_kind IN (
+                'explanatory', 'photo', 'decorative_illustration', 'icon_or_logo',
+                'advertisement', 'unknown'
+            )),
+            ocr_text TEXT NOT NULL DEFAULT '',
+            ocr_truncated INTEGER NOT NULL DEFAULT 0 CHECK(ocr_truncated IN (0, 1)),
+            ocr_char_limit INTEGER CHECK(ocr_char_limit IS NULL OR ocr_char_limit > 0),
+            ignored_reason TEXT,
+            ocr_llm_run_id TEXT REFERENCES llm_run(llm_run_id),
+            analysis_input_fingerprint TEXT,
+            analysis_backend TEXT,
+            analysis_model TEXT,
+            analyzed_at TEXT,
+            last_attempt_target TEXT,
+            last_attempt_fingerprint TEXT,
+            last_attempt_status TEXT CHECK(
+                last_attempt_status IS NULL OR last_attempt_status IN ('completed', 'ignored', 'failed')
+            ),
+            last_failure_kind TEXT,
+            transient_retry_used INTEGER NOT NULL DEFAULT 0 CHECK(transient_retry_used IN (0, 1)),
+            last_attempt_at TEXT,
+            analysis_warning TEXT,
             updated_at TEXT NOT NULL,
             UNIQUE(resource_id, source_url)
         );
@@ -1626,6 +1734,8 @@ def _create_schema(connection: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS comment_resource_idx ON comment(resource_id);
         CREATE INDEX IF NOT EXISTS comment_revision_comment_idx ON comment_revision(comment_id);
         CREATE INDEX IF NOT EXISTS resource_image_resource_idx ON resource_image(resource_id, position);
+        CREATE INDEX IF NOT EXISTS resource_image_analysis_status_idx
+            ON resource_image(analysis_status, resource_id, position);
         CREATE INDEX IF NOT EXISTS sync_run_status_idx ON sync_run(status, started_at);
         CREATE INDEX IF NOT EXISTS llm_run_reuse_idx ON llm_run(
             resource_revision_id, operation, backend, model, prompt_version,
@@ -2049,3 +2159,70 @@ def _migrate_v8_to_v9(connection: sqlite3.Connection) -> None:
             connection.execute("ALTER TABLE fetch_capture ADD COLUMN failure_kind TEXT")
         connection.execute("UPDATE fetch_capture SET consecutive_failures = 1 WHERE consecutive_failures >= 2")
         connection.execute("UPDATE schema_meta SET value = '9' WHERE key = 'schema_version'")
+
+
+def _migrate_v9_to_v10(connection: sqlite3.Connection) -> None:
+    """Add current image OCR values and last-attempt state."""
+    with _transaction(connection):
+        connection.execute("ALTER TABLE resource_image RENAME TO resource_image_v9")
+        connection.execute(
+            """
+            CREATE TABLE resource_image (
+                resource_image_id TEXT PRIMARY KEY,
+                resource_id TEXT NOT NULL REFERENCES resource(resource_id),
+                resource_revision_id TEXT REFERENCES resource_revision(resource_revision_id),
+                source_url TEXT NOT NULL,
+                alt_text TEXT NOT NULL DEFAULT '',
+                position INTEGER NOT NULL DEFAULT 0,
+                image_sha256 TEXT,
+                analysis_status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK(analysis_status IN ('pending', 'completed', 'ignored', 'failed')),
+                analysis_method TEXT CHECK(analysis_method IN ('llm', 'svg_text')),
+                image_kind TEXT CHECK(image_kind IS NULL OR image_kind IN (
+                    'explanatory', 'photo', 'decorative_illustration', 'icon_or_logo',
+                    'advertisement', 'unknown'
+                )),
+                ocr_text TEXT NOT NULL DEFAULT '',
+                ocr_truncated INTEGER NOT NULL DEFAULT 0 CHECK(ocr_truncated IN (0, 1)),
+                ocr_char_limit INTEGER CHECK(ocr_char_limit IS NULL OR ocr_char_limit > 0),
+                ignored_reason TEXT,
+                ocr_llm_run_id TEXT REFERENCES llm_run(llm_run_id),
+                analysis_input_fingerprint TEXT,
+                analysis_backend TEXT,
+                analysis_model TEXT,
+                analyzed_at TEXT,
+                last_attempt_target TEXT,
+                last_attempt_fingerprint TEXT,
+                last_attempt_status TEXT CHECK(
+                    last_attempt_status IS NULL OR last_attempt_status IN ('completed', 'ignored', 'failed')
+                ),
+                last_failure_kind TEXT,
+                transient_retry_used INTEGER NOT NULL DEFAULT 0 CHECK(transient_retry_used IN (0, 1)),
+                last_attempt_at TEXT,
+                analysis_warning TEXT,
+                updated_at TEXT NOT NULL,
+                UNIQUE(resource_id, source_url)
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO resource_image(
+                resource_image_id, resource_id, resource_revision_id, source_url,
+                alt_text, position, updated_at
+            )
+            SELECT resource_image_id, resource_id, resource_revision_id, source_url,
+                   alt_text, position, updated_at
+            FROM resource_image_v9
+            """
+        )
+        connection.execute("DROP TABLE resource_image_v9")
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS resource_image_resource_idx "
+            "ON resource_image(resource_id, position)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS resource_image_analysis_status_idx "
+            "ON resource_image(analysis_status, resource_id, position)"
+        )
+        connection.execute("UPDATE schema_meta SET value = '10' WHERE key = 'schema_version'")

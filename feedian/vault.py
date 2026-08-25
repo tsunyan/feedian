@@ -9,7 +9,7 @@ from typing import Any
 
 VAULT_CONFIG_RELATIVE_PATH = Path(".feedian") / "config.json"
 VAULT_DATABASE_NAME = "feedian.sqlite3"
-VAULT_CONFIG_VERSION = 2
+VAULT_CONFIG_VERSION = 3
 
 
 @dataclass
@@ -48,6 +48,18 @@ class LLMSettings:
     fallback: LLMFallbackSettings = field(default_factory=LLMFallbackSettings)
 
 
+@dataclass(frozen=True)
+class ImageOCRSettings:
+    workers: int = 8
+    timeout_seconds: int = 15
+    max_bytes: int = 20 * 1024 * 1024
+    max_pixels: int = 40_000_000
+    min_short_edge_pixels: int = 200
+    max_ocr_chars_per_image: int = 2_000
+    max_ocr_images_per_resource: int = 8
+    max_ocr_chars_per_resource: int = 10_000
+
+
 @dataclass
 class VaultConfig:
     format_version: int = VAULT_CONFIG_VERSION
@@ -80,6 +92,7 @@ class VaultConfig:
         }
     )
     llm: LLMSettings = field(default_factory=LLMSettings)
+    image_ocr: ImageOCRSettings = field(default_factory=ImageOCRSettings)
 
     def provider_output_folder(self, provider: str) -> Path:
         settings = self.providers.get(provider)
@@ -225,7 +238,8 @@ def load_vault_config(root: str | Path) -> VaultConfig:
             f"({VAULT_CONFIG_VERSION})."
         )
     allowed = {
-        "format_version", "raw_folder", "source_folder", "review_folder", "providers", "fetch", "llm"
+        "format_version", "raw_folder", "source_folder", "review_folder", "providers", "fetch", "llm",
+        "image_ocr",
     }
     unknown = sorted(set(raw) - allowed)
     if unknown:
@@ -246,6 +260,7 @@ def load_vault_config(root: str | Path) -> VaultConfig:
         providers=providers,
         fetch=fetch,
         llm=_parse_llm(raw.get("llm")),
+        image_ocr=_parse_image_ocr(raw.get("image_ocr")),
     )
 
 
@@ -279,12 +294,22 @@ def render_vault_config(config: VaultConfig) -> str:
                 "model": config.llm.fallback.model,
             },
         },
+        "image_ocr": {
+            "workers": config.image_ocr.workers,
+            "timeout_seconds": config.image_ocr.timeout_seconds,
+            "max_bytes": config.image_ocr.max_bytes,
+            "max_pixels": config.image_ocr.max_pixels,
+            "min_short_edge_pixels": config.image_ocr.min_short_edge_pixels,
+            "max_ocr_chars_per_image": config.image_ocr.max_ocr_chars_per_image,
+            "max_ocr_images_per_resource": config.image_ocr.max_ocr_images_per_resource,
+            "max_ocr_chars_per_resource": config.image_ocr.max_ocr_chars_per_resource,
+        },
     }
     return json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
 
 
 def migrate_vault_config(root: str | Path) -> bool:
-    """Explicitly migrate a version-one Vault config to version two."""
+    """Explicitly migrate an older Vault config to the current format."""
 
     path = vault_paths(root).config_path
     try:
@@ -304,9 +329,11 @@ def migrate_vault_config(root: str | Path) -> bool:
         # Validate rather than silently accepting an invalid current config.
         load_vault_config(root)
         return False
-    if version != 1:
+    if version not in (1, 2):
         raise RuntimeError(f"No migration path from Vault config format {version}.")
-    allowed = {"format_version", "raw_folder", "source_folder", "review_folder", "providers", "fetch"}
+    allowed = {
+        "format_version", "raw_folder", "source_folder", "review_folder", "providers", "fetch", "llm",
+    }
     unknown = sorted(set(raw) - allowed)
     if unknown:
         raise ValueError(f"Unknown vault config field(s): {', '.join(unknown)}")
@@ -319,11 +346,29 @@ def migrate_vault_config(root: str | Path) -> bool:
         review_folder=_relative_folder(raw.get("review_folder", "review"), "review_folder"),
         providers=providers,
         fetch=fetch,
+        llm=_parse_llm(raw.get("llm")),
     )
     temporary = path.with_suffix(".json.tmp")
     temporary.write_text(render_vault_config(migrated), encoding="utf-8")
     temporary.replace(path)
     return True
+
+
+def _parse_image_ocr(raw: object) -> ImageOCRSettings:
+    if raw is None:
+        return ImageOCRSettings()
+    if not isinstance(raw, dict):
+        raise ValueError("image_ocr must be a JSON object.")
+    fields = tuple(ImageOCRSettings.__dataclass_fields__)
+    unknown = sorted(set(raw) - set(fields))
+    if unknown:
+        raise ValueError(f"Unknown image_ocr field(s): {', '.join(unknown)}")
+    defaults = ImageOCRSettings()
+    values = {
+        name: positive_int_setting(f"image_ocr.{name}", raw.get(name, getattr(defaults, name)))
+        for name in fields
+    }
+    return ImageOCRSettings(**values)
 
 
 def _parse_llm(raw: object) -> LLMSettings:
