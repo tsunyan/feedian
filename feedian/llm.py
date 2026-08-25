@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import html
 import json
 import re
 import threading
@@ -447,8 +448,21 @@ def build_untrusted_message(prompt: str, *, max_message_chars: int | None = None
     if max_message_chars is not None:
         budget = max_message_chars - len(SUMMARY_INSTRUCTIONS) - len(UNTRUSTED_INPUT_REMINDER) - 4
         if len(prompt) > budget:
-            marker = "\n[Source text truncated.]\n</untrusted_page_text>"
-            prompt = prompt[: max(0, budget - len(marker))].rstrip() + marker
+            marker = "\n[Source text truncated.]"
+            tags = (
+                "untrusted_bookmark_metadata", "untrusted_page_title",
+                "untrusted_page_text", "untrusted_image_ocr",
+            )
+            closing_reserve = max(len(f"\n</{tag}>") for tag in tags)
+            prefix = prompt[: max(0, budget - len(marker) - closing_reserve)]
+            open_tag = ""
+            for tag in tags:
+                if prefix.rfind(f"<{tag}>") > prefix.rfind(f"</{tag}>"):
+                    open_tag = tag
+            closing = f"\n</{open_tag}>" if open_tag else ""
+            while len(prefix.rstrip()) + len(marker) + len(closing) > budget:
+                prefix = prefix[:-1]
+            prompt = prefix.rstrip() + marker + closing
     return f"{SUMMARY_INSTRUCTIONS}\n\n{prompt}\n\n{UNTRUSTED_INPUT_REMINDER}"
 
 
@@ -592,7 +606,7 @@ def build_prompt(
         content = content[:max_article_chars]
     if page.error and not content:
         content = f"Page text unavailable. Fetch error: {page.error}"
-    return (
+    prompt = (
         f"Output language: {language}\n"
         "Create an Obsidian-ready summary for this bookmark.\n"
         "The `tags` field should contain short lowercase tags without leading #. "
@@ -607,6 +621,17 @@ def build_prompt(
         f"{content}\n"
         "</untrusted_page_text>"
     )
+    if not page.image_ocr_texts:
+        return prompt
+    blocks = []
+    for index, ocr_text in enumerate(page.image_ocr_texts, start=1):
+        blocks.append(
+            "<untrusted_image_ocr>\n"
+            f"Image {index} OCR (original-language text):\n"
+            f"{html.escape(ocr_text, quote=False)}\n"
+            "</untrusted_image_ocr>"
+        )
+    return f"{prompt}\n\n" + "\n\n".join(blocks)
 
 
 def extract_output_text(data: dict[str, Any]) -> str:

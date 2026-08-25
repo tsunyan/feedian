@@ -77,7 +77,7 @@ class IngestCandidate:
     cached_result: dict[str, Any] | None
     input_tokens: int
     topic: str
-    ocr_text: str = ""
+    image_ocr_texts: tuple[str, ...] = ()
     reason: str = "all"
     topic_count: int = 1
 
@@ -100,7 +100,7 @@ class IngestCandidate:
 
     @property
     def prompt_version(self) -> str:
-        return OCR_PROMPT_VERSION if self.ocr_text else PROMPT_VERSION
+        return OCR_PROMPT_VERSION if self.image_ocr_texts else PROMPT_VERSION
 
 
 @dataclass(frozen=True)
@@ -559,7 +559,7 @@ def _execute_job(job: _Job, *, language: str) -> _Job:
     try:
         job.audit = job.backend.summarize(
             model=job.model, item=job.metadata,
-            page=_page(job.row, job.metadata, ocr_text=job.candidate.ocr_text),
+            page=_page(job.row, job.metadata, image_ocr_texts=job.candidate.image_ocr_texts),
             language=language, timeout_seconds=60, max_output_tokens=800,
             reasoning_effort="low", max_retries=3, retry_base_seconds=1.0,
             temporary_parent=job.temporary_parent,
@@ -671,15 +671,11 @@ def _candidate(
         str(row["resource_id"]), max_images=image_settings.max_ocr_images_per_resource,
         max_chars=image_settings.max_ocr_chars_per_resource,
     )
-    ocr_text = ""
-    if ocr_rows:
-        ocr_text = "\n\n".join(
-            f"[Image {index + 1} OCR; untrusted original-language text]\n{str(image['ocr_text'])}"
-            for index, image in enumerate(ocr_rows)
-        )
-    prompt_version = OCR_PROMPT_VERSION if ocr_text else PROMPT_VERSION
+    image_ocr_texts = tuple(str(image["ocr_text"]) for image in ocr_rows)
+    prompt_version = OCR_PROMPT_VERSION if image_ocr_texts else PROMPT_VERSION
     request = build_summary_request(
-        model=model, item=metadata, page=_page(row, metadata, ocr_text=ocr_text), language=language,
+        model=model, item=metadata, page=_page(row, metadata, image_ocr_texts=image_ocr_texts),
+        language=language,
         max_output_tokens=800, reasoning_effort="low",
         max_article_chars=selected_backend.capabilities.max_article_chars,
     )
@@ -708,18 +704,18 @@ def _candidate(
     input_tokens, _ = count_prompt_tokens(f"{SUMMARY_INSTRUCTIONS}\n\n{prompt}", model)
     return IngestCandidate(
         row, metadata, request, fingerprint, legacy_fingerprint, cached, input_tokens,
-        _topics(metadata)[0], ocr_text,
+        _topics(metadata)[0], image_ocr_texts,
     )
 
 
-def _page(row: Any, metadata: dict[str, Any], *, ocr_text: str = "") -> PageFetchResult:
-    content = str(row["content_markdown"] or "")
-    if ocr_text:
-        content = f"{content}\n\n<feedian_image_ocr>\n{ocr_text}\n</feedian_image_ocr>".strip()
+def _page(
+    row: Any, metadata: dict[str, Any], *, image_ocr_texts: tuple[str, ...] = (),
+) -> PageFetchResult:
     return PageFetchResult(
-        url=str(metadata.get("link") or ""), text=content,
+        url=str(metadata.get("link") or ""), text=str(row["content_markdown"] or ""),
         title=str(row["title"] or metadata.get("title") or ""),
         discussion_text=str(row["discussion_text"] or ""),
+        image_ocr_texts=image_ocr_texts,
     )
 
 
@@ -756,7 +752,8 @@ def _select_auto_candidates(
         selected = IngestCandidate(
             candidate.row, candidate.metadata, candidate.request, candidate.fingerprint,
             candidate.legacy_fingerprint, candidate.cached_result, candidate.input_tokens, topic,
-            ocr_text=candidate.ocr_text, reason=reason, topic_count=topic_counts[topic],
+            image_ocr_texts=candidate.image_ocr_texts,
+            reason=reason, topic_count=topic_counts[topic],
         )
         buckets.setdefault(topic, []).append(selected)
     for bucket in buckets.values():

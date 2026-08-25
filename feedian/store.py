@@ -1311,11 +1311,13 @@ class VaultStore:
     ) -> list[sqlite3.Row]:
         rows = self.connection.execute(
             """
-            SELECT source_url, alt_text, position, ocr_text, ocr_truncated
-            FROM resource_image
-            WHERE resource_id = ? AND analysis_status = 'completed'
-              AND image_kind = 'explanatory' AND ocr_text <> ''
-            ORDER BY position, resource_image_id
+            SELECT ri.source_url, ri.alt_text, ri.position, ri.ocr_text, ri.ocr_truncated
+            FROM resource_image AS ri
+            JOIN resource AS r ON r.resource_id = ri.resource_id
+            WHERE ri.resource_id = ? AND ri.resource_revision_id = r.current_revision_id
+              AND ri.analysis_status = 'completed'
+              AND ri.image_kind = 'explanatory' AND ri.ocr_text <> ''
+            ORDER BY ri.position, ri.resource_image_id
             LIMIT ?
             """,
             (resource_id, max_images),

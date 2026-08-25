@@ -5,12 +5,11 @@ import math
 import os
 import re
 import tempfile
-import threading
 import time
 import unicodedata
 import xml.etree.ElementTree as ET
-from collections import Counter
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import Counter, deque
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -19,7 +18,7 @@ from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.request import Request
 
-from .extract import build_safe_opener, validate_fetch_url
+from .extract import UnresolvableHostError, build_safe_opener, validate_fetch_url
 from .llm_backends import (
     BackendAudit,
     BackendError,
@@ -39,6 +38,7 @@ from .vault import ImageOCRSettings, VaultConfig, fetch_policy, positive_int_set
 
 
 SVG_EXTRACTOR_VERSION = "svg-text-v1"
+IMAGE_ANALYSIS_TIMEOUT_SECONDS = 60
 NAME_GATE_PATTERNS = (
     "@2x", "@3x", "logo", "icon", "avatar", "profile", "button", "btn", "banner",
     "badge", "sprite", "spacer", "blank", "emoji", "favicon",
@@ -214,11 +214,62 @@ def extract_svg_text(content: bytes, settings: ImageOCRSettings) -> ImageAnalysi
     )
 
 
+def _gif_is_animated(data: bytes) -> bool:
+    """Count real image blocks without mistaking palette or compressed bytes for separators."""
+
+    if len(data) < 13:
+        return False
+    index = 13
+    packed = data[10]
+    if packed & 0x80:
+        index += 3 * (2 ** ((packed & 0x07) + 1))
+    frames = 0
+    while index < len(data):
+        block = data[index]
+        if block == 0x3B:  # trailer
+            return False
+        if block == 0x21:  # extension followed by data sub-blocks
+            if index + 2 > len(data):
+                return False
+            index += 2
+        elif block == 0x2C:  # image descriptor
+            frames += 1
+            if frames > 1:
+                return True
+            if index + 10 > len(data):
+                return False
+            descriptor_packed = data[index + 9]
+            index += 10
+            if descriptor_packed & 0x80:
+                index += 3 * (2 ** ((descriptor_packed & 0x07) + 1))
+            if index >= len(data):
+                return False
+            index += 1  # LZW minimum code size
+        elif block == 0x00:  # padding seen in otherwise valid files
+            index += 1
+            continue
+        else:
+            return False
+        while index < len(data):
+            size = data[index]
+            index += 1
+            if size == 0:
+                break
+            if index + size > len(data):
+                return False
+            index += size
+    return False
+
+
 def raster_dimensions(media_type: str, data: bytes) -> tuple[int, int, bool] | None:
     if media_type == "image/png" and data.startswith(b"\x89PNG\r\n\x1a\n") and len(data) >= 24:
         return int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big"), b"acTL" in data
     if media_type == "image/gif" and data[:6] in {b"GIF87a", b"GIF89a"} and len(data) >= 10:
-        return int.from_bytes(data[6:8], "little"), int.from_bytes(data[8:10], "little"), data.count(b"\x2c") > 1
+        return (
+            int.from_bytes(data[6:8], "little"),
+            int.from_bytes(data[8:10], "little"),
+            _gif_is_animated(data),
+        )
     if media_type == "image/jpeg" and data.startswith(b"\xff\xd8"):
         index = 2
         while index + 9 <= len(data):
@@ -368,6 +419,8 @@ def fetch_image(
                 return fetch_image(source_url, config, temporary_parent, _retry_429=False)
         transient = exc.code == 429 or exc.code >= 500
         return ImageFetchResult("failed", source_url, reason=f"http_{exc.code}", transient=transient)
+    except UnresolvableHostError:
+        return ImageFetchResult("failed", source_url, reason="dns", transient=True)
     except (URLError, TimeoutError) as exc:
         reason = "timeout" if isinstance(getattr(exc, "reason", exc), TimeoutError) else "network"
         return ImageFetchResult("failed", source_url, reason=reason, transient=True)
@@ -395,7 +448,6 @@ def _due(row: Any, target: str, settings: ImageOCRSettings, force: bool) -> bool
 def _analysis_from_fetch(
     fetched: ImageFetchResult, *, backend: LLMBackend, model: str, alt_text: str,
     settings: ImageOCRSettings, temporary_parent: Path,
-    backend_gate: threading.Semaphore,
 ) -> ImageAnalysisResult:
     if fetched.status == "ignored":
         return ImageAnalysisResult(status="ignored", ignored_reason=fetched.reason)
@@ -415,13 +467,12 @@ def _analysis_from_fetch(
     if fetched.temporary_path is None:
         return ImageAnalysisResult(status="failed", failure_kind="missing_temporary_image")
     try:
-        with backend_gate:
-            audit = backend.analyze_image(
-                model=model, image_path=fetched.temporary_path, media_type=fetched.media_type,
-                source_url=fetched.source_url,
-                alt_text=alt_text, max_ocr_chars=settings.max_ocr_chars_per_image,
-                timeout_seconds=settings.timeout_seconds, temporary_parent=temporary_parent,
-            )
+        audit = backend.analyze_image(
+            model=model, image_path=fetched.temporary_path, media_type=fetched.media_type,
+            source_url=fetched.source_url,
+            alt_text=alt_text, max_ocr_chars=settings.max_ocr_chars_per_image,
+            timeout_seconds=IMAGE_ANALYSIS_TIMEOUT_SECONDS, temporary_parent=temporary_parent,
+        )
         result = audit.result
         kind = str(result["image_kind"])
         if kind != "explanatory":
@@ -449,6 +500,18 @@ def _analysis_from_fetch(
         return ImageAnalysisResult(
             status="failed", failure_kind=type(exc).__name__, warning=str(exc)[:300], transient=True,
         )
+
+
+def _timed_analysis_from_fetch(
+    fetched: ImageFetchResult, *, backend: LLMBackend, model: str, alt_text: str,
+    settings: ImageOCRSettings, temporary_parent: Path,
+) -> tuple[ImageAnalysisResult, int]:
+    started_at = time.monotonic()
+    result = _analysis_from_fetch(
+        fetched, backend=backend, model=model, alt_text=alt_text,
+        settings=settings, temporary_parent=temporary_parent,
+    )
+    return result, round((time.monotonic() - started_at) * 1000)
 
 
 def _attempt_values(
@@ -608,124 +671,215 @@ def enrich_images(
         finish_group(key, group)
 
     report.fetch_urls = len(fetch_urls)
-    temporary_parent = Path(vault_root) / ".feedian" / "tmp"
-    temporary_parent.mkdir(parents=True, exist_ok=True)
-    with ThreadPoolExecutor(max_workers=settings.workers) as executor:
-        fetch_futures = {
-            executor.submit(fetch_image, url, config, temporary_parent): url for url in fetch_urls
-        }
-        fetched_by_url = {fetch_futures[future]: future.result() for future in as_completed(fetch_futures)}
-
-    report.analysis_groups = sum(
-        1 for key, _ in ready_groups if fetched_by_url[key[0]].status == "ready"
-    )
+    report.analysis_groups = 0
     report.shared_groups = sum(1 for key, _ in ready_groups if len(all_groups[key]) > 1)
     effective_parallelism = report.llm_parallelism
-    backend_gate = threading.Semaphore(effective_parallelism)
-    with ThreadPoolExecutor(max_workers=settings.workers) as executor:
-        futures: dict[Any, tuple[tuple[str, str], list[Any], str | None, float]] = {}
-        for key, group in ready_groups:
-            fetched = fetched_by_url[key[0]]
-            fingerprint = analysis_fingerprint(
-                fetched.image_sha256, key[1], backend_id,
-                svg=fetched.media_type == "image/svg+xml",
-            ) if fetched.image_sha256 else ""
-            run_id: str | None = None
-            if fetched.status == "ready" and fetched.media_type != "image/svg+xml":
-                representative = group[0]
-                run_id = store.start_llm_run(
-                    resource_id=str(representative["resource_id"]),
-                    resource_revision_id=str(representative["resource_revision_id"]),
-                    operation="image-ocr", backend=backend_id, model=config.llm.model,
-                    prompt_version=IMAGE_OCR_PROMPT_VERSION,
-                    summary_schema_version=IMAGE_OCR_SCHEMA_VERSION,
-                    input_fingerprint=fingerprint,
-                    request={"source_url": key[0], "image_sha256": fetched.image_sha256,
-                             "alt_text": key[1], "prompt_version": IMAGE_OCR_PROMPT_VERSION,
-                             "schema_version": IMAGE_OCR_SCHEMA_VERSION},
-                    auth_mode=backend.capabilities.auth_mode,
-                    billing_mode=backend.capabilities.billing_mode,
-                    backend_metadata=backend_metadata,
-                )
-            future = executor.submit(
-                _analysis_from_fetch, fetched_by_url[key[0]], backend=backend, model=config.llm.model,
-                alt_text=key[1], settings=settings, temporary_parent=temporary_parent,
-                backend_gate=backend_gate,
+    temporary_parent = Path(vault_root) / ".feedian" / "tmp"
+    temporary_parent.mkdir(parents=True, exist_ok=True)
+    groups_by_url: dict[str, list[tuple[tuple[str, str], list[Any]]]] = {}
+    for key, group in ready_groups:
+        groups_by_url.setdefault(key[0], []).append((key, group))
+
+    open_run_ids: set[str] = set()
+
+    def start_run(key: tuple[str, str], group: list[Any], fetched: ImageFetchResult) -> str:
+        fingerprint = analysis_fingerprint(fetched.image_sha256, key[1], backend_id)
+        representative = group[0]
+        run_id = store.start_llm_run(
+            resource_id=str(representative["resource_id"]),
+            resource_revision_id=str(representative["resource_revision_id"]),
+            operation="image-ocr", backend=backend_id, model=config.llm.model,
+            prompt_version=IMAGE_OCR_PROMPT_VERSION,
+            summary_schema_version=IMAGE_OCR_SCHEMA_VERSION,
+            input_fingerprint=fingerprint,
+            request={"source_url": key[0], "image_sha256": fetched.image_sha256,
+                     "alt_text": key[1], "prompt_version": IMAGE_OCR_PROMPT_VERSION,
+                     "schema_version": IMAGE_OCR_SCHEMA_VERSION},
+            auth_mode=backend.capabilities.auth_mode,
+            billing_mode=backend.capabilities.billing_mode,
+            backend_metadata=backend_metadata,
+        )
+        open_run_ids.add(run_id)
+        return run_id
+
+    def complete_group(
+        key: tuple[str, str], selected_group: list[Any], fetched: ImageFetchResult,
+        result: ImageAnalysisResult, run_id: str | None, duration_ms: int,
+    ) -> None:
+        fingerprint = analysis_fingerprint(
+            fetched.image_sha256, key[1], backend_id, svg=fetched.media_type == "image/svg+xml",
+        ) if fetched.image_sha256 else ""
+        if run_id is not None and result.audit is not None:
+            store.finish_llm_run(
+                run_id, request=result.audit.request, response=result.audit.response,
+                result=result.audit.result, usage=result.audit.usage,
+                auth_mode=result.audit.auth_mode, billing_mode=result.audit.billing_mode,
+                backend_metadata=result.audit.metadata, duration_ms=duration_ms,
             )
-            futures[future] = (key, group, run_id, time.monotonic())
-        for future in as_completed(futures):
-            key, selected_group, run_id, started_at = futures[future]
-            fetched = fetched_by_url[key[0]]
-            result = future.result()
-            fingerprint = analysis_fingerprint(
-                fetched.image_sha256, key[1], backend_id, svg=fetched.media_type == "image/svg+xml",
-            ) if fetched.image_sha256 else ""
-            duration_ms = round((time.monotonic() - started_at) * 1000)
-            if run_id is not None and result.audit is not None:
-                store.finish_llm_run(
-                    run_id, request=result.audit.request, response=result.audit.response,
-                    result=result.audit.result, usage=result.audit.usage,
-                    auth_mode=result.audit.auth_mode, billing_mode=result.audit.billing_mode,
-                    backend_metadata=result.audit.metadata, duration_ms=duration_ms,
-                )
-                report.input_tokens += int(result.audit.usage.get("input_tokens", 0))
-                report.output_tokens += int(result.audit.usage.get("output_tokens", 0))
-                actual_cost = result.audit.response.get("total_cost_usd")
-                if not isinstance(actual_cost, (int, float)) or isinstance(actual_cost, bool):
-                    actual_cost = result.audit.metadata.get("cli_estimated_cost_usd")
-                if isinstance(actual_cost, (int, float)) and not isinstance(actual_cost, bool) and actual_cost >= 0:
-                    report.cost_usd += float(actual_cost)
-                    report.priced_requests += 1
-                elif result.audit.billing_mode == "metered-api":
-                    report.unpriced += 1
-                else:
-                    report.unmetered += 1
-            elif run_id is not None:
-                store.finish_llm_run(
-                    run_id, error=result.warning or result.failure_kind or "image analysis failed",
-                    duration_ms=duration_ms,
-                )
-                if backend.capabilities.billing_mode == "metered-api":
-                    report.unpriced += 1
-                else:
-                    report.unmetered += 1
-            ids = [str(row["resource_image_id"]) for row in all_groups[key]]
-            target = targets[str(selected_group[0]["resource_image_id"])]
-            values = _attempt_values(result, fetched, target, fingerprint, backend_id, config.llm.model, settings, run_id)
-            if result.status == "failed":
-                # Do not destroy a previously adopted result. A confirmed byte
-                # change makes it pending so ingest cannot consume stale OCR.
-                for row in all_groups[key]:
-                    row_values = dict(values)
-                    if result.transient:
-                        same_failed_target = (
-                            str(row["last_attempt_target"] or "") == target
-                            and str(row["last_failure_kind"] or "").startswith("transient:")
+            open_run_ids.discard(run_id)
+            report.input_tokens += int(result.audit.usage.get("input_tokens", 0))
+            report.output_tokens += int(result.audit.usage.get("output_tokens", 0))
+            actual_cost = result.audit.response.get("total_cost_usd")
+            if not isinstance(actual_cost, (int, float)) or isinstance(actual_cost, bool):
+                actual_cost = result.audit.metadata.get("cli_estimated_cost_usd")
+            if (
+                isinstance(actual_cost, (int, float))
+                and not isinstance(actual_cost, bool)
+                and actual_cost >= 0
+            ):
+                report.cost_usd += float(actual_cost)
+                report.priced_requests += 1
+            elif result.audit.billing_mode == "metered-api":
+                report.unpriced += 1
+            else:
+                report.unmetered += 1
+        elif run_id is not None:
+            store.finish_llm_run(
+                run_id, error=result.warning or result.failure_kind or "image analysis failed",
+                duration_ms=duration_ms,
+            )
+            open_run_ids.discard(run_id)
+            if backend.capabilities.billing_mode == "metered-api":
+                report.unpriced += 1
+            else:
+                report.unmetered += 1
+        ids = [str(row["resource_image_id"]) for row in all_groups[key]]
+        target = targets[str(selected_group[0]["resource_image_id"])]
+        values = _attempt_values(
+            result, fetched, target, fingerprint, backend_id, config.llm.model, settings, run_id,
+        )
+        if result.status == "failed":
+            # Do not destroy a previously adopted result. A confirmed byte
+            # change makes it pending so ingest cannot consume stale OCR.
+            for row in all_groups[key]:
+                row_values = dict(values)
+                if result.transient:
+                    same_failed_target = (
+                        str(row["last_attempt_target"] or "") == target
+                        and str(row["last_failure_kind"] or "").startswith("transient:")
+                    )
+                    row_values["transient_retry_used"] = int(same_failed_target)
+                if (
+                    fetched.image_sha256
+                    and row["image_sha256"]
+                    and fetched.image_sha256 != row["image_sha256"]
+                ):
+                    row_values["analysis_status"] = "pending"
+                elif str(row["analysis_status"] or "pending") not in {"completed", "ignored"}:
+                    row_values["analysis_status"] = "failed"
+                store.apply_image_analysis([str(row["resource_image_id"])], row_values)
+        else:
+            store.apply_image_analysis(ids, values)
+        count = len(ids)
+        report.propagated_rows += count
+        touched_resources.update(str(row["resource_id"]) for row in all_groups[key])
+        if result.status == "completed":
+            report.completed += count
+            report.ocr_truncated += count if result.ocr_truncated else 0
+        elif result.status == "ignored":
+            report.ignored += count
+            report.ignored_reasons[result.ignored_reason or "unknown"] += count
+        else:
+            report.failed += count
+            report.failure_kinds[result.failure_kind or "unknown"] += count
+        finish_group(key, selected_group)
+
+    fetch_queue = deque(sorted(fetch_urls))
+    pending_analysis: deque[tuple[tuple[str, str], list[Any], ImageFetchResult]] = deque()
+    fetch_futures: dict[Future[Any], str] = {}
+    analysis_futures: dict[
+        Future[Any], tuple[tuple[str, str], list[Any], ImageFetchResult, str | None, bool]
+    ] = {}
+    live_ready_urls: set[str] = set()
+    remaining_groups_by_url: dict[str, int] = {}
+    temporary_paths: set[Path] = set()
+    active_raster = 0
+
+    def pop_schedulable_analysis(
+    ) -> tuple[tuple[str, str], list[Any], ImageFetchResult] | None:
+        for index, item in enumerate(pending_analysis):
+            is_raster = item[2].media_type != "image/svg+xml"
+            if not is_raster or active_raster < effective_parallelism:
+                pending_analysis.rotate(-index)
+                selected_item = pending_analysis.popleft()
+                pending_analysis.rotate(index)
+                return selected_item
+        return None
+
+    try:
+        with ThreadPoolExecutor(max_workers=settings.workers) as executor:
+            while fetch_queue or fetch_futures or pending_analysis or analysis_futures:
+                while len(fetch_futures) + len(analysis_futures) < settings.workers:
+                    item = pop_schedulable_analysis()
+                    if item is not None:
+                        key, group, fetched = item
+                        is_raster = fetched.media_type != "image/svg+xml"
+                        run_id = start_run(key, group, fetched) if is_raster else None
+                        future = executor.submit(
+                            _timed_analysis_from_fetch, fetched, backend=backend,
+                            model=config.llm.model, alt_text=key[1], settings=settings,
+                            temporary_parent=temporary_parent,
                         )
-                        row_values["transient_retry_used"] = int(same_failed_target)
-                    if fetched.image_sha256 and row["image_sha256"] and fetched.image_sha256 != row["image_sha256"]:
-                        row_values["analysis_status"] = "pending"
-                    elif str(row["analysis_status"] or "pending") not in {"completed", "ignored"}:
-                        row_values["analysis_status"] = "failed"
-                    store.apply_image_analysis([str(row["resource_image_id"])], row_values)
-            else:
-                store.apply_image_analysis(ids, values)
-            count = len(ids)
-            report.propagated_rows += count
-            touched_resources.update(str(row["resource_id"]) for row in all_groups[key])
-            if result.status == "completed":
-                report.completed += count
-                report.ocr_truncated += count if result.ocr_truncated else 0
-            elif result.status == "ignored":
-                report.ignored += count
-                report.ignored_reasons[result.ignored_reason or "unknown"] += count
-            else:
-                report.failed += count
-                report.failure_kinds[result.failure_kind or "unknown"] += count
-            finish_group(key, selected_group)
-    for fetched in fetched_by_url.values():
-        if fetched.temporary_path is not None:
-            fetched.temporary_path.unlink(missing_ok=True)
+                        analysis_futures[future] = (key, group, fetched, run_id, is_raster)
+                        if is_raster:
+                            active_raster += 1
+                        continue
+                    if (
+                        fetch_queue
+                        and len(live_ready_urls) + len(fetch_futures) < settings.workers
+                    ):
+                        url = fetch_queue.popleft()
+                        future = executor.submit(fetch_image, url, config, temporary_parent)
+                        fetch_futures[future] = url
+                        continue
+                    break
+                running = set(fetch_futures) | set(analysis_futures)
+                if not running:
+                    raise RuntimeError("Image scheduler stalled with pending work.")
+                done, _ = wait(running, return_when=FIRST_COMPLETED)
+                for future in done:
+                    if future in fetch_futures:
+                        url = fetch_futures.pop(future)
+                        fetched = future.result()
+                        groups = groups_by_url[url]
+                        if fetched.status == "ready":
+                            report.analysis_groups += len(groups)
+                            live_ready_urls.add(url)
+                            remaining_groups_by_url[url] = len(groups)
+                            if fetched.temporary_path is not None:
+                                temporary_paths.add(fetched.temporary_path)
+                            for key, group in groups:
+                                pending_analysis.append((key, group, fetched))
+                        else:
+                            result = _analysis_from_fetch(
+                                fetched, backend=backend, model=config.llm.model,
+                                alt_text="", settings=settings,
+                                temporary_parent=temporary_parent,
+                            )
+                            for key, group in groups:
+                                complete_group(key, group, fetched, result, None, 0)
+                        continue
+                    key, group, fetched, run_id, is_raster = analysis_futures.pop(future)
+                    if is_raster:
+                        active_raster -= 1
+                    result, duration_ms = future.result()
+                    complete_group(key, group, fetched, result, run_id, duration_ms)
+                    remaining_groups_by_url[key[0]] -= 1
+                    if remaining_groups_by_url[key[0]] == 0:
+                        live_ready_urls.discard(key[0])
+                        del remaining_groups_by_url[key[0]]
+                        if fetched.temporary_path is not None:
+                            fetched.temporary_path.unlink(missing_ok=True)
+                            temporary_paths.discard(fetched.temporary_path)
+    finally:
+        for future in fetch_futures:
+            future.cancel()
+        for future in analysis_futures:
+            future.cancel()
+        for run_id in open_run_ids:
+            store.finish_llm_run(run_id, error="image enrichment interrupted")
+        for path in temporary_paths:
+            path.unlink(missing_ok=True)
     report.propagated_resources = len(touched_resources)
     return report
 

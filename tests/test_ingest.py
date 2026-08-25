@@ -87,7 +87,7 @@ def test_only_completed_image_ocr_switches_the_summary_request_to_v2(tmp_path) -
         ))
         resource_id = item.resource_id or ""
         revision_id, _ = store.record_resource_revision(
-            resource_id, content_markdown="Original body", title="OCR article",
+            resource_id, content_markdown="B" * 12_000, title="OCR article",
         )
         without_ocr = plan_source_notes(
             store, model="model", backend_instance=backend,
@@ -115,7 +115,10 @@ def test_only_completed_image_ocr_switches_the_summary_request_to_v2(tmp_path) -
 
     assert without_ocr.prompt_version == "source-note-v1"
     assert with_ocr.prompt_version == "source-note-v2"
-    assert "Original labels" in str(with_ocr.request)
+    prompt = str(with_ocr.request["input"][0]["content"][0]["text"])
+    assert "B" * 10_000 in prompt
+    assert "B" * 10_001 not in prompt
+    assert "Original labels" in prompt
     assert pending.prompt_version == "source-note-v1"
     assert pending.request == without_ocr.request
 

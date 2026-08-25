@@ -57,6 +57,7 @@ class PageFetchResult:
     not_modified: bool = False
     failure_kind: str | None = None
     browser_pending: "BrowserCandidate | None" = None
+    image_ocr_texts: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
