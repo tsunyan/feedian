@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+from urllib.parse import unquote
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -9,7 +11,25 @@ from typing import Any
 
 VAULT_CONFIG_RELATIVE_PATH = Path(".feedian") / "config.json"
 VAULT_DATABASE_NAME = "feedian.sqlite3"
-VAULT_CONFIG_VERSION = 3
+VAULT_CONFIG_VERSION = 4
+
+DEFAULT_IMAGE_OCR_NAME_TOKENS = (
+    "2x", "3x", "avatar", "badge", "banner", "blank", "bnr", "btn", "button",
+    "emoji", "favicon", "icon", "logo", "profile", "spacer", "sprite",
+)
+DEFAULT_IMAGE_OCR_URL_PREFIXES = (
+    "b.hatena.ne.jp/bc/",
+    "b.hatena.ne.jp/entry/image/",
+    "i.ytimg.com/vi/",
+    "lh3.googleusercontent.com/a/",
+    "pbs.twimg.com/amplify_video_thumb/",
+    "pbs.twimg.com/card_img/",
+    "pbs.twimg.com/cards/",
+    "pbs.twimg.com/ext_tw_video_thumb/",
+    "pbs.twimg.com/media/",
+    "pbs.twimg.com/tweet_video_thumb/",
+    "profile-image.kraken.asahi.com/",
+)
 
 
 @dataclass
@@ -55,9 +75,12 @@ class ImageOCRSettings:
     max_bytes: int = 20 * 1024 * 1024
     max_pixels: int = 40_000_000
     min_short_edge_pixels: int = 200
+    max_long_edge_pixels: int = 1_024
     max_ocr_chars_per_image: int = 2_000
     max_ocr_images_per_resource: int = 8
     max_ocr_chars_per_resource: int = 10_000
+    ignore_name_tokens: tuple[str, ...] = DEFAULT_IMAGE_OCR_NAME_TOKENS
+    ignore_url_prefixes: tuple[str, ...] = DEFAULT_IMAGE_OCR_URL_PREFIXES
 
 
 @dataclass
@@ -300,9 +323,12 @@ def render_vault_config(config: VaultConfig) -> str:
             "max_bytes": config.image_ocr.max_bytes,
             "max_pixels": config.image_ocr.max_pixels,
             "min_short_edge_pixels": config.image_ocr.min_short_edge_pixels,
+            "max_long_edge_pixels": config.image_ocr.max_long_edge_pixels,
             "max_ocr_chars_per_image": config.image_ocr.max_ocr_chars_per_image,
             "max_ocr_images_per_resource": config.image_ocr.max_ocr_images_per_resource,
             "max_ocr_chars_per_resource": config.image_ocr.max_ocr_chars_per_resource,
+            "ignore_name_tokens": list(config.image_ocr.ignore_name_tokens),
+            "ignore_url_prefixes": list(config.image_ocr.ignore_url_prefixes),
         },
     }
     return json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
@@ -329,10 +355,11 @@ def migrate_vault_config(root: str | Path) -> bool:
         # Validate rather than silently accepting an invalid current config.
         load_vault_config(root)
         return False
-    if version not in (1, 2):
+    if version not in (1, 2, 3):
         raise RuntimeError(f"No migration path from Vault config format {version}.")
     allowed = {
         "format_version", "raw_folder", "source_folder", "review_folder", "providers", "fetch", "llm",
+        "image_ocr",
     }
     unknown = sorted(set(raw) - allowed)
     if unknown:
@@ -347,6 +374,7 @@ def migrate_vault_config(root: str | Path) -> bool:
         providers=providers,
         fetch=fetch,
         llm=_parse_llm(raw.get("llm")),
+        image_ocr=_parse_image_ocr(raw.get("image_ocr")),
     )
     temporary = path.with_suffix(".json.tmp")
     temporary.write_text(render_vault_config(migrated), encoding="utf-8")
@@ -364,11 +392,63 @@ def _parse_image_ocr(raw: object) -> ImageOCRSettings:
     if unknown:
         raise ValueError(f"Unknown image_ocr field(s): {', '.join(unknown)}")
     defaults = ImageOCRSettings()
+    collection_fields = {"ignore_name_tokens", "ignore_url_prefixes"}
     values = {
         name: positive_int_setting(f"image_ocr.{name}", raw.get(name, getattr(defaults, name)))
-        for name in fields
+        for name in fields if name not in collection_fields
     }
+    values["ignore_name_tokens"] = _normalize_image_ocr_name_tokens(
+        raw.get("ignore_name_tokens", defaults.ignore_name_tokens)
+    )
+    values["ignore_url_prefixes"] = _normalize_image_ocr_url_prefixes(
+        raw.get("ignore_url_prefixes", defaults.ignore_url_prefixes)
+    )
     return ImageOCRSettings(**values)
+
+
+def _normalize_image_ocr_name_tokens(raw: object) -> tuple[str, ...]:
+    if not isinstance(raw, (list, tuple)):
+        raise ValueError("image_ocr.ignore_name_tokens must be an array of lowercase ASCII tokens.")
+    normalized: set[str] = set()
+    for value in raw:
+        if not isinstance(value, str):
+            raise ValueError("image_ocr.ignore_name_tokens must contain only strings.")
+        token = value.strip()
+        if not re.fullmatch(r"[a-z0-9]+", token):
+            raise ValueError(
+                "image_ocr.ignore_name_tokens must contain only non-empty lowercase ASCII alphanumeric tokens."
+            )
+        normalized.add(token)
+    return tuple(sorted(normalized))
+
+
+def _normalize_image_ocr_url_prefixes(raw: object) -> tuple[str, ...]:
+    if not isinstance(raw, (list, tuple)):
+        raise ValueError("image_ocr.ignore_url_prefixes must be an array of hostname/path prefixes.")
+    normalized: set[str] = set()
+    for value in raw:
+        if not isinstance(value, str):
+            raise ValueError("image_ocr.ignore_url_prefixes must contain only strings.")
+        candidate = value.strip()
+        if (
+            "://" in candidate or "?" in candidate or "#" in candidate or "@" in candidate
+            or "/" not in candidate
+        ):
+            raise ValueError(
+                "image_ocr.ignore_url_prefixes entries must use hostname/path-prefix without scheme, query, fragment, or userinfo."
+            )
+        hostname, separator, path = candidate.partition("/")
+        hostname = hostname.lower()
+        path = unquote(path).lstrip("/")
+        if (
+            not separator or ":" in hostname
+            or not re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?", hostname)
+        ):
+            raise ValueError(
+                "image_ocr.ignore_url_prefixes entries must use a valid hostname/path-prefix form."
+            )
+        normalized.add(f"{hostname}/{path}")
+    return tuple(sorted(normalized))
 
 
 def _parse_llm(raw: object) -> LLMSettings:
