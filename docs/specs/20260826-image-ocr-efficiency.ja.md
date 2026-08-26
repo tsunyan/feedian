@@ -47,7 +47,7 @@ decodeできない場合の扱いは3つに分ける。**この区別は必須�
 
 - **必須formatのdecoderが無い** — install不備として画像取得前のpreflightでcommandを失敗させる。PNG、JPEG、GIFはPillow本体、WebPは`PIL.features.check_module('webp')`で確認し、原本fallbackには入れない。
 - **任意formatのcodecが無い、またはそのformatに未対応** — 縮小せず、取得した原本をそのままbackendへ渡す。対象はAVIFである。AVIFは現行の`SUPPORTED_RASTER_MIMES`に含まれ、今日そのまま渡って成功しているため、こちら側にdecoderが無いという都合で成功中のOCRを失ってはならない。
-- **bytesが壊れていてdecodeできない** — `unavailable:unsupported_image_decoder`として終端無視にする。
+- **bytesが壊れていてdecodeできない** — `unavailable:unsupported_image_decoder`として終端無視にする。decode済み画像または原本を一時fileへ書くlocal I/O失敗はdecoder不良ではないため、`transient:temporary_image_io`としてcommandを失敗させ、次回の自動再試行対象にする。
 
 `max_long_edge_pixels`の変更は新規解析へだけ適用する。**この値を`attempt_target`のpayloadへ入れてはならない。** `max_bytes`、`max_pixels`、`min_short_edge_pixels`は既にpayloadに入っているが、それらは解析の可否を変えるgateであるのに対し、`max_long_edge_pixels`は送る画像の中身を変えるだけで、model変更と同じ扱いになる。比較や再取得が必要なら`--force`を使う。実際の元寸法と送信寸法は`llm_run.request_json`へ保存する。
 
@@ -121,8 +121,8 @@ backend境界には正規化後（または原本）の画像実体、media type
 
 改善後のtargetはfilter一覧全体ではなく、各URLに対する**有効なgate判定**を含める。値は`name_token:<token>`、`url_prefix:<prefix>`、`pass`のいずれかである。
 
-- 規則追加で新しく一致した行だけが`pass`からrule IDへ変わり、取得せずローカルに更新される。採用中の完了結果があればpayloadを保持した`ignored`、無ければ通常の`ignored`にする。
-- 規則削除で該当行だけがrule IDから`pass`へ変わる。gateが保持していた完了結果は外部requestなしに`completed`へ戻し、それ以外だけを通常の取得・解析対象へ戻す。
+- 規則追加で新しく一致した行だけが`pass`からrule IDへ変わり、取得せずローカルに更新される。採用中の完了結果またはLLM分類済み`ignored`結果があればpayloadを保持し、採用済み結果が無ければ通常の`ignored`にする。
+- 規則削除で該当行だけがrule IDから`pass`へ変わる。gateが保持していた完了結果は外部requestなしに`completed`へ戻し、LLM分類済み`ignored`結果は分類とpayloadを保ったまま新targetをローカル採用する。採用済み結果の無い行だけを通常の取得・解析対象へ戻す。
 - 一致しない行はfilter一覧が変わっても`pass`のままで、既存のLLM結果を再利用する。
 
 **草案にあった`gate_version`は設けない。** gateは毎回URLからローカルに再計算されるため、規則やアルゴリズムを変えれば該当行の判定値が変わり、変わらない行は再解析する必要がない。`matched_rule`が既にその役割を果たしており、`gate_version`をbumpすべき具体的な状況が存在しない。用途の定義されないversion fieldは、後で「念のため上げる」運用に流れ、本仕様が防ごうとしている全画像の再解析を招く。全行の再解析が本当に必要になった場合は`--force`を使う。
@@ -134,10 +134,11 @@ config v3からの移行直後も、既存の完了・LLM分類無視結果が�
 | 一致前の状態 | 一致中の`analysis_status` | payload |
 |---|---|---|
 | `completed` | `ignored` | `ocr_text`、`image_kind='explanatory'`、`analysis_method`、`analysis_input_fingerprint`、`image_sha256`など採用済みpayloadを保持し、`ignored_reason`と`last_attempt_*`だけをgate結果へ更新する |
+| LLM分類済み`ignored` | `ignored` | `analysis_method`、`analysis_input_fingerprint`、`image_kind`、`image_sha256`、`ignored_reason`など分類payloadをすべて保持し、`last_attempt_*`だけをgate結果へ更新する |
 | 画像変更確認後の`pending` | `pending` | 保持中の旧payloadを上書きせず、gate結果を試行列へ記録する |
 | 採用済み結果なし | `ignored` | 従来どおりgate無視結果を書く |
 
-保存済み完了結果を保持したgate無視は、`analysis_status='ignored'`かつ`image_kind='explanatory'`、`analysis_method`と`analysis_input_fingerprint`が非NULLであることから、schema追加なしに識別する。規則を削除してtargetが`pass`へ変わった場合は、この行だけをローカルに`completed`へ戻して`ignored_reason`を消す。もともと`pending`だった行や採用済み結果の無い`ignored`行は復活させず、通常の取得・解析対象へ戻す。
+gate適用前から採用済み結果があったことは、`analysis_method`と`analysis_input_fingerprint`が非NULLであることからschema追加なしに識別する。さらに、直前の試行がgate由来であることは`last_attempt_status='ignored'`、`last_attempt_fingerprint`と`last_failure_kind`がNULLであることから識別する。規則を削除してtargetが`pass`へ変わり、このgate由来条件を満たす場合だけ、`image_kind='explanatory'`の行をローカルに`completed`へ戻して`ignored_reason`を消し、それ以外のLLM分類済み`ignored`行は分類と`ignored_reason`を保ったまま新targetをローカル採用する。backend、prompt、schema、資源gateなどgate以外のtarget要素が変わった行をこの復帰経路へ入れてはならず、通常どおり再解析する。もともと`pending`だった行や採用済み結果の無い`ignored`行も通常の取得・解析対象へ戻す。
 
 同じrule IDが有効な間は、`last_attempt_status='ignored'`と同じ`last_attempt_target`を持つ行を、現在の`analysis_status`にかかわらずdueにしない。rule IDが変わった場合だけローカル更新し、`pass`へ変わった場合だけ上の復帰または通常処理を行う。
 
@@ -176,13 +177,15 @@ unavailable:http_<code>
 unavailable:unsupported_image_header
 unavailable:invalid_or_incomplete_header
 unavailable:unsupported_image_decoder
+unavailable:blocked_url
+unavailable:invalid_fetch_response
 resource_limit:max_bytes
 resource_limit:max_pixels
 ```
 
 同じtargetでは自動再試行しない。設定変更または`--force`で再試行できる。`max_bytes`と`max_pixels`は`attempt_target`のpayloadに含まれるため、値を上げれば自動的に再試行対象へ戻る。gateは従来どおり`--force`より優先する。
 
-commandを非0にする`failed`は、再試行しても残った一過性network・backend障害（`transient=True`）、監査runを正常に閉じられない状態、DB書き込み失敗など、commandまたは外部serviceの動作確認を必要とするものに限定する。
+commandを非0にする`failed`は、再試行しても残った一過性network・backend障害と一時画像のlocal I/O失敗（`transient=True`）、監査runを正常に閉じられない状態、DB書き込み失敗など、commandまたは外部serviceの動作確認を必要とするものに限定する。URL policy違反は自由文の例外messageを理由語彙へ混ぜず、`unavailable:blocked_url`へ丸めて詳細だけを`analysis_warning`へ保存する。
 
 実測では`failed`が94行あり、内訳は`http_404`が78行、`unsupported_image_header`が16行で、それ以外の失敗理由は0件だった。後者はすべて`assets.st-note.com`である。この94行は恒久的に残るため、現状では`enrich-images`が毎回終了コード1を返している。特定site全体のdenylist追加は行わない。
 
@@ -196,7 +199,7 @@ rasterの`llm_run.request_json.logical`へ次を保存する。
 - headerから得た元の`width`と`height`
 - EXIF orientation反映後の元の`width`と`height`
 - backendへ送った`width`、`height`、`media_type`
-- 縮小を行ったかどうか、適用した`max_long_edge_pixels`、短辺下限規則が働いたかどうか
+- 縮小を行ったかどうか、適用した`max_long_edge_pixels`、短辺下限規則が実際の縮小倍率を長辺規則より大きくしたかどうか。縮小しなかった画像では短辺下限の適用有無を必ず`false`とする
 
 画像bytes、base64、API keyは保存しない。これらは既存JSON監査列へ入れるためSQLite schema列は増やさない。開始時requestに保存した`image_sha256`を完了時の論理requestで失わないよう、backend auditのrequest envelopeを統合する。実測で、完了時に`logical`が上書きされ`image_sha256`が残っていないことを確認した。
 
@@ -306,23 +309,23 @@ Vault config formatを3から4へ上げる。migrationは現行code定数を`ign
 8. `max_pixels + 1`の画像で`DecompressionBombWarning`が例外になり、pixel dataをloadしない。明示的な寸法照合も同じ入力を拒否し、process全体の無関係なwarning処理を変えない。
 9. `openai-responses`、`codex-local`、`claude-code-local`へ同じ送信寸法の画像が渡り、provider固有設定の有無で前処理が変わらない。再encode時は一時fileの拡張子も正規化後のものになる。
 10. `max_long_edge_pixels`を変えても`attempt_target`が変わらず、既存の成功結果が再解析されない。
-11. 監査JSONへ元寸法、送信寸法、media type、byte数、SHA-256、縮小有無、短辺下限の適用有無が残る。
+11. 監査JSONへ元寸法、送信寸法、media type、byte数、SHA-256、縮小有無、短辺下限の適用有無が残る。縮小しなかった画像の短辺下限適用有無は`false`になる。
 12. 名前tokenはURL pathだけに完全一致し、hostname、query、alt、部分文字列、数字接尾辞では一致しない。
 13. URL prefixは正規化したhostnameとpathにだけ一致し、hostnameは完全一致で番号付きshardに一致せず、不正な設定を拒否する。
-14. 完了OCRを持つ行に新しいgate規則が一致すると、`analysis_status='ignored'`になって`ignored_reason`だけが更新され、OCR・分類・指紋・SHA-256は保持される。採用済み結果の無い一致行は通常の`ignored`になる。無関係な完了行を再取得・再解析しない。
+14. 完了OCRを持つ行に新しいgate規則が一致すると、`analysis_status='ignored'`になって`ignored_reason`だけが更新され、OCR・分類・指紋・SHA-256は保持される。LLM分類済み`ignored`行では分類理由を含むpayloadをすべて保持し、`last_attempt_*`だけを更新する。採用済み結果の無い一致行は通常の`ignored`になる。
 15. 同じrule IDを維持した2回目の実行では、保持payloadの有無にかかわらず対象resource、DB update、外部requestが0になり、残件が収束する。**`--force`を付けた実行ではgate一致行が再評価されるが、取得も解析も行われず、保持payloadは1 byteも変化しない。同じ`--force`で終端事象行は再取得される。** `last_failure_kind`でこの2つを判別していることを確認する。
-16. gate規則を削除すると、保持した完了結果だけが外部requestなしに`completed`へ戻り、`ignored_reason`が消える。もともと`pending`または採用済み結果の無い`ignored`だった行だけが通常対象へ戻る。
+16. gate規則を削除すると、`last_attempt_status='ignored'`、`last_attempt_fingerprint`と`last_failure_kind`がNULLのgate由来行に限り、保持した完了結果は外部requestなしに`completed`へ戻って`ignored_reason`が消え、LLM分類済み`ignored`結果は分類payloadを保ったまま新targetをローカル採用する。backend、prompt、schema、資源gateなどgate以外のtarget要素が変わったLLM分類済み`ignored`行は通常どおり再解析する。もともと`pending`または採用済み結果の無い`ignored`だった行も通常対象へ戻る。
 17. config v3からv4へのmigrationで既存の完了・LLM無視結果を外部requestなしに維持し、`name_pattern:` / `denylist:`形式の`ignored_reason`が新形式へ上書きされる。
 18. `transient=False`のfetch失敗が理由付きの終端事象になり、それだけなら終了コード0になる。404、410、未対応header、資源上限、decode不能を含み、採用済み結果を持たない行だけが`ignored`になる。
 19. 完了OCRを持つ行を`--force`し、取得が404 / 410になるか、新SHA-256が不明または採用中と同じ状態でdecode不能になっても、`analysis_status='completed'`と全payloadが維持され、OCRが引き続き`ingest`へ入り、終了コードが0になる。
 20. 新SHA-256が採用中と異なることを確認してから終端事象になった行だけが`pending`へ戻る。非空OCRなど旧payloadは保持されるが`ingest`へは入らず、同じtargetの次回実行では自動再試行しない。
-21. backend一時障害とDB書き込み失敗は終了コード非0のままになる。
+21. backend一時障害、正規化後または原本の一時file書き込み失敗、DB書き込み失敗は終了コード非0のままになる。一時file書き込み失敗を`unsupported_image_decoder`として終端無視にしない。
 22. dry-runが取得前filter件数を読み取り専用で報告する。
 23. 同一DB状態において、完了時の`remaining_resources_after`が次回dry-runの開始値と一致する。
 24. group件数と伝播行件数を別々に報告し、`llm_requests`がerrorで閉じたrunを含めて`llm_run`増分と一致する。
 25. `gate_ignored_rows`と`postfetch_ignored_rows`が分けて報告される。
 26. `retained_current_rows`が、gate一致または終端事象で採用済みpayloadを保持した行の実数と一致する。
-27. 入力tokenの平均、p50、p95、最大が保存済みusageから再計算した値と一致する。
+27. 入力tokenの平均、p50、p95、最大が保存済みusageから再計算した値と一致し、値が0なら`unknown`ではなく`0`と表示する。
 28. OCRなしのsync、ingest、render、snapshot動作が変わらない。
 29. `python -m pytest -q`、`PRAGMA quick_check`、`PRAGMA integrity_check`が成功する。
 
@@ -387,6 +390,39 @@ Vault config formatを3から4へ上げる。migrationは現行code定数を`ign
    - (前) 「実装後に1,024・1,536・2,048pxを比較し、読める最小値を後で決める」
    - (後) 「実Vaultの説明画像177件から代表6件を選んだ18枚を人間が原寸比較し、1,024pxを既定値として確定した。実装後は製品経路が同じ結果になることだけをspot checkする」
    - 理由: 可読性は数値だけで決められないため人間判断を待っていたが、比較が完了した。証拠はレビュー7である。
+
+### 改訂2 — Codex (2026-08-26)
+
+実装コードレビューで確定仕様の状態遷移に不足が見つかったため、最終案を修正した。証拠は[画像OCRの効率化と調整可能なgateのコードレビュー](../reviews/20260826-image-ocr-efficiency-implementation.ja.md)の指摘1〜5と対応testである。
+
+1. **一時file書き込み失敗とdecoder不良の分離**
+   - (前) 「bytesが壊れていてdecodeできない場合は`unavailable:unsupported_image_decoder`として終端無視にする」。local I/O失敗の扱いは明記していなかった。
+   - (後) 「decodeまたは素通しの結果を一時fileへ書くlocal I/O失敗は`transient:temporary_image_io`としてcommandを失敗させ、自動再試行対象にする」。
+   - 理由: disk fullや一時的な書き込み拒否は画像bytesの恒久的な不良ではなく、終端無視にすると終了コード0のまま再試行も通知も失うためである。
+
+2. **gate適用前からLLM分類済み`ignored`だった行の保持と復帰**
+   - (前) 「gate一致時に保持するのは`completed`のpayloadだけであり、規則削除時に復帰するのも`image_kind='explanatory'`の保持完了結果だけ」としていた。
+   - (後) 「LLM分類済み`ignored`も採用済み結果として全payloadを保持し、規則削除時は分類と`ignored_reason`を保ったまま新targetをローカル採用する」。
+   - 理由: 既にLLM分類済みの行へgateを足して戻すだけでpayloadを失い、外部requestと解析costを再度払うのは、目的3の可逆なfilter調整に反するためである。
+
+3. **監査field `short_edge_floor_applied`の意味**
+   - (前) 「短辺下限規則が働いたかどうか」とだけ記し、縮小しない画像での値を定めていなかった。
+   - (後) 「短辺下限規則が実際の縮小倍率を大きくした場合だけ`true`で、縮小しなかった画像は必ず`false`」とする。
+   - 理由: 縮小していない縦横比2:1超の画像まで`true`にすると、短辺下限の効果を測る監査値が実態と一致しないためである。
+
+4. **固定理由語彙と0 token表示**
+   - (前) URL policy違反の固定理由と、percentileが0の場合の表示を定めていなかった。
+   - (後) URL policy違反は`unavailable:blocked_url`へ丸めて自由文を`analysis_warning`へ保存し、token percentileの計算値が0なら`unknown`ではなく`0`と表示する。
+   - 理由: 理由別counterへ自由文が混ざるとVault調整に使える集計にならず、計算済みの0を`unknown`へ潰すと監査結果を誤読するためである。
+
+### 改訂3 — Codex (2026-08-26)
+
+改訂2のgate復帰条件がgate以外のtarget変更まで拾うことを再レビューで確認したため、最終案を修正した。
+
+1. **gate由来結果の識別条件**
+   - (前) 「採用済み`ignored`であり、保存済みtargetと現在targetが異なれば、gate削除後のローカル復帰・採用経路へ入れる」。
+   - (後) 「採用済み`ignored`に加え、`last_attempt_status='ignored'`、`last_attempt_fingerprint`と`last_failure_kind`がNULLというgate由来条件を満たす場合だけローカル復帰・採用経路へ入れる。gate以外のtarget要素が変わった行は再解析する」。
+   - 理由: target差だけではbackend、prompt、schema、`max_bytes`などの変更とgate削除を区別できず、過去に非説明と分類された行だけ新しい解析条件で再判定されないためである。証拠はコードレビューの指摘6と、gate適用前・gate往復後の両方でbackend変更が`fetch`になる対応testである。
 
 ## 草案
 

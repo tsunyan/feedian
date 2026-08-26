@@ -197,7 +197,7 @@ The active provider and model are shown in the ingest preview and execution head
 
 ```json
 {
-  "format_version": 3,
+  "format_version": 4,
   "raw_folder": "raw",
   "source_folder": "source",
   "review_folder": "review",
@@ -253,9 +253,21 @@ The active provider and model are shown in the ingest preview and execution head
     "max_bytes": 20971520,
     "max_pixels": 40000000,
     "min_short_edge_pixels": 200,
+    "max_long_edge_pixels": 1024,
     "max_ocr_chars_per_image": 2000,
     "max_ocr_images_per_resource": 8,
-    "max_ocr_chars_per_resource": 10000
+    "max_ocr_chars_per_resource": 10000,
+    "ignore_name_tokens": [
+      "2x", "3x", "avatar", "badge", "banner", "blank", "bnr", "btn",
+      "button", "emoji", "favicon", "icon", "logo", "profile", "spacer", "sprite"
+    ],
+    "ignore_url_prefixes": [
+      "b.hatena.ne.jp/bc/", "b.hatena.ne.jp/entry/image/", "i.ytimg.com/vi/",
+      "lh3.googleusercontent.com/a/", "pbs.twimg.com/amplify_video_thumb/",
+      "pbs.twimg.com/card_img/", "pbs.twimg.com/cards/",
+      "pbs.twimg.com/ext_tw_video_thumb/", "pbs.twimg.com/media/",
+      "pbs.twimg.com/tweet_video_thumb/", "profile-image.kraken.asahi.com/"
+    ]
   }
 }
 ```
@@ -285,13 +297,18 @@ The active provider and model are shown in the ingest preview and execution head
 | `image_ocr.workers` | Global parallel workers for image fetching and analysis across all resources. Defaults to 8 and is capped further by the selected backend. |
 | `image_ocr.timeout_seconds` | Per-request image download timeout. Defaults to 15 seconds. |
 | `image_ocr.max_bytes` | Maximum downloaded bytes per image. Defaults to 20 MiB. |
-| `image_ocr.max_pixels` | Maximum pixels declared by a raster image header. Defaults to 40,000,000. Image bytes are never decoded. |
+| `image_ocr.max_pixels` | Maximum decoded pixels. Defaults to 40,000,000. Pillow's decompression-bomb warning is treated as an error and decoded dimensions are checked again before pixel data is loaded. |
 | `image_ocr.min_short_edge_pixels` | Ignore raster images, and SVG files that declare a size, whose shorter edge is below this. Defaults to 200 pixels. |
+| `image_ocr.max_long_edge_pixels` | Raster normalization target. Defaults to 1,024 pixels. Images are never enlarged; very narrow images stay larger when needed to keep their short edge readable. |
 | `image_ocr.max_ocr_chars_per_image` | Maximum stored OCR characters per image. Defaults to 2,000; truncated results are marked for later inspection. |
 | `image_ocr.max_ocr_images_per_resource` | Maximum explanatory-image OCR results supplied to one `ingest` request. Defaults to 8. |
 | `image_ocr.max_ocr_chars_per_resource` | Maximum total OCR characters supplied for one resource. Defaults to 10,000. |
+| `image_ocr.ignore_name_tokens` | Complete lowercase ASCII path-token denylist. Hostnames, query strings, fragments, alt text, substrings, regular expressions, and globs are not matched. |
+| `image_ocr.ignore_url_prefixes` | Complete `hostname/path-prefix` denylist applied to the stored source URL before fetching. Hostnames match exactly, so numbered shards must be listed separately when wanted. |
 
-Unknown config fields are rejected instead of silently ignored. Worker counts, fetch limits, and every `image_ocr` setting must be integers of 1 or more; a boolean, a decimal, or a quoted number is rejected when the config is read rather than coerced.
+Unknown config fields are rejected instead of silently ignored. Numeric `image_ocr` settings must be integers of 1 or more; a boolean, a decimal, or a quoted number is rejected rather than coerced. Gate arrays are normalized and deduplicated, and malformed entries are rejected.
+
+The two image gate arrays are the Vault's complete active values, not additions to hidden code defaults. To tune a Vault, run `enrich-images --dry-run`, inspect the `ignored_reason` and host counts, then add only rules whose matched images are known to be non-explanatory. Rules such as host prefixes for `spotlight.fantia.jp`, `media.vogue.co.jp`, `dailyportalz.jp`, `nazology.kusuguru.co.jp`, and `media.loom-app.com`, or the `photo` and `storage` name tokens, are intentionally not defaults because their accuracy is Vault-dependent. Removing a rule restores a retained completed OCR locally when possible.
 
 ## Command reference
 

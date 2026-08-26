@@ -566,19 +566,22 @@ def _enrich_images(args: argparse.Namespace) -> int:
 
         def print_plan(plan) -> None:
             historical = (
-                f"{plan.historical_seconds_per_image:.3f}"
-                if plan.historical_seconds_per_image is not None else "unknown"
+                f"{plan.historical_seconds_per_request:.3f}"
+                if plan.historical_seconds_per_request is not None else "unknown"
             )
             expected = f"{plan.expected_seconds:.1f}" if plan.expected_seconds is not None else "unknown"
             print(
-                f"enrich-images-plan: remaining_resources={plan.remaining_resources} "
-                f"resources={plan.resources} candidate_rows={plan.candidate_rows} "
-                f"fetch_urls={plan.fetch_urls} analysis_groups={plan.analysis_groups} "
-                f"reused_existing={plan.reused_existing} llm_parallelism={plan.llm_parallelism} "
-                f"historical_seconds_per_image={historical} expected_seconds={expected}"
+                f"enrich-images-plan: remaining_resources_before={plan.remaining_resources_before} "
+                f"selected_resources={plan.selected_resources} candidate_rows={plan.candidate_rows} "
+                f"prefetch_ignored_rows={plan.prefetch_ignored_rows} "
+                f"planned_fetch_urls={plan.planned_fetch_urls} "
+                f"planned_analysis_groups={plan.planned_analysis_groups} "
+                f"reused_existing_rows={plan.reused_existing_rows} "
+                f"llm_parallelism={plan.llm_parallelism} "
+                f"historical_seconds_per_request={historical} expected_seconds={expected}"
             )
             if not args.dry_run:
-                reporter.start_task("enrich-images: processing resources", total=plan.resources)
+                reporter.start_task("enrich-images: processing resources", total=plan.selected_resources)
 
         if args.dry_run:
             report = enrich_images(
@@ -603,15 +606,12 @@ def _enrich_images(args: argparse.Namespace) -> int:
                                 if temporary_image.is_file():
                                     temporary_image.unlink(missing_ok=True)
                         raise
-        print(
-            f"enrich-images: remaining_resources={report.remaining_resources} "
-            f"{report_line(report)}"
-        )
+        print(f"enrich-images: {report_line(report)}")
         for reason, count in sorted(report.ignored_reasons.items()):
             print(f"  ignored_reason[{reason}]={count}")
         for kind, count in sorted(report.failure_kinds.items()):
             print(f"  failure_kind[{kind}]={count}")
-        return 1 if report.failed else 0
+        return 1 if report.transient_failed_rows else 0
     finally:
         store.close()
 
