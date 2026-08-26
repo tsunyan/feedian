@@ -20,6 +20,7 @@ from feedian.image_ocr import (
     enrich_images,
     extract_svg_text,
     fetch_image,
+    gate_decision,
     prefetch_ignored_reason,
     raster_dimensions,
     _due,
@@ -124,6 +125,24 @@ def test_fetch_policy_failure_uses_a_fixed_reason(monkeypatch) -> None:
     assert result.reason == "blocked_url"
     assert result.warning == "non-public address is not allowed: 127.0.0.1"
     assert result.transient is False
+
+
+def test_unparsable_url_passes_the_gate_instead_of_aborting_the_run() -> None:
+    # gate_decision runs for every row while the plan is built, before any fetch.
+    # urlsplit raises "Invalid IPv6 URL" on an unmatched bracket, so raising here
+    # would abort the whole run over one stored row.
+    settings = ImageOCRSettings()
+    url = "http://[bad/chart.png"
+
+    assert gate_decision(url, settings) == "pass"
+    assert prefetch_ignored_reason(url, settings) is None
+    assert attempt_target(url, "", "openai-responses", settings)
+
+    result = fetch_image(url, VaultConfig())
+
+    assert result.status == "failed"
+    assert result.transient is False
+    assert image_ocr_module._terminal_reason(result.reason).startswith("unavailable:")
 
 
 def test_malformed_url_is_terminal_and_not_retried(monkeypatch) -> None:

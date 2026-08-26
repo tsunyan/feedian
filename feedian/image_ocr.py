@@ -148,8 +148,16 @@ def normalize_alt(value: str) -> str:
 
 
 def gate_decision(source_url: str, settings: ImageOCRSettings) -> str:
-    parsed = urlsplit(source_url)
-    hostname = (parsed.hostname or "").lower()
+    try:
+        parsed = urlsplit(source_url)
+        hostname = (parsed.hostname or "").lower()
+    except ValueError:
+        # A stored URL urlsplit cannot parse -- an unmatched bracket makes it
+        # raise "Invalid IPv6 URL". This runs for every row while the plan is
+        # built, long before any fetch, so raising here would abort the whole
+        # run over one bad row. Let it pass the gate: fetch_image classifies it
+        # as a terminal unavailable and the run keeps going.
+        return "pass"
     decoded_path = unquote(parsed.path).lstrip("/")
     host_path = f"{hostname}/{decoded_path}"
     for prefix in settings.ignore_url_prefixes:

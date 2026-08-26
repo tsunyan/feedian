@@ -11,7 +11,7 @@
 
 指摘は5件で、うち1件が重大度「高」である。**指摘1は、local diskのI/O失敗を「decoderが読めない画像」として恒久的な終端無視に落とすもので、本仕様が終了コード0と自動再試行の抑止をセットにしたことで沈黙する。** 指摘2は、gate一致がLLM分類済み行のpayloadを捨てるため、filterを試して戻すと再解析costを払い直す。どちらも仕様が達成しようとした性質（保存済み結果を壊さない、filter調整で再解析しない）の裏をかいている。
 
-初回の5件と再レビューの指摘6をすべて採用し、作業ツリーで修正した。指摘2と、その修正範囲を限定する指摘6は実装だけでなく確定仕様の状態遷移にも関わるため、仕様の`改訂2`・`改訂3`へ変更前後・理由・証拠を記録した。全体回帰は636 passed / 1 skipped、Ruffは成功している。レビュー対象と修正を分けるcommit topologyがまだ作られていないため、文書のステータスは`対応中`とする。
+初回の5件と再レビューの指摘6をすべて採用し、作業ツリーで修正した。指摘2と、その修正範囲を限定する指摘6は実装だけでなく確定仕様の状態遷移にも関わるため、仕様の`改訂2`・`改訂3`へ変更前後・理由・証拠を記録した。その後の実Vault実行で指摘7・8が出た。指摘7は修正し、指摘8は確定仕様の改訂を要するため保留とした。全体回帰は637 passed / 1 skipped、Ruffは成功している。その後PR #23のCodexレビューで指摘9が出たので修正した。指摘1〜7と9の対応が終わり、保留の指摘8も理由を記録したので、本文書のステータスは`完了`である。
 
 ## 検証した挙動
 
@@ -138,6 +138,21 @@ pathに素のspaceと括弧が入っており、`http.client`がrequest lineを�
 
 参考として、現在Vaultには`analysis_status='failed'`の行が151行ある。指摘7・8を終端扱いにすると、この大半が終了コードに影響しなくなる。
 
+### 9. `gate_decision`がparse不能なURLで実行全体を落とす — 重大度: 高（PR #23のCodexレビューで判明）
+
+`gate_decision`（`feedian/image_ocr.py:148`）は`urlsplit(source_url)`をそのまま呼ぶ。角括弧が閉じていないURLに対してPythonの`urlsplit`は`ValueError: Invalid IPv6 URL`を送出する。
+
+```text
+>>> urlsplit("http://[bad/chart.png")
+ValueError: Invalid IPv6 URL
+```
+
+`enrich_images`はplanを組む段階で全行分の`targets`、`gates`、`legacy_targets`を作り、末尾の残件再scanでも全行に対して`gate_decision`と`attempt_target`を呼ぶ。**どれも取得の前なので、保存済みURLが1件でもparse不能だと`enrich-images`全体がtraceback で落ちる。** 取得側の終端処理まで到達しない。
+
+`AGENTS.md`の「1ページの取得が壊れても、記録して次へ進む」という方針に正面から反する。またこの仕様が目的5で「正常に完走したcommandを失敗扱いにしない」と決めた線より手前で、完走そのものができなくなる。
+
+`gate_decision`で`ValueError`を捕捉して`pass`を返せば、その行は通常どおり`fetch_image`へ流れる。実測すると`fetch_image`は`invalid_fetch_response` / `transient=False`を返すので、既存の終端規則で`unavailable:invalid_fetch_response`として記録され、実行は続き終了コードは0になる。gate側に終端判定を持ち込む必要はない。
+
 ## 仕様との差分（指摘ではない）
 
 - `_due`のgate分岐（`feedian/image_ocr.py:620`付近）は`force`より前に置かれており、`--force`でもgate行がdueにならない。最終案は「`_due`へ`force`より前段の判定を持ち込まない」「`--force`時に再評価はされるが冪等な再書き込みになる」と書いている。観測できる結果（取得しない、payloadが変わらない）は同じかより強いので実害は無いが、検証15の文面とは一致しない。仕様文を実装に合わせるか、実装をコメントで補うかを決めておきたい。
@@ -156,6 +171,7 @@ pathに素のspaceと括弧が入っており、`http.client`がrequest lineを�
 | 6 | 採用 | `_retained_gate_result`へ`last_attempt_fingerprint IS NULL`を追加し、gateが書いた試行だけを復帰対象に限定した。通常のLLM分類結果とgate往復後にローカル採用済みの結果はfingerprintを持つため、backend・prompt・schema・資源gateの変更では`fetch`になって再解析される。確定仕様の`改訂3`にも識別条件を反映した。 |
 | 7 | 採用 | `fetch_image`へ`except InvalidURL`を足し、`reason='blocked_url'`・`transient=False`にした。既存の終端規則にそのまま乗るため仕様改訂は不要。理由語彙は新設せず`blocked_url`へ丸め、例外messageは`warning`から`analysis_warning`へ残す。`tests/test_image_ocr.py`に`test_malformed_url_is_terminal_and_not_retried`を追加した。 |
 | 8 | 保留 | 解析側の非transient失敗（`unsafe_svg`、`invalid_svg`、`output_limit`）を終端に含めるかは、確定仕様の終端規則が取得側に限定していることの是非そのものであり、改訂を要する。report fieldの名前と終了コードの定義も併せて決める必要があるため、本PRの範囲に入れず別仕様へ回す。実害は「終端事象が発生した実行だけ終了コードが1になる」ことに限られ、`_due`は再試行せず状態は収束する。データ損失も再解析ループも無いことは確認済みである。 |
+| 9 | 採用 | `gate_decision`の`urlsplit`を`try`で囲み、`ValueError`なら`pass`を返すようにした。その行は通常どおり取得へ流れ、`fetch_image`が`invalid_fetch_response`の終端として分類する。`tests/test_image_ocr.py`に`test_unparsable_url_passes_the_gate_instead_of_aborting_the_run`を追加した。 |
 
 ## 検証
 
@@ -196,4 +212,4 @@ pathに素のspaceと括弧が入っており、`http.client`がrequest lineを�
 
 ## 規約化した項目
 
-なし。今回の8件は同種指摘の2回目には該当しない。
+なし。今回の9件は同種指摘の2回目には該当しない。
