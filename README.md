@@ -108,7 +108,7 @@ Each backend authenticates differently:
 
 | Backend | Credential | Notes |
 | --- | --- | --- |
-| `openai-responses` | `OPENAI_API_KEY` | The built-in default backend. |
+| `openai-responses` | `OPENAI_API_KEY` | What `feedian init` writes as the Vault's initial `llm.backend`. |
 | `manus-api` | `MANUS_API_KEY` | Sent as the `x-manus-api-key` header. Uses the structured output API. |
 | `codex-local` | None in `.env` | Run `codex login` once in Feedian's own `CODEX_HOME` (`~/.feedian/codex-home`), which leaves your usual `~/.codex` untouched. Feedian never passes an LLM API key to the CLI. |
 | `claude-code-local` | `ANTHROPIC_API_KEY`, or `ANTHROPIC_AUTH_TOKEN` with an `ANTHROPIC_BASE_URL` gateway | Set exactly one of the two, never both. OAuth and subscription authentication are not used. |
@@ -772,7 +772,7 @@ python -m feedian --config config.json --list-collections
 - Linked pages, bookmark metadata, and comments are treated as untrusted reference data. The prompt tags that material as untrusted and instructs the model not to follow instructions found inside it.
 - That defense is weaker with Manus than with OpenAI. OpenAI carries Feedian's instructions in a separate system field the page text cannot reach; Manus has no such field, so the instructions are placed before and repeated after the quoted material in one message, and Manus executes it as an agent. Prefer OpenAI when the material is untrusted enough to matter.
 - Whatever a backend returns is re-checked against Feedian's own schema before a note is written, so a backend that does not enforce the schema itself cannot write malformed frontmatter.
-- Page fetching accepts only HTTP(S), blocks private/local addresses by default, and rechecks redirects. Add only trusted hosts to `fetch.allow_private_hosts`. Addresses are checked by resolving the hostname, and the connection resolves it again independently, so this does not defeat a DNS entry that changes between the two.
+- Page fetching accepts only HTTP(S), blocks private/local addresses by default, and rechecks redirects. Add only trusted hosts to `fetch.allow_private_hosts`. The hostname is resolved exactly once: every address that lookup returns is checked, and the connection is then made only within that same checked set, so the name cannot resolve to something else between the check and the connect. The browser fallback re-validates every URL but relies on Chromium's own name resolution, which leaves a narrow gap Feedian accepts.
 - Raindrop and LLM requests retry bounded transient failures with capped exponential backoff.
 - A Vault write lock prevents overlapping mutating operations.
 - Before every LLM request, Feedian checks that the Vault remains readable. The request as sent, the response, LLM usage, and the generated note are recorded per resource in SQLite.

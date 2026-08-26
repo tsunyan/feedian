@@ -453,7 +453,7 @@ credential transportを提供しており、企業gatewayやローカル互換AP
 
 ## 現状
 
-[`llm_backends.py:L544`](feedian\llm_backends.py:L544) に `ClaudeCodeLocalBackend` が定義されているが、現在は以下:
+[`llm_backends.py:L544`](../../feedian/llm_backends.py) に `ClaudeCodeLocalBackend` が定義されているが、現在は以下:
 
 ```python
 class ClaudeCodeLocalBackend:
@@ -466,7 +466,7 @@ class ClaudeCodeLocalBackend:
 
 ### 1. `ApiBackend` を継承して API キー認証をサポート
 
-[`ApiBackend`](feedian\llm_backends.py:L127) は既に:
+[`ApiBackend`](../../feedian/llm_backends.py) は既に:
 - `__init__(api_key_name=..., model_name=...)` で API キー名とモデル名を受け付ける
 - `_api_key` を保持し、各呼び出しで認証を確認する構造を持っている
 
@@ -505,7 +505,7 @@ BACKEND_ALIASES = {
 
 ### 3. URL の扱い方
 
-現在 [`sync_vault`](feedian\sync.py:L57) と [`ingest`](feedian\cli.py) は既に `item.url` を保持し、[`fetch_page_text`](feedian\extract.py:L352) で HTTP を経由している。これを利用する:
+現在 [`sync_vault`](../../feedian/sync.py) と [`ingest`](../../feedian/cli.py) は既に `item.url` を保持し、[`fetch_page_text`](../../feedian/extract.py) で HTTP を経由している。これを利用する:
 
 ```python
 # 現状（既に機能）
@@ -740,9 +740,9 @@ result = backend.summarize(...)
 
 ## 影響範囲
 
-- [`feedian/llm_backends.py`](feedian\llm_backends.py): `ClaudeCodeLocalBackend` のクラス定義と `get_backend()` を拡張
+- [`feedian/llm_backends.py`](../../feedian/llm_backends.py): `ClaudeCodeLocalBackend` のクラス定義と `get_backend()` を拡張
 - `.env.example`: `CLAUDE_API_KEY` と `CLAUDE_MODEL` の文を追加
-- [`docs/reviews/`](docs\reviews\): 実装完了後にコードレビューを行う
+- [`docs/reviews/`](../reviews/): 実装完了後にコードレビューを行う
 
 ## リスク
 

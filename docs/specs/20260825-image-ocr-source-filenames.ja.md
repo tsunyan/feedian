@@ -1047,7 +1047,7 @@ snapshotの構造が決定的である。`create_snapshot`はSQLite全体をback
 
 しかしその行の`analysis_input_fingerprint`は旧いままになる。§7の既定対象は「`pending`と`failed`、または現在の解析設定と入力指紋が一致しない画像」なので、modelを変えて再解析に失敗した行は、次回も指紋不一致で選ばれ、また失敗する。抑止が無く、実行のたびに外部requestの費用が発生し続ける。
 
-この repository には先例がある。取得失敗には`fetch_capture.consecutive_failures`と terminal failure 判定があり、[fetchのretryと抑止](docs/specs/20260818-fetch-retry-suppression.ja.md)で決着している。画像解析にも失敗回数の記録と抑止規則が要る。最終案で決めるべきである。
+この repository には先例がある。取得失敗には`fetch_capture.consecutive_failures`と terminal failure 判定があり、[fetchのretryと抑止](20260818-fetch-retry-suppression.ja.md)で決着している。画像解析にも失敗回数の記録と抑止規則が要る。最終案で決めるべきである。
 
 #### 高 — D2. 採否3cが採否1・§7と噛み合わず、再解析の既定経路を塞ぐ
 
@@ -1166,7 +1166,7 @@ snapshotの構造が決定的である。`create_snapshot`はSQLite全体をback
 
 第二に、この仕様が定義する失敗はほとんどが一過性である。§2はtimeout（既定15秒）、byte上限超過、非画像MIME、decode不能を画像単位の失敗とし、§5はbackend側の失敗も同じ`failed`へ落とす。遅いCDNが1回15秒を超えただけで、その画像は既定実行から恒久的に消える。復帰手段は`--force`しか無いが、`--force`は§7により対象resourceの候補画像を**全て再取得・再解析する**——最も安い種類の失敗から復帰するために、仕様中で最も高い操作を使うことになる。
 
-この repository は既に区別する機構を持っている。取得失敗は`terminal_http_statuses`・`terminal_failure_kinds`・`terminal_kind_failures`で終端か一過性かを分け、`retry_base_minutes`・`retry_max_days`でbackoffする（[fetchのretryと抑止](docs/specs/20260818-fetch-retry-suppression.ja.md)）。採否Dは「明示commandだから」を理由に導入を見送るが、明示commandであることは失敗の性質を変えない。
+この repository は既に区別する機構を持っている。取得失敗は`terminal_http_statuses`・`terminal_failure_kinds`・`terminal_kind_failures`で終端か一過性かを分け、`retry_base_minutes`・`retry_max_days`でbackoffする（[fetchのretryと抑止](20260818-fetch-retry-suppression.ja.md)）。採否Dは「明示commandだから」を理由に導入を見送るが、明示commandであることは失敗の性質を変えない。
 
 最小限、終端と一過性を分けて一過性は次回1回だけ再試行するか、あるいは失敗行だけを安く再試行する選択肢（`--retry-failed`相当）を用意するか、どちらかを最終案で決めるべきである。
 
