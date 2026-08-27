@@ -192,6 +192,10 @@ git history already records that.
 - **Disposition (`採否`)** — Required, one row per finding, using 採用 / 修正して採用 / 不採用 / 保留 as the
   specification review sections do. A fixed finding compresses to one line naming the commit.
   **A rejected or deferred finding carries its reasoning** — that is what this document exists for.
+- **Conclusion (`結論`)** — **Rewrite it when the status becomes `完了`.** The conclusion is written while the
+  findings are still open, so it describes the pre-fix state; left alone, a completed review opens by telling
+  the reader that work is outstanding. State what was found, what was fixed, and what the verification showed.
+  `指摘`, `採否`, and `検証` keep their history — only `結論` is rewritten.
 - **Promoted rules (`規約化した項目`)** — When the same finding appears in a second review, promote it to a rule
   in this file and record the promotion here. A rule an agent reads is worth more than a finding repeated.
 
