@@ -4,9 +4,11 @@
 ![Dependencies](https://img.shields.io/badge/dependencies-see%20requirements.txt-4C8CBF)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
 
-Feedian collects bookmarks and feeds into a per-Obsidian-vault SQLite archive, renders the collected material as `raw/` Markdown, and optionally uses an LLM — OpenAI or Manus — to create summarized and tagged `source/` notes.
+Feedian collects bookmarks and feeds into a per-Obsidian-vault SQLite archive, renders the collected material as `raw/` Markdown, and optionally uses an LLM backend — the OpenAI API, the Manus API, or a locally installed Codex or Claude Code CLI — to create summarized and tagged `source/` notes.
 
 Supported providers are Raindrop.io, Hatena Bookmark, and RSS/Atom. Public Hatena comments can be attached to URLs collected from **any** provider.
+
+Two words are used precisely throughout this document. A **provider** is a place material is collected from: Raindrop.io, Hatena Bookmark, or an RSS/Atom feed. A **backend** is how an LLM request is executed: `openai-responses`, `manus-api`, `codex-local`, or `claude-code-local`.
 
 ## Scope
 
@@ -17,24 +19,22 @@ fast and worth running.
 
 ## How it works
 
-```text
-Raindrop / Hatena / RSS
-|
-v
-feedian sync                             no LLM
-|
-v
-.feedian/feedian.sqlite3 <-----------+   canonical local archive
-|              |                     |
-|              |                     |   feedian enrich-images
-|              |                     +-- reads stored image URLs and writes
-|              |                         image OCR back into the archive
-|              |                         (optional; uses the LLM)
-v              v
-feedian render feedian ingest            ingest uses the LLM
-|              |
-v              v
-raw/           source/
+```mermaid
+flowchart TB
+    providers["Raindrop.io / Hatena Bookmark / RSS or Atom"]
+    sync["feedian sync<br/>No LLM"]
+    archive[(".feedian/feedian.sqlite3<br/>Canonical local archive")]
+    render["feedian render<br/>No LLM"]
+    ingest["feedian ingest<br/>Uses the selected LLM backend"]
+    enrich["feedian enrich-images<br/>Optional; uses the selected LLM backend"]
+    raw["raw/<br/>Generated Obsidian view"]
+    source["source/<br/>Generated Obsidian view"]
+
+    providers --> sync --> archive
+    archive --> render --> raw
+    archive --> ingest --> source
+    archive -->|Stored image URLs| enrich
+    enrich -->|Image analysis and OCR| archive
 ```
 
 - `.feedian/feedian.sqlite3` is the canonical local archive.
@@ -44,6 +44,17 @@ raw/           source/
 - `ingest` asks the selected LLM backend for a title, summary, key points, content type, and one to six tags; stored image OCR is included when available.
 - Extracted HTML text is retained, but the original HTML is discarded. Non-HTML response bytes such as PDFs are retained for later re-extraction. Page image URLs are stored; image bytes are not downloaded.
 - `enrich-images` downloads image bytes only into temporary files and removes them after analysis; the archive keeps the image URL, analysis state, and OCR text.
+
+## Documentation
+
+| Where | What it answers |
+| --- | --- |
+| This README | How to install, configure, and run Feedian. |
+| [`DESIGN.md`](DESIGN.md) | How Feedian behaves now, subsystem by subsystem. |
+| [`docs/specs/`](docs/specs/) | Why individual decisions were made, and which alternatives were rejected. |
+| [`docs/reviews/`](docs/reviews/) | Code reviews, their findings, and whether each was accepted. |
+
+`DESIGN.md` is the only place that describes current behaviour; a specification records the reasoning behind one decision at the time it was made.
 
 ## Quick start
 
@@ -72,17 +83,17 @@ function feedian { & "C:\path\to\feedian\.venv\Scripts\feedian.exe" @args }
 
 ### 2. Set credentials
 
-Copy `.env.example` to `.env`, then fill in only the providers you enable:
+Copy `.env.example` to `.env`, then fill in only the providers you enable and the backend you use:
 
 ```dotenv
 RAINDROP_TOKEN=your-raindrop-token
 HATENA_ID=your-hatena-id
 HATENA_API_KEY=your-hatena-api-key
 OPENAI_API_KEY=your-openai-api-key
-OPENAI_MODEL=gpt-5.6-luna
+OPENAI_MODEL=gpt-5.6-terra
 ```
 
-`OPENAI_API_KEY` is needed only when OpenAI `ingest` must make a new API call. `OPENAI_MODEL` is optional and selects its default model. RSS needs no credential. Do not commit `.env`.
+`OPENAI_API_KEY` is needed only when the `openai-responses` backend must make a new API call. `OPENAI_MODEL` is optional and overrides that backend's default model. RSS needs no credential. Do not commit `.env`.
 
 Feedian reads `.env` from the current directory first, then a per-user file:
 
@@ -93,15 +104,24 @@ Feedian reads `.env` from the current directory first, then a per-user file:
 
 Real environment variables win over both, and the working-directory file wins over the per-user file. Because commands can select a Vault from anywhere, put credentials in the per-user file if you run Feedian from outside the repository — `feedian schedule` tasks start in an arbitrary directory and would otherwise find no `.env`. Keep credentials out of the Vault itself: a Vault is a Git repository that `snapshot` commits and pushes.
 
-To use Manus for ingest instead, set `MANUS_API_KEY` and select the provider:
+Each backend authenticates differently:
+
+| Backend | Credential | Notes |
+| --- | --- | --- |
+| `openai-responses` | `OPENAI_API_KEY` | What `feedian init` writes as the Vault's initial `llm.backend`. |
+| `manus-api` | `MANUS_API_KEY` | Sent as the `x-manus-api-key` header. Uses the structured output API. |
+| `codex-local` | None in `.env` | Run `codex login` once in Feedian's own `CODEX_HOME` (`~/.feedian/codex-home`), which leaves your usual `~/.codex` untouched. Feedian never passes an LLM API key to the CLI. |
+| `claude-code-local` | `ANTHROPIC_API_KEY`, or `ANTHROPIC_AUTH_TOKEN` with an `ANTHROPIC_BASE_URL` gateway | Set exactly one of the two, never both. OAuth and subscription authentication are not used. |
+
+To use Manus instead of OpenAI, set the credential and select the backend:
 
 ```dotenv
 MANUS_API_KEY=your-manus-api-key
-LLM_PROVIDER=manus
+LLM_BACKEND=manus-api
 # MANUS_MODEL=manus-1.6
 ```
 
-You can also select it for one run with `feedian ingest --provider manus`. Manus uses its `x-manus-api-key` authentication header and structured output API.
+Selecting a backend for one run is `feedian ingest --backend manus-api`. Selecting it permanently belongs in the Vault's `llm.backend`, described under [Vault config fields](#vault-config-fields). `enrich-images` has no backend flag and always uses the Vault configuration.
 
 Manus runs as a remote agent task rather than a single request. Feedian cannot stop a task it has started, so every Manus failure message carries the `task_id` and `task_url`; if a run fails or times out, open that URL to check whether the task is still running.
 
@@ -163,153 +183,6 @@ The dry run shows the selected resources, locally counted input tokens, a maximu
 
 During a real run, the progress display shows cumulative input tokens, output tokens, and estimated USD cost. Each successful item is recorded immediately, so stopping and rerunning continues by reusing completed results instead of making duplicate API calls. Do not use `--force` when resuming.
 
-## Vault and configuration selection
-
-Modern commands use the Vault-local `.feedian/config.json`. Feedian chooses the Vault in this order:
-
-1. `--vault PATH`
-2. The current directory or its nearest parent containing `.feedian/config.json`
-3. The user default set by `init --set-default` or `config set-default-vault`
-
-There are two different config formats in this repository:
-
-- `<vault>/.feedian/config.json`: current SQLite/Vault workflow; used by all modern commands documented below.
-- Repository-root `config.json`: legacy direct-export workflow only; it is **not** read by `feedian ingest`.
-
-For modern `ingest`, the provider is selected in this order:
-
-1. `--provider openai|manus`
-2. `LLM_PROVIDER` from the environment or `.env`
-3. Built-in default `openai`
-
-The model default then follows the selected provider:
-
-| Provider | Order |
-| --- | --- |
-| `openai` | `--model MODEL`, then `OPENAI_MODEL`, then built-in `gpt-5.6-terra` |
-| `manus` | `--model MODEL`, then `MANUS_MODEL`, then built-in `manus-1.6` |
-
-The active provider and model are shown in the ingest preview and execution header.
-
-### Vault config fields
-
-`feedian init` creates this structure:
-
-```json
-{
-  "format_version": 4,
-  "raw_folder": "raw",
-  "source_folder": "source",
-  "review_folder": "review",
-  "providers": {
-    "raindrop": {
-      "folder": "Raindrop",
-      "enabled": true,
-      "poll_hours": 168
-    },
-    "hatena": {
-      "folder": "Hatena",
-      "enabled": true,
-      "poll_hours": 168
-    },
-    "rss": {
-      "folder": "RSS",
-      "enabled": false,
-      "poll_hours": 6,
-      "layout": "feed/year/month",
-      "feeds": [
-        "https://example.com/feed.xml",
-        {
-          "url": "https://example.net/atom.xml",
-          "name": "Example Tech",
-          "folder": "Example Tech",
-          "tags": ["technology"],
-          "route": "reading"
-        }
-      ],
-      "category_routes": {
-        "AI": "technology/ai",
-        "Security": "technology/security"
-      }
-    }
-  },
-  "fetch": {
-    "html_max_bytes": 10485760,
-    "document_max_bytes": 104857600,
-    "refresh_days": 30,
-    "workers": 8,
-    "comment_workers": 8,
-    "star_refresh_days": 30,
-    "allow_private_hosts": []
-  },
-  "llm": {
-    "backend": "openai-responses",
-    "model": "gpt-5.6-terra",
-    "workers": 8
-  },
-  "image_ocr": {
-    "workers": 8,
-    "timeout_seconds": 15,
-    "max_bytes": 20971520,
-    "max_pixels": 40000000,
-    "min_short_edge_pixels": 200,
-    "max_long_edge_pixels": 1024,
-    "max_ocr_chars_per_image": 2000,
-    "max_ocr_images_per_resource": 8,
-    "max_ocr_chars_per_resource": 10000,
-    "ignore_name_tokens": [
-      "2x", "3x", "avatar", "badge", "banner", "blank", "bnr", "btn",
-      "button", "emoji", "favicon", "icon", "logo", "profile", "spacer", "sprite"
-    ],
-    "ignore_url_prefixes": [
-      "b.hatena.ne.jp/bc/", "b.hatena.ne.jp/entry/image/", "i.ytimg.com/vi/",
-      "lh3.googleusercontent.com/a/", "pbs.twimg.com/amplify_video_thumb/",
-      "pbs.twimg.com/card_img/", "pbs.twimg.com/cards/",
-      "pbs.twimg.com/ext_tw_video_thumb/", "pbs.twimg.com/media/",
-      "pbs.twimg.com/tweet_video_thumb/", "profile-image.kraken.asahi.com/"
-    ]
-  }
-}
-```
-
-| Field | Meaning |
-| --- | --- |
-| `raw_folder`, `source_folder`, `review_folder` | Relative output folders inside the Vault. |
-| `providers.<name>.folder` | Provider subfolder under `raw_folder`. |
-| `providers.<name>.enabled` | Include the provider in `sync --source all` and scheduled runs. |
-| `providers.raindrop.collection_id` | Optional Raindrop collection ID; omitted means all bookmarks. |
-| `providers.<name>.poll_hours` | Minimum interval used by `run` to decide whether that provider is due. |
-| `providers.rss.feeds` | RSS/Atom subscriptions. Each entry may be a URL string or an object with `url`, `name`, `folder`, `tags`, `route`, and `enabled`. |
-| `providers.rss.layout` | RSS raw-note layout: `flat`, `feed`, `feed/year`, `feed/year/month` (default), or `route/feed/year/month`. |
-| `providers.rss.category_routes` | Explicit feed-category-to-folder mappings. Unlisted categories never create folders automatically. |
-| `fetch.html_max_bytes` | Maximum HTML download size. |
-| `fetch.document_max_bytes` | Maximum retained non-HTML response size. |
-| `fetch.refresh_days` | Age after which Feedian checks a linked page for updates again. |
-| `fetch.workers` | Parallel workers for page fetching during `sync`. Defaults to 8. |
-| `fetch.comment_workers` | Parallel workers for Hatena comment retrieval. |
-| `fetch.star_refresh_days` | Default age for refreshing Hatena Star counts. |
-| `fetch.allow_private_hosts` | Explicit private/local hosts that page fetching may access. Empty by default. |
-| `fetch.retry_base_minutes` | Wait before retrying a page that failed once. Doubles with each further consecutive failure. |
-| `fetch.retry_max_days` | Ceiling on that growing wait. |
-| `fetch.terminal_http_statuses` | Statuses that are never retried, only `--force-fetch` gets past them. Defaults to `[404, 410]`; an empty list turns this off and lets the growing wait handle everything. |
-| `fetch.quick_stop_after_known_pages` | Consecutive pages of already-stored items that end collection during a quick sync. Defaults to 1. Raising it makes quick look further past known items. |
-| `llm.workers` | Parallel workers for `ingest`. Defaults to 8. Each backend caps this further with its own limit; local agent backends run one at a time. |
-| `image_ocr.workers` | Global parallel workers for image fetching and analysis across all resources. Defaults to 8 and is capped further by the selected backend. |
-| `image_ocr.timeout_seconds` | Per-request image download timeout. Defaults to 15 seconds. |
-| `image_ocr.max_bytes` | Maximum downloaded bytes per image. Defaults to 20 MiB. |
-| `image_ocr.max_pixels` | Maximum decoded pixels. Defaults to 40,000,000. Pillow's decompression-bomb warning is treated as an error and decoded dimensions are checked again before pixel data is loaded. |
-| `image_ocr.min_short_edge_pixels` | Ignore raster images, and SVG files that declare a size, whose shorter edge is below this. Defaults to 200 pixels. |
-| `image_ocr.max_long_edge_pixels` | Raster normalization target. Defaults to 1,024 pixels. Images are never enlarged; very narrow images stay larger when needed to keep their short edge readable. |
-| `image_ocr.max_ocr_chars_per_image` | Maximum stored OCR characters per image. Defaults to 2,000; truncated results are marked for later inspection. |
-| `image_ocr.max_ocr_images_per_resource` | Maximum explanatory-image OCR results supplied to one `ingest` request. Defaults to 8. |
-| `image_ocr.max_ocr_chars_per_resource` | Maximum total OCR characters supplied for one resource. Defaults to 10,000. |
-| `image_ocr.ignore_name_tokens` | Complete lowercase ASCII path-token denylist. Hostnames, query strings, fragments, alt text, substrings, regular expressions, and globs are not matched. |
-| `image_ocr.ignore_url_prefixes` | Complete `hostname/path-prefix` denylist applied to the stored source URL before fetching. Hostnames match exactly, so numbered shards must be listed separately when wanted. |
-
-Unknown config fields are rejected instead of silently ignored. Numeric `image_ocr` settings must be integers of 1 or more; a boolean, a decimal, or a quoted number is rejected rather than coerced. Gate arrays are normalized and deduplicated, and malformed entries are rejected.
-
-The two image gate arrays are the Vault's complete active values, not additions to hidden code defaults. To tune a Vault, run `enrich-images --dry-run`, inspect the `ignored_reason` and host counts, then add only rules whose matched images are known to be non-explanatory. Rules such as host prefixes for `spotlight.fantia.jp`, `media.vogue.co.jp`, `dailyportalz.jp`, `nazology.kusuguru.co.jp`, and `media.loom-app.com`, or the `photo` and `storage` name tokens, are intentionally not defaults because their accuracy is Vault-dependent. Removing a rule restores a retained completed OCR locally when possible.
-
 ## Command reference
 
 Run `feedian --help` for the command overview or `feedian COMMAND --help` for terminal help. The complete modern command set is summarized here.
@@ -357,6 +230,7 @@ Create or upgrade the Vault database, run integrity checks, compact it, and rebu
 
 ```powershell
 feedian sync [--vault PATH] [--source all|raindrop|hatena|rss] [--limit N]
+             [--quick | --full]
              [--skip-page-fetch] [--skip-comments]
              [--force-fetch] [--force-comments]
              [--progress auto|rich|plain|off] [--verbose]
@@ -368,12 +242,24 @@ Collect provider metadata and linked-page content into SQLite without calling an
 | --- | --- |
 | `--source` | Provider to collect; default `all` means every enabled provider. |
 | `--limit N` | Maximum items per selected provider. Useful for a staged first run. |
+| `--quick` | Default. Collect only new items and bodies never fetched, stopping early once known items appear. |
+| `--full` | Process every item, including ones already stored. Required by both force options. |
 | `--skip-page-fetch` | Store provider metadata without downloading linked-page content. |
 | `--skip-comments` | Do not check or retrieve public Hatena comments. |
-| `--force-fetch` | Check pages now, ignoring `fetch.refresh_days`. When a site supports it, unchanged pages return HTTP 304 and their content is not downloaded again. |
-| `--force-comments` | Retrieve full Hatena comments even when the public bookmark count is unchanged. |
+| `--force-fetch` | Check pages now, ignoring `fetch.refresh_days`. When a site supports it, unchanged pages return HTTP 304 and their content is not downloaded again. **Requires `--full`.** |
+| `--force-comments` | Retrieve full Hatena comments even when the public bookmark count is unchanged. **Requires `--full`.** |
 | `--progress` | `auto` uses Rich in a terminal and plain output elsewhere; it can be overridden. |
 | `--verbose` | Print each processed source item title. |
+
+#### Quick and full
+
+A quick sync touches only what it has never seen: items with no stored record, and stored resources whose page was never fetched. It stops walking a provider once it has passed known items, which is what makes a routine run cheap — on an unchanged Vault, Hatena collection drops from dozens of requests to two.
+
+The cost is that quick does not notice things that changed behind items it already has: provider-side metadata edits, comments appearing or disappearing, pages due for a refresh under `fetch.refresh_days`, and earlier fetch failures that would now succeed. None of these are corrected automatically, and quick is never promoted to full on its own — the mode is fixed when the run starts. Run `--full` on a schedule, which is what `feedian run` does.
+
+`--force-fetch` and `--force-comments` mean "fetch known items again", which directly contradicts quick's "do not touch known items", so they are rejected without `--full` rather than silently changing the mode. For `--source rss` the two modes barely differ, because a feed only ever exposes a bounded recent window.
+
+The reasoning and the rejected alternatives are in [`DESIGN.md`](DESIGN.md#syncのモード) and [syncのquickモード](docs/specs/20260818-sync-quick-mode.ja.md).
 
 Hatena comment handling applies to every processed item with a URL, including Raindrop and RSS items—not only bookmarks collected from Hatena. Feedian checks bookmark counts in batches, retrieves full comments for new or changed entries, enriches star totals, and keeps at most 20 public comments per resource, ordered by stars and then age. `--limit` and `--source` also limit which items are considered during that sync.
 
@@ -397,7 +283,7 @@ Fetch stored candidate images, classify them, and save original-language OCR for
 | `--force` | Re-fetch and re-analyze selected candidates. Cheap local gates still apply. |
 | `--progress` | Select Rich, plain, automatic, or disabled progress output. |
 
-The command evaluates all candidate images recorded for each selected resource. Download size, decoded dimensions, and image type are checked locally before an LLM request. SVG files are not rendered; safe text from their XML `<text>` elements is extracted locally. Results are reusable across runs, and failures remain visible in the final report. OCR text is stored in SQLite rather than written directly to Markdown, then supplied to a later `ingest` run within the per-image and per-resource limits above.
+The command evaluates all candidate images recorded for each selected resource. Download size, decoded dimensions, and image type are checked locally before an LLM request. SVG files are not rendered; safe text from their XML `<text>` elements is extracted locally. Results are reusable across runs, and failures remain visible in the final report. OCR text is stored in SQLite rather than written directly to Markdown, then supplied to a later `ingest` run within the per-image and per-resource limits set by `image_ocr.max_ocr_images_per_resource` and `image_ocr.max_ocr_chars_per_resource`.
 
 ### `render`
 
@@ -410,7 +296,7 @@ Render SQLite records as Obsidian Markdown. Without `--apply`, output goes to `.
 ### `ingest`
 
 ```powershell
-feedian ingest [--vault PATH] [--provider openai|manus] [--model MODEL] [--language LANGUAGE] [--limit N]
+feedian ingest [--vault PATH] [--backend BACKEND] [--model MODEL] [--language LANGUAGE] [--limit N]
                [--dry-run] [--auto | --stale] [--force]
                [--progress auto|rich|plain|off]
 ```
@@ -419,8 +305,8 @@ Create LLM-derived `source/` notes from resources already stored by `sync`.
 
 | Option | Meaning |
 | --- | --- |
-| `--provider openai\|manus` | LLM provider for this run. Overrides `LLM_PROVIDER`; default `openai`. |
-| `--model MODEL` | Model for this run. Overrides the selected provider's environment variable. |
+| `--backend BACKEND` | Backend for this run: `openai-responses`, `manus-api`, `codex-local`, or `claude-code-local`. Overrides `LLM_BACKEND` and the Vault's `llm.backend`. |
+| `--model MODEL` | Model for this run. Overrides the selected backend's environment variable and, as described under [Backend and model selection](#backend-and-model-selection), is the only way to pair a specific model with a one-off backend. |
 | `--language LANGUAGE` | Output language; default `Japanese`. |
 | `--limit N` | Maximum candidates to process. Without `--auto`, omitted means all stored resources. |
 | `--dry-run` | Show selection, token counts, and cost estimates without API calls or writes. |
@@ -429,15 +315,17 @@ Create LLM-derived `source/` notes from resources already stored by `sync`.
 | `--force` | Ignore reusable successful LLM results and call the API again. This can incur duplicate cost. |
 | `--progress` | Select Rich, plain, automatic, or disabled progress output. |
 
+`--provider openai|manus` is still accepted as a deprecated alias of `--backend` and is not shown in `--help`. Use the backend names.
+
 `--auto` defaults to 20 candidates when `--limit` is omitted. A normal run reuses a matching successful result for the same content revision, model, prompt version, and request fingerprint. Because stored image OCR is part of that fingerprint, a resource enriched after its last summary no longer matches; `--stale` selects exactly those. Plain `--limit N` takes the oldest N resources rather than the changed ones, and `--auto` skips every resource that already has a source note, so neither refreshes newly enriched summaries. Each completed resource is marked in SQLite, allowing repeated stop-and-resume runs to advance without duplicating completed work.
 
 LLM tags are stored in the `source/` note frontmatter and `## Tags` section. Provider tags collected by `sync` remain separate in raw metadata and are also supplied to the LLM as context.
 
-The displayed cost is a local estimate from Feedian's price snapshot; account credits, complimentary tokens, taxes, and the provider's final billed amount are not known to Feedian.
+The displayed cost is a local estimate from Feedian's price snapshot; account credits, complimentary tokens, taxes, and the amount the service finally bills are not known to Feedian.
 
 Feedian's price snapshot covers OpenAI models only, and Manus reports no token usage. A run whose cost cannot be computed shows `n/a` for cost and tokens rather than zero, and the summary line reports `unpriced_requests` and `unmetered_requests` counts. `n/a` means "not reported", never "free".
 
-Whatever the provider returns is re-checked against Feedian's own schema before a note is written: field types are corrected, and title, summary, key point, and tag lengths and counts are capped. OpenAI enforces this schema itself, but Manus supports only a subset of it, so the check is what keeps a malformed Manus response out of `source/`. A response with no usable title or summary fails that resource, leaving it for the next run instead of writing a hollow note.
+Whatever the backend returns is re-checked against Feedian's own schema before a note is written: field types are corrected, and title, summary, key point, and tag lengths and counts are capped. OpenAI enforces this schema itself, but Manus supports only a subset of it, so the check is what keeps a malformed Manus response out of `source/`. A response with no usable title or summary fails that resource, leaving it for the next run instead of writing a hollow note.
 
 ### `enrich-stars`
 
@@ -522,6 +410,226 @@ feedian restore --vault PATH --tag TAG [--archive FILE]
 
 Restore a verified snapshot. `--tag` is always required: verification reads `.feedian/snapshot.json` as it was committed and tagged in the Vault's own Git history (not the copy bundled inside the archive), and checks the archive's sha256 against that value before extracting anything. With `--archive`, restore from that local `.sqlite3.7z` file, verified against `--tag`'s Git-tagged manifest. Without it, download the archive from `--tag`'s GitHub Release first (fetching the tag from `origin` if it isn't local yet), then restore the same way. The destination Vault must not already contain `.feedian/feedian.sqlite3`.
 
+## Vault and configuration selection
+
+Modern commands use the Vault-local `.feedian/config.json`. Feedian chooses the Vault in this order:
+
+1. `--vault PATH`
+2. The current directory or its nearest parent containing `.feedian/config.json`
+3. The user default set by `init --set-default` or `config set-default-vault`
+
+There are two different config formats in this repository:
+
+- `<vault>/.feedian/config.json`: current SQLite/Vault workflow; used by every modern command in the reference above.
+- Repository-root `config.json`: legacy direct-export workflow only; it is **not** read by `feedian ingest`.
+
+### Backend and model selection
+
+For `ingest`, the backend is selected in this order:
+
+1. `--backend BACKEND`
+2. `LLM_BACKEND` from the environment or `.env`
+3. `llm.backend` in the Vault config
+
+The Vault config is the real default, not a built-in constant. `feedian init` writes `llm.backend` as `openai-responses`, so an untouched Vault uses OpenAI. `--provider` and `LLM_PROVIDER` are still accepted as deprecated aliases of the first two; new configuration should use the backend names.
+
+The model is then selected in this order:
+
+1. `--model MODEL`
+2. The selected backend's environment variable
+3. `llm.model` in the Vault config, **only when the selected backend is the configured one**
+4. The backend's built-in default
+
+Step 3 is worth reading twice. `llm.model` belongs to `llm.backend`, so overriding the backend for one run also drops the configured model and falls through to step 4. Pass `--model` when you want a specific model with a one-off backend.
+
+| Backend | Environment variable | Built-in default model |
+| --- | --- | --- |
+| `openai-responses` | `OPENAI_MODEL` | `gpt-5.6-terra` |
+| `manus-api` | `MANUS_MODEL` | `manus-1.6` |
+| `codex-local` | `CODEX_MODEL` | `gpt-5.6-terra` |
+| `claude-code-local` | `ANTHROPIC_MODEL` | `claude-sonnet-5` on the official endpoint; none for a compatible endpoint set with `ANTHROPIC_BASE_URL`, where a model must be given explicitly or the run fails. |
+
+The active backend and model are shown in the ingest preview and execution header.
+
+`enrich-images` takes no backend or model flag. It always uses the Vault's `llm.backend` and `llm.model`.
+
+### Vault config fields
+
+`feedian init` creates exactly this structure:
+
+```json
+{
+  "format_version": 4,
+  "raw_folder": "raw",
+  "source_folder": "source",
+  "review_folder": "review",
+  "providers": {
+    "raindrop": {
+      "folder": "Raindrop",
+      "enabled": true,
+      "poll_hours": 168
+    },
+    "hatena": {
+      "folder": "Hatena",
+      "enabled": true,
+      "poll_hours": 168
+    },
+    "rss": {
+      "folder": "RSS",
+      "enabled": false,
+      "poll_hours": 6,
+      "layout": "feed/year/month"
+    }
+  },
+  "fetch": {
+    "html_max_bytes": 10485760,
+    "document_max_bytes": 104857600,
+    "refresh_days": 30,
+    "workers": 8,
+    "comment_workers": 8,
+    "star_refresh_days": 30,
+    "allow_private_hosts": [],
+    "retry_base_minutes": 30,
+    "retry_max_days": 30,
+    "terminal_http_statuses": [
+      404,
+      410
+    ],
+    "terminal_failure_kinds": [
+      "dns",
+      "timeout"
+    ],
+    "terminal_kind_failures": 3,
+    "timeout_seconds": 5,
+    "browser_timeout_seconds": 30
+  },
+  "llm": {
+    "backend": "openai-responses",
+    "model": "gpt-5.6-terra",
+    "workers": 8,
+    "fallback": {
+      "enabled": false,
+      "backend": "",
+      "model": ""
+    }
+  },
+  "image_ocr": {
+    "workers": 8,
+    "timeout_seconds": 15,
+    "max_bytes": 20971520,
+    "max_pixels": 40000000,
+    "min_short_edge_pixels": 200,
+    "max_long_edge_pixels": 1024,
+    "max_ocr_chars_per_image": 2000,
+    "max_ocr_images_per_resource": 8,
+    "max_ocr_chars_per_resource": 10000,
+    "ignore_name_tokens": [
+      "2x",
+      "3x",
+      "avatar",
+      "badge",
+      "banner",
+      "blank",
+      "bnr",
+      "btn",
+      "button",
+      "emoji",
+      "favicon",
+      "icon",
+      "logo",
+      "profile",
+      "spacer",
+      "sprite"
+    ],
+    "ignore_url_prefixes": [
+      "b.hatena.ne.jp/bc/",
+      "b.hatena.ne.jp/entry/image/",
+      "i.ytimg.com/vi/",
+      "lh3.googleusercontent.com/a/",
+      "pbs.twimg.com/amplify_video_thumb/",
+      "pbs.twimg.com/card_img/",
+      "pbs.twimg.com/cards/",
+      "pbs.twimg.com/ext_tw_video_thumb/",
+      "pbs.twimg.com/media/",
+      "pbs.twimg.com/tweet_video_thumb/",
+      "profile-image.kraken.asahi.com/"
+    ]
+  }
+}
+```
+
+RSS subscriptions and category routes are added by editing that file. An entry may be a bare URL string or an object:
+
+```json
+"rss": {
+  "folder": "RSS",
+  "enabled": true,
+  "poll_hours": 6,
+  "layout": "feed/year/month",
+  "feeds": [
+    "https://example.com/feed.xml",
+    {
+      "url": "https://example.net/atom.xml",
+      "name": "Example Tech",
+      "folder": "Example Tech",
+      "tags": ["technology"],
+      "route": "reading"
+    }
+  ],
+  "category_routes": {
+    "AI": "technology/ai",
+    "Security": "technology/security"
+  }
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `raw_folder`, `source_folder`, `review_folder` | Relative output folders inside the Vault. |
+| `providers.<name>.folder` | Provider subfolder under `raw_folder`. |
+| `providers.<name>.enabled` | Include the provider in `sync --source all` and scheduled runs. |
+| `providers.raindrop.collection_id` | Optional Raindrop collection ID; omitted means all bookmarks. |
+| `providers.<name>.poll_hours` | Minimum interval used by `run` to decide whether that provider is due. |
+| `providers.rss.feeds` | RSS/Atom subscriptions. Each entry may be a URL string or an object with `url`, `name`, `folder`, `tags`, `route`, and `enabled`. |
+| `providers.rss.layout` | RSS raw-note layout: `flat`, `feed`, `feed/year`, `feed/year/month` (default), or `route/feed/year/month`. |
+| `providers.rss.category_routes` | Explicit feed-category-to-folder mappings. Unlisted categories never create folders automatically. |
+| `fetch.html_max_bytes` | Maximum HTML download size. |
+| `fetch.document_max_bytes` | Maximum retained non-HTML response size. |
+| `fetch.refresh_days` | Age after which Feedian checks a linked page for updates again. |
+| `fetch.workers` | Parallel workers for page fetching during `sync`. Defaults to 8. |
+| `fetch.comment_workers` | Parallel workers for Hatena comment retrieval. |
+| `fetch.star_refresh_days` | Default age for refreshing Hatena Star counts. |
+| `fetch.allow_private_hosts` | Explicit private/local hosts that page fetching may access. Empty by default. |
+| `fetch.retry_base_minutes` | Wait before retrying a page that failed once. Doubles with each further consecutive failure. |
+| `fetch.retry_max_days` | Ceiling on that growing wait. |
+| `fetch.terminal_http_statuses` | Statuses that are never retried, only `--force-fetch` gets past them. Defaults to `[404, 410]`; an empty list turns this off and lets the growing wait handle everything. |
+| `fetch.terminal_failure_kinds` | Failure kinds that stop being retried once they repeat. Defaults to `["dns", "timeout"]`, meaning a host that stops resolving or stops answering. |
+| `fetch.terminal_kind_failures` | Consecutive failures of such a kind before it is treated as terminal. Defaults to 3. |
+| `fetch.timeout_seconds` | Page fetch connect and response timeout. Defaults to 5 seconds. |
+| `fetch.browser_timeout_seconds` | Timeout for the browser fallback, which is slower by nature. Defaults to 30 seconds. |
+| `fetch.quick_stop_after_known_pages` | Consecutive pages of already-stored items that end collection during a quick sync. Defaults to 1. Raising it makes quick look further past known items. |
+| `llm.backend` | Backend used by `ingest` and `enrich-images` when no flag or environment variable overrides it. Defaults to `openai-responses`. |
+| `llm.model` | Model for `llm.backend`. Used only while that backend is the selected one. |
+| `llm.fallback.enabled`, `llm.fallback.backend`, `llm.fallback.model` | Optional second backend to retry an unavailable one. Disabled by default; see below. |
+| `llm.workers` | Parallel workers for `ingest`. Defaults to 8. Each backend caps this further with its own limit; local agent backends run one at a time. |
+| `image_ocr.workers` | Global parallel workers for image fetching and analysis across all resources. Defaults to 8 and is capped further by the selected backend. |
+| `image_ocr.timeout_seconds` | Per-request image download timeout. Defaults to 15 seconds. |
+| `image_ocr.max_bytes` | Maximum downloaded bytes per image. Defaults to 20 MiB. |
+| `image_ocr.max_pixels` | Maximum decoded pixels. Defaults to 40,000,000. Pillow's decompression-bomb warning is treated as an error and decoded dimensions are checked again before pixel data is loaded. |
+| `image_ocr.min_short_edge_pixels` | Ignore raster images, and SVG files that declare a size, whose shorter edge is below this. Defaults to 200 pixels. |
+| `image_ocr.max_long_edge_pixels` | Raster normalization target. Defaults to 1,024 pixels. Images are never enlarged; very narrow images stay larger when needed to keep their short edge readable. |
+| `image_ocr.max_ocr_chars_per_image` | Maximum stored OCR characters per image. Defaults to 2,000; truncated results are marked for later inspection. |
+| `image_ocr.max_ocr_images_per_resource` | Maximum explanatory-image OCR results supplied to one `ingest` request. Defaults to 8. |
+| `image_ocr.max_ocr_chars_per_resource` | Maximum total OCR characters supplied for one resource. Defaults to 10,000. |
+| `image_ocr.ignore_name_tokens` | Complete lowercase ASCII path-token denylist. Hostnames, query strings, fragments, alt text, substrings, regular expressions, and globs are not matched. |
+| `image_ocr.ignore_url_prefixes` | Complete `hostname/path-prefix` denylist applied to the stored source URL before fetching. Hostnames match exactly, so numbered shards must be listed separately when wanted. |
+
+**Backend fallback** is disabled by default, and enabling it requires naming both `llm.fallback.backend` and `llm.fallback.model`. It is deliberately narrow: Feedian switches to the second backend only when the first is unavailable, rate limited, or times out. Authentication, policy, and protocol failures do not trigger it, because those mean the configuration or the implementation is wrong, and paying a second backend would only hide that. The ingest plan shows the fallback destination before a run, or `disabled` when there is none, and a fallback request is recorded as its own `llm_run` under the backend that actually served it, so the audit trail always shows which one wrote a summary.
+
+Unknown config fields are rejected instead of silently ignored. Numeric `image_ocr` settings must be integers of 1 or more; a boolean, a decimal, or a quoted number is rejected rather than coerced. Gate arrays are normalized and deduplicated, and malformed entries are rejected.
+
+The two image gate arrays are the Vault's complete active values, not additions to hidden code defaults. To tune a Vault, run `enrich-images --dry-run`, inspect the `ignored_reason` and host counts, then add only rules whose matched images are known to be non-explanatory. Rules such as host prefixes for `spotlight.fantia.jp`, `media.vogue.co.jp`, `dailyportalz.jp`, `nazology.kusuguru.co.jp`, and `media.loom-app.com`, or the `photo` and `storage` name tokens, are intentionally not defaults because their accuracy is Vault-dependent. Removing a rule restores a retained completed OCR locally when possible.
+
 ## Common recipes
 
 ### Grow the raw archive in stages
@@ -565,7 +673,7 @@ To add a controlled top-level route, set `providers.rss.layout` to `route/feed/y
 ### Refresh an article and its Hatena discussion
 
 ```powershell
-feedian sync --source all --force-fetch --force-comments
+feedian sync --source all --full --force-fetch --force-comments
 ```
 
 ### Compare full and automatic ingest previews
@@ -653,12 +761,18 @@ python -m feedian --config config.json --source hatena --input bookmarks.atom --
 
 See [`config.example.json`](config.example.json) for legacy config fields. The legacy `openai_model` setting does not configure modern `feedian ingest`; use `OPENAI_MODEL` or `ingest --model` for that.
 
+One legacy option is still useful in the SQLite workflow: `--list-collections` is how you find the ID to put in `providers.raindrop.collection_id`, since no modern command lists Raindrop collections.
+
+```powershell
+python -m feedian --config config.json --list-collections
+```
+
 ## Security and operational behavior
 
 - Linked pages, bookmark metadata, and comments are treated as untrusted reference data. The prompt tags that material as untrusted and instructs the model not to follow instructions found inside it.
 - That defense is weaker with Manus than with OpenAI. OpenAI carries Feedian's instructions in a separate system field the page text cannot reach; Manus has no such field, so the instructions are placed before and repeated after the quoted material in one message, and Manus executes it as an agent. Prefer OpenAI when the material is untrusted enough to matter.
-- Whatever a provider returns is re-checked against Feedian's own schema before a note is written, so a provider that does not enforce the schema itself cannot write malformed frontmatter.
-- Page fetching accepts only HTTP(S), blocks private/local addresses by default, and rechecks redirects. Add only trusted hosts to `fetch.allow_private_hosts`. Addresses are checked by resolving the hostname, and the connection resolves it again independently, so this does not defeat a DNS entry that changes between the two.
+- Whatever a backend returns is re-checked against Feedian's own schema before a note is written, so a backend that does not enforce the schema itself cannot write malformed frontmatter.
+- Page fetching accepts only HTTP(S), blocks private/local addresses by default, and rechecks redirects. Add only trusted hosts to `fetch.allow_private_hosts`. The hostname is resolved exactly once: every address that lookup returns is checked, and the connection is then made only within that same checked set, so the name cannot resolve to something else between the check and the connect. The browser fallback re-validates every URL but relies on Chromium's own name resolution, which leaves a narrow gap Feedian accepts.
 - Raindrop and LLM requests retry bounded transient failures with capped exponential backoff.
 - A Vault write lock prevents overlapping mutating operations.
 - Before every LLM request, Feedian checks that the Vault remains readable. The request as sent, the response, LLM usage, and the generated note are recorded per resource in SQLite.
