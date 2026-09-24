@@ -284,7 +284,9 @@ def _git_output(vault_root: Path, args: list[str], *, required: bool = True) -> 
 
 def _run(command: list[str], *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
     try:
-        return subprocess.run(command, cwd=cwd, text=True, capture_output=True, check=True)
+        return subprocess.run(
+            command, cwd=cwd, capture_output=True, check=True, encoding="utf-8", errors="replace"
+        )
     except FileNotFoundError as exc:
         raise RuntimeError(f"Required command not found: {command[0]}") from exc
     except subprocess.CalledProcessError as exc:

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
 
-from feedian.snapshots import _github_repository, _managed_git_paths, _path_is_within, _phase
+from feedian.snapshots import _github_repository, _managed_git_paths, _path_is_within, _phase, _run
 from feedian.vault import VaultConfig
 
 
@@ -40,3 +41,11 @@ def test_snapshot_phase_reports_start_and_completion() -> None:
         ("compressing database archive", 4, 9, False),
         ("compressing database archive", 4, 9, True),
     ]
+
+
+def test_run_decodes_command_output_as_utf8_regardless_of_locale() -> None:
+    # git writes UTF-8; on a Japanese Windows locale the default cp932 decode raised in a reader thread.
+    text = "raw/ソース ✓ 🌱 ﾟ"
+    script = f"import sys; sys.stdout.buffer.write({text.encode('utf-8')!r})"
+
+    assert _run([sys.executable, "-c", script]).stdout == text
