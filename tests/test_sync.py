@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import io
 from datetime import datetime, timedelta, timezone
+from urllib.error import HTTPError
 
 import pytest
 
@@ -1631,3 +1633,248 @@ def test_the_body_only_pass_fetches_in_parallel_too(monkeypatch, tmp_path, worke
         assert seen_allow_browser and not any(seen_allow_browser), "browser stays on the main thread"
     finally:
         store.close()
+
+
+# --- Review 20260905: a stored body survives a failed or empty fetch, and a feed
+# cut short by --limit does not hide the rest behind its validator. ---
+
+
+STORED_BODY = "Previously archived complete article"
+
+
+class _HttpResponse:
+    """The slice of an urllib response that fetch_page_text and fetch_rss_items read."""
+
+    def __init__(self, body: bytes, content_type: str, *, url: str, etag: str = "") -> None:
+        self._body = body
+        self._url = url
+        self.status = 200
+        self.headers = {"Content-Type": content_type}
+        if etag:
+            self.headers["ETag"] = etag
+
+    def read(self, _limit: int = -1) -> bytes:
+        return self._body
+
+    def geturl(self) -> str:
+        return self._url
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args) -> bool:
+        return False
+
+
+def _serve_pages(monkeypatch, respond) -> None:
+    """Run the real fetch_page_text, with only DNS validation and the socket replaced."""
+
+    class Opener:
+        def open(self, request, timeout):
+            return respond(request)
+
+    monkeypatch.setattr("feedian.extract.validate_fetch_url", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("feedian.extract.build_opener", lambda *_args, **_kwargs: Opener())
+
+
+def _store_with_body(store: VaultStore, item: CanonicalItem) -> tuple[str, str]:
+    """Give the item's resource a body, aged so the next full sync refetches it."""
+    stored = store.upsert_canonical_item(item)
+    resource_id = stored.resource_id or ""
+    revision_id, _ = store.record_resource_revision(
+        resource_id, content_markdown=STORED_BODY, title=item.title, final_url=item.url,
+        extracted_by="http:trafilatura",
+    )
+    store.connection.execute(
+        "UPDATE fetch_capture SET fetched_at = ? WHERE resource_id = ?",
+        ("2000-01-01T00:00:00+00:00", resource_id),
+    )
+    store.connection.commit()
+    return resource_id, revision_id
+
+
+def _resource_state(store: VaultStore, resource_id: str):
+    return store.connection.execute(
+        """
+        SELECT r.current_revision_id, rr.content_markdown, fc.warning, fc.http_status,
+               fc.consecutive_failures, fc.extracted_by, fc.http_payload_id
+        FROM resource AS r
+        LEFT JOIN resource_revision AS rr ON rr.resource_revision_id = r.current_revision_id
+        LEFT JOIN fetch_capture AS fc ON fc.resource_id = r.resource_id
+        WHERE r.resource_id = ?
+        """,
+        (resource_id,),
+    ).fetchone()
+
+
+@pytest.mark.parametrize("workers", [1, 8])
+@pytest.mark.parametrize("status", [404, 503])
+def test_a_failed_page_fetch_keeps_the_stored_body_instead_of_the_feed_excerpt(
+    monkeypatch, tmp_path, status, workers
+) -> None:
+    """Review 20260905-1. The feed body stands in only for a resource holding no body.
+
+    Two items hold a body and a third does not, all failing in one run, so that
+    workers=8 really fetches on the pool and the guard is seen to be per resource.
+    """
+    items = [
+        (
+            CanonicalItem(
+                source="rss", source_id=f"rss-{n}", content_key=f"url:{n}",
+                url=f"https://example.test/{n}", title=f"Article {n}", embedded_content="Short RSS excerpt",
+            ),
+            b"{}",
+        )
+        for n in range(3)
+    ]
+
+    def respond(request):
+        raise HTTPError(request.full_url, status, "error", {}, io.BytesIO())
+
+    _serve_pages(monkeypatch, respond)
+    monkeypatch.setattr("feedian.sync._provider_items", lambda *_args, **_kwargs: iter(items))
+    config = VaultConfig(providers={"rss": ProviderSettings(folder="RSS")})
+    config.fetch["workers"] = workers
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        held = [_store_with_body(store, item) for item, _payload in items[:2]]
+        new_item = items[2][0]
+
+        report = sync_vault(store, config, source="rss", quick=False, fetch_comments=False)
+
+        assert report.fetched == 3
+        assert store.connection.execute("SELECT COUNT(*) FROM resource_revision").fetchone()[0] == 3
+        new_resource_id = store.connection.execute(
+            "SELECT resource_id FROM resource_identifier WHERE namespace = 'url' AND value = ?", (new_item.url,)
+        ).fetchone()[0]
+        new_state = _resource_state(store, new_resource_id)
+        assert new_state["content_markdown"] == "Short RSS excerpt", "a resource with no body still gets the feed's"
+        assert "rss-feed-fallback" in new_state["extracted_by"]
+        assert new_state["warning"] == f"HTTP {status}"
+        for resource_id, revision_id in held:
+            state = _resource_state(store, resource_id)
+            assert state["current_revision_id"] == revision_id
+            assert state["content_markdown"] == STORED_BODY, "the feed excerpt must not replace the body"
+            # The failure is still recorded, the same way any failed fetch is.
+            assert (state["warning"], state["http_status"], state["consecutive_failures"]) == (
+                f"HTTP {status}", status, 1,
+            )
+            assert state["extracted_by"] == "http:trafilatura"
+    finally:
+        store.close()
+
+
+def test_an_empty_text_plain_response_keeps_the_stored_body(monkeypatch, tmp_path) -> None:
+    """Review 20260905-2, HTTP side: whitespace-only text/plain is a failed extraction."""
+    item = CanonicalItem(source="hatena", source_id="one", content_key="url:one", url="https://example.test/one", title="A")
+    _serve_pages(monkeypatch, lambda request: _HttpResponse(b"   ", "text/plain; charset=utf-8", url=request.full_url))
+    monkeypatch.setattr("feedian.sync._provider_items", lambda *_args, **_kwargs: iter([(item, b"{}")]))
+    config = VaultConfig(providers={"hatena": VaultConfig().providers["hatena"]})
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        resource_id, revision_id = _store_with_body(store, item)
+
+        report = sync_vault(store, config, source="hatena", quick=False, fetch_comments=False)
+
+        assert report.fetched == 1
+        state = _resource_state(store, resource_id)
+        assert state["current_revision_id"] == revision_id
+        assert state["content_markdown"] == STORED_BODY
+        assert state["warning"] == "no extractable text found"
+        assert state["consecutive_failures"] == 1
+        assert state["http_payload_id"] is not None, "the capture points at the empty response's own bytes"
+    finally:
+        store.close()
+
+
+def test_an_empty_text_plain_response_writes_no_revision_for_a_new_resource(monkeypatch, tmp_path) -> None:
+    """Review 20260905-2: an empty body must not make a new resource look fetched."""
+    item = CanonicalItem(source="hatena", source_id="one", content_key="url:one", url="https://example.test/one", title="A")
+    _serve_pages(monkeypatch, lambda request: _HttpResponse(b" \n ", "text/plain", url=request.full_url))
+    monkeypatch.setattr("feedian.sync._provider_items", lambda *_args, **_kwargs: iter([(item, b"{}")]))
+    config = VaultConfig(providers={"hatena": VaultConfig().providers["hatena"]})
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        sync_vault(store, config, source="hatena", quick=False, fetch_comments=False)
+
+        assert store.connection.execute("SELECT COUNT(*) FROM resource_revision").fetchone()[0] == 0
+        resource_id = store.connection.execute("SELECT resource_id FROM resource").fetchone()[0]
+        state = _resource_state(store, resource_id)
+        assert state["current_revision_id"] is None
+        assert state["warning"] == "no extractable text found"
+        assert store.unfetched_resources(["hatena"]) == [(resource_id, item.url)]
+    finally:
+        store.close()
+
+
+def test_a_limited_rss_sync_does_not_let_the_feed_validator_hide_unstored_items(monkeypatch, tmp_path) -> None:
+    """Review 20260905-3. The real parser and sync; the feed answers 304 to any validator."""
+    feed_url = "https://feed.example.test/feed.xml"
+    feed = b"""<rss><channel><title>Feed</title>
+      <item><guid>a</guid><title>A</title><link>https://example.test/a</link>
+        <pubDate>Mon, 03 Aug 2026 00:00:00 GMT</pubDate></item>
+      <item><guid>b</guid><title>B</title><link>https://example.test/b</link>
+        <pubDate>Sun, 02 Aug 2026 00:00:00 GMT</pubDate></item>
+    </channel></rss>"""
+    sent: list[str | None] = []
+
+    class Opener:
+        def open(self, request, timeout):
+            etag = request.get_header("If-none-match")
+            sent.append(etag)
+            if etag:
+                raise HTTPError(request.full_url, 304, "Not Modified", {}, io.BytesIO())
+            return _HttpResponse(feed, "application/rss+xml", url=feed_url, etag="v1")
+
+    monkeypatch.setattr("feedian.rss.validate_fetch_url", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("feedian.rss.build_opener", lambda *_args, **_kwargs: Opener())
+    config = VaultConfig(providers={"rss": ProviderSettings(folder="RSS", feeds=[RssFeedSettings(url=feed_url)])})
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        limited = sync_vault(
+            store, config, source="rss", quick=True, limit=1, fetch_pages=False, fetch_comments=False
+        )
+        full = sync_vault(store, config, source="rss", quick=False, fetch_pages=False, fetch_comments=False)
+        again = sync_vault(store, config, source="rss", quick=False, fetch_pages=False, fetch_comments=False)
+
+        assert limited.processed == 1
+        assert full.processed == 2, "the full sync collects the item the limit left out"
+        assert store.connection.execute("SELECT COUNT(*) FROM source_item").fetchone()[0] == 2
+        assert again.processed == 0, "once the whole feed is stored, its validator is replayed"
+        assert sent == [None, None, "v1"]
+    finally:
+        store.close()
+
+
+def test_a_limit_blanks_validators_only_for_the_feed_it_cut(monkeypatch) -> None:
+    """Review 20260905-3: a feed the limit took whole keeps its validators."""
+    feed_a, feed_b = "https://a.test/feed.xml", "https://b.test/feed.xml"
+    config = VaultConfig(
+        providers={"rss": ProviderSettings(folder="RSS", feeds=[RssFeedSettings(url=feed_a), RssFeedSettings(url=feed_b)])}
+    )
+
+    def entry(feed_url: str, source_id: str, created_at: str) -> RssItem:
+        return RssItem(
+            CanonicalItem(
+                source="rss", source_id=source_id, content_key=f"url:{source_id}",
+                url=f"https://example.test/{source_id}", created_at=created_at,
+                provider_metadata={
+                    "feed_url": feed_url, "feed_etag": f"etag-{source_id[0]}", "feed_last_modified": "modified",
+                },
+            ),
+            b"{}",
+        )
+
+    feeds = {
+        feed_a: [entry(feed_a, "a1", "2026-08-03T00:00:00Z"), entry(feed_a, "a2", "2026-08-01T00:00:00Z")],
+        feed_b: [entry(feed_b, "b1", "2026-08-02T00:00:00Z")],
+    }
+    monkeypatch.setattr("feedian.sync.fetch_rss_items", lambda feed_url, **_kwargs: feeds[feed_url])
+
+    rows = list(_provider_items(config, "rss", 2))
+
+    validators = {
+        item.source_id: (item.provider_metadata["feed_etag"], item.provider_metadata["feed_last_modified"])
+        for item, _payload in rows
+    }
+    assert validators == {"a1": ("", ""), "b1": ("etag-b", "modified")}

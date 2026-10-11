@@ -17,6 +17,7 @@ from feedian.extract import (
     decode_html,
     extract_html,
     extract_page_parts,
+    extract_stored_payload,
     fetch_page_text,
     resolve_content_url,
     should_render_with_browser,
@@ -97,6 +98,29 @@ class StagedExtractionTests(unittest.TestCase):
         self.assertEqual(result.raw_body, raw)
         self.assertEqual(result.extraction_method, "pypdf")
         self.assertIn("OCR", result.error or "")
+
+    def test_whitespace_only_plain_text_is_a_failed_extraction(self) -> None:
+        """Review 20260905-2: without the warning, the store saves "" as a body."""
+        result = self._fetch_static_response(b" \r\n\t ", "text/plain; charset=utf-8")
+
+        self.assertEqual(result.text, "")
+        self.assertEqual(result.error, "no extractable text found")
+        self.assertEqual(result.raw_body, b" \r\n\t ")
+
+    def test_plain_text_with_content_still_extracts_cleanly(self) -> None:
+        result = self._fetch_static_response(b"Plain article body", "text/plain")
+
+        self.assertEqual(result.text, "Plain article body")
+        self.assertIsNone(result.error)
+
+    def test_whitespace_only_stored_plain_text_is_a_failed_extraction(self) -> None:
+        result = extract_stored_payload(b"   ", "https://example.com/document", "text/plain")
+
+        self.assertEqual(result.text, "")
+        self.assertEqual(result.error, "no extractable text found")
+        stored = extract_stored_payload(b"Plain article body", "https://example.com/document", "text/plain")
+        self.assertEqual(stored.text, "Plain article body")
+        self.assertIsNone(stored.error)
 
     @staticmethod
     def _fetch_static_response(raw: bytes, content_type: str):
