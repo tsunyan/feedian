@@ -217,7 +217,18 @@ def sync_vault(
                                     final_url=page.final_url or item.url,
                                     response_headers=page.response_headers,
                                 )
-                            elif not page.text.strip() and item.embedded_content:
+                            elif (
+                                not page.text.strip()
+                                and item.embedded_content
+                                and not _resource_has_revision(store, stored.resource_id)
+                            ):
+                                # The same guard as the exception path above: the feed
+                                # body stands in only for a resource holding none yet.
+                                # record_resource_revision rewrites the current revision
+                                # in place, so standing in for a held body would replace
+                                # the full text with the excerpt for good. An empty
+                                # extraction always carries a warning, so _store_page
+                                # records this as a failed fetch and keeps the body.
                                 page.text = item.embedded_content
                                 page.title = page.title or item.title
                                 page.extraction_method = "rss-feed-fallback"
@@ -535,7 +546,17 @@ def _provider_items(
             reverse=True,
         )
         selected = collected if limit is None else collected[: max(0, limit)]
+        # A feed's ETag/Last-Modified vouch for the whole response, and the next
+        # sync replays them from whichever of its items was stored last. When the
+        # limit stores only part of a feed, a 304 to those validators would hide
+        # the rest until the feed changes, even from a full sync without a limit.
+        # So that feed's items are stored without validators: the next sync asks
+        # for it unconditionally, and validators return with the next item stored
+        # from a response that was not cut.
+        cut_feeds = {entry.item.provider_metadata.get("feed_url") for _, entry in collected[len(selected):]}
         for _, entry in selected:
+            if entry.item.provider_metadata.get("feed_url") in cut_feeds:
+                entry.item.provider_metadata.update({"feed_etag": "", "feed_last_modified": ""})
             yield entry.item, entry.payload
         return
     raise ValueError(f"Unsupported provider: {provider}")
