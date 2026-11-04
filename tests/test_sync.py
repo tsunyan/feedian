@@ -1081,6 +1081,101 @@ def test_raindrop_quick_collection_ends_on_a_short_page_without_stopping_early(m
     assert stopped == []
 
 
+DIRTY_X_LINK = "https://x.com/u/status/1?a=abc&s=09"
+CLEAN_X_LINK = "https://x.com/u/status/1"
+
+
+def _x_link_client(monkeypatch, *, fail: bool = False) -> list[tuple[int, str]]:
+    raws = [
+        {"_id": 1, "link": DIRTY_X_LINK},
+        {"_id": 2, "link": "https://example.test/clean"},
+    ]
+    calls: list[tuple[int, str]] = []
+
+    class _StubClient:
+        def __init__(self, token: str) -> None:
+            self.token = token
+
+        def iter_raindrop_pages(self, collection_id: int, per_page: int, nested: bool):
+            yield raws
+
+        def iter_raindrops(self, collection_id: int, per_page: int, nested: bool, limit=None):
+            yield from raws
+
+        def update_raindrop_link(self, raindrop_id: int, link: str) -> None:
+            if fail:
+                raise RuntimeError("boom")
+            calls.append((raindrop_id, link))
+
+    monkeypatch.setattr("feedian.sync._required_env", lambda _name: "token")
+    monkeypatch.setattr("feedian.sync.RaindropClient", _StubClient)
+    return calls
+
+
+def _raindrop_config() -> VaultConfig:
+    return VaultConfig(providers={"raindrop": VaultConfig().providers["raindrop"]})
+
+
+@pytest.mark.parametrize("quick", [True, False])
+def test_raindrop_collection_cleans_a_dirty_link_and_keeps_the_raw_payload(monkeypatch, quick) -> None:
+    calls = _x_link_client(monkeypatch)
+    events: list[str | None] = []
+
+    rows = list(
+        _provider_items(
+            _raindrop_config(), "raindrop", None, quick=quick, known=set(), on_raindrop_link=events.append
+        )
+    )
+
+    assert len(rows) == 2
+    assert calls == [(1, CLEAN_X_LINK)]
+    assert events == [None]
+    assert rows[0][0].url == CLEAN_X_LINK
+    assert DIRTY_X_LINK in rows[0][1].decode("utf-8")
+
+
+@pytest.mark.parametrize("quick", [True, False])
+def test_raindrop_collection_never_writes_without_a_callback(monkeypatch, quick) -> None:
+    calls = _x_link_client(monkeypatch)
+
+    rows = list(_provider_items(_raindrop_config(), "raindrop", None, quick=quick, known=set()))
+
+    assert len(rows) == 2
+    assert calls == []
+
+
+@pytest.mark.parametrize("quick", [True, False])
+def test_raindrop_link_failure_is_reported_without_stopping_collection(monkeypatch, quick) -> None:
+    _x_link_client(monkeypatch, fail=True)
+    events: list[str | None] = []
+
+    rows = list(
+        _provider_items(
+            _raindrop_config(), "raindrop", None, quick=quick, known=set(), on_raindrop_link=events.append
+        )
+    )
+
+    assert len(rows) == 2
+    assert len(events) == 1
+    assert "1" in events[0] and "boom" in events[0]
+
+
+def test_sync_vault_reports_cleaned_raindrop_links(monkeypatch, tmp_path) -> None:
+    calls = _x_link_client(monkeypatch)
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        report = sync_vault(
+            store, _raindrop_config(), source="raindrop", fetch_pages=False, fetch_comments=False
+        )
+    finally:
+        store.close()
+
+    assert calls == [(1, CLEAN_X_LINK)]
+    assert report.raindrop_links_cleaned == 1
+    assert report.raindrop_link_errors == ()
+    assert report.failed == 0
+
+
 def test_settings_fingerprint_differs_between_quick_and_full_runs(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr("feedian.sync._provider_items", lambda *_args, **_kwargs: iter(()))
     config = VaultConfig(providers={"hatena": VaultConfig().providers["hatena"]})
