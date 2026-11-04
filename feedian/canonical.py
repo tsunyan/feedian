@@ -46,8 +46,26 @@ class CanonicalItem:
         return metadata
 
 
+X_HOSTS: frozenset[str] = frozenset(
+    {"x.com", "www.x.com", "mobile.x.com", "twitter.com", "www.twitter.com", "mobile.twitter.com"}
+)
+X_SHARE_PARAMS: frozenset[str] = frozenset({"a", "s", "t"})
+
+
+def strip_tracking_params(url: str) -> str:
+    """Drop X's per-share tracking parameters, leaving every other byte as it was."""
+    parsed = urlsplit(url)
+    if (parsed.hostname or "").lower() not in X_HOSTS or not parsed.query:
+        return url
+    segments = parsed.query.split("&")
+    kept = [segment for segment in segments if segment.partition("=")[0] not in X_SHARE_PARAMS]
+    if len(kept) == len(segments):
+        return url
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "&".join(kept), parsed.fragment))
+
+
 def canonicalize_url(url: str) -> str:
-    parsed = urlsplit(url.strip())
+    parsed = urlsplit(strip_tracking_params(url.strip()))
     scheme = parsed.scheme.lower()
     hostname = (parsed.hostname or "").lower()
     port = parsed.port
@@ -71,7 +89,7 @@ def canonical_item_from_metadata(
     *,
     default_source: str = "raindrop",
 ) -> CanonicalItem:
-    url = str(item.get("link") or "")
+    url = strip_tracking_params(str(item.get("link") or ""))
     source = str(item.get("_feedian_source") or default_source)
     source_id = str(item.get("_feedian_source_id") or item.get("_id") or "unknown")
     content_key = str(item.get("_feedian_content_key") or (url_content_key(url) if url else ""))

@@ -6,6 +6,8 @@ from unittest.mock import patch
 from feedian.canonical import source_id_for_url
 from feedian.extract import _ValidatingHTTPHandler, _ValidatingHTTPSHandler
 from feedian.hatena import (
+    _item,
+    _search_result_item,
     clean_hatena_excerpt,
     fetch_hatena_bookmarks,
     fetch_hatena_bookmark_counts,
@@ -417,3 +419,31 @@ class HatenaQuickCollectionTests(unittest.TestCase):
 
         self.assertEqual(read_json.call_count, 3)
         self.assertIn("https://example.com/newB", [item.url for item in items])
+
+    def test_item_strips_x_share_parameters_and_keeps_the_original_url(self) -> None:
+        dirty = "https://x.com/u/status/1?a=hash&s=09"
+        clean = "https://x.com/u/status/1"
+        kwargs = dict(title="T", comment="", tags=[], created="", updated="", private=None)
+
+        item = _item(url=f" {dirty} ", **kwargs)
+        self.assertEqual(item.url, clean)
+        self.assertEqual(item.source_id, source_id_for_url("hatena", clean))
+        self.assertEqual(item.provider_metadata, {"original_url": dirty})
+
+        untouched = _item(url=clean, **kwargs)
+        self.assertEqual(untouched.url, clean)
+        self.assertEqual(untouched.provider_metadata, {})
+
+    def test_search_result_strips_x_share_parameters_and_keeps_the_original_url(self) -> None:
+        dirty = "https://x.com/u/status/1?s=12"
+        clean = "https://x.com/u/status/1"
+
+        item = _search_result_item({"entry": {"url": dirty, "title": "T"}, "comment": ""})
+        assert item is not None
+        self.assertEqual(item.url, clean)
+        self.assertEqual(item.source_id, source_id_for_url("hatena", clean))
+        self.assertEqual(item.provider_metadata, {"original_url": dirty})
+
+        plain = _search_result_item({"entry": {"url": clean, "title": "T"}, "comment": ""})
+        assert plain is not None
+        self.assertEqual(plain.provider_metadata, {})
