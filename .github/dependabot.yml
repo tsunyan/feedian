@@ -6,10 +6,12 @@ updates:
   - package-ecosystem: pip
     directory: "/"
     schedule:
-      interval: weekly
+      interval: cron
+      cronjob: "0 3 * * 3,6" # Wednesday and Saturday, 03:00
+      timezone: Asia/Tokyo
     groups:
       # requirements.txt and pyproject.toml both declare dependencies in this
-      # directory; one PR per week covering every update is easier to review
+      # directory; one PR per run covering every update is easier to review
       # than one per package.
       python-dependencies:
         patterns: ["*"]
@@ -17,7 +19,9 @@ updates:
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
-      interval: weekly
+      interval: cron
+      cronjob: "0 3 * * 3,6" # Wednesday and Saturday, 03:00
+      timezone: Asia/Tokyo
     groups:
       github-actions:
         patterns: ["*"]
