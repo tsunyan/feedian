@@ -81,33 +81,19 @@ class RaindropClient:
         return item if isinstance(item, dict) else {}
 
     def update_raindrop_note(self, raindrop_id: int, note: str) -> None:
-        request = Request(
-            f"{API_BASE}/raindrop/{raindrop_id}",
-            data=json.dumps({"note": note}).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {self.token}",
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-                "User-Agent": "feedian/0.1",
-            },
-            method="PUT",
-        )
-        try:
-            run_with_retries(
-                lambda: self._read_json(request),
-                max_retries=self.max_retries,
-                retry_base_seconds=self.retry_base_seconds,
-            )
-        except HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"Raindrop API error HTTP {exc.code}: {body}") from exc
-        except URLError as exc:
-            raise RuntimeError(f"Raindrop API network error: {exc.reason}") from exc
+        self._put(f"/raindrop/{raindrop_id}", {"note": note})
+
+    def update_raindrop_link(self, raindrop_id: int, link: str) -> None:
+        # No pleaseParse: Raindrop re-parses cover and excerpt only when it is present.
+        self._put(f"/raindrop/{raindrop_id}", {"link": link})
 
     def append_raindrop_tags(self, collection_id: int, raindrop_id: int, tags: list[str]) -> None:
+        self._put(f"/raindrops/{collection_id}", {"ids": [raindrop_id], "tags": tags})
+
+    def _put(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
         request = Request(
-            f"{API_BASE}/raindrops/{collection_id}",
-            data=json.dumps({"ids": [raindrop_id], "tags": tags}).encode("utf-8"),
+            f"{API_BASE}{path}",
+            data=json.dumps(body).encode("utf-8"),
             headers={
                 "Authorization": f"Bearer {self.token}",
                 "Accept": "application/json",
@@ -117,14 +103,14 @@ class RaindropClient:
             method="PUT",
         )
         try:
-            run_with_retries(
+            return run_with_retries(
                 lambda: self._read_json(request),
                 max_retries=self.max_retries,
                 retry_base_seconds=self.retry_base_seconds,
             )
         except HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"Raindrop API error HTTP {exc.code}: {body}") from exc
+            body_text = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"Raindrop API error HTTP {exc.code}: {body_text}") from exc
         except URLError as exc:
             raise RuntimeError(f"Raindrop API network error: {exc.reason}") from exc
 

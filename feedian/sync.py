@@ -52,6 +52,8 @@ class SyncReport:
     skipped: int = 0
     retried: int = 0
     stopped_early: tuple[str, ...] = ()
+    raindrop_links_cleaned: int = 0
+    raindrop_link_errors: tuple[str, ...] = ()
 
 
 def sync_vault(
@@ -104,6 +106,15 @@ def sync_vault(
     provider_errors: list[str] = []
     stopped_early_providers: list[str] = []
     handled_resource_ids: set[str] = set()
+    links_cleaned = 0
+    link_errors: list[str] = []
+
+    def record_raindrop_link(error: str | None) -> None:
+        nonlocal links_cleaned
+        if error is None:
+            links_cleaned += 1
+        else:
+            link_errors.append(error)
 
     def record_provider_error(provider: str, source_name: str, error: Exception) -> None:
         nonlocal failed
@@ -127,6 +138,7 @@ def sync_vault(
                     stop_after_known_pages=stop_after_known_pages,
                     on_stopped_early=stopped_early_providers.append,
                     network=policy.network,
+                    on_raindrop_link=record_raindrop_link,
                 ),
                 size=max(1, fetch_workers * 4),
             ):
@@ -295,6 +307,8 @@ def sync_vault(
         skipped=skipped,
         retried=retried,
         stopped_early=tuple(stopped_early_providers),
+        raindrop_links_cleaned=links_cleaned,
+        raindrop_link_errors=tuple(link_errors),
     )
 
 
@@ -421,6 +435,26 @@ def _selected_providers(config: VaultConfig, source: str) -> list[str]:
     return [source]
 
 
+def _clean_raindrop_link(
+    client: RaindropClient,
+    raw: dict[str, Any],
+    item: CanonicalItem,
+    on_raindrop_link: Callable[[str | None], None] | None,
+) -> None:
+    """Write the cleaned URL back to Raindrop when stripping changed it.
+
+    A failure is reported through the callback and never stops collection.
+    """
+    if on_raindrop_link is None or not item.url or item.url == str(raw.get("link") or ""):
+        return
+    try:
+        client.update_raindrop_link(int(raw["_id"]), item.url)
+    except Exception as exc:
+        on_raindrop_link(f"{raw.get('_id')}: {exc}")
+    else:
+        on_raindrop_link(None)
+
+
 def _provider_items(
     config: VaultConfig,
     provider: str,
@@ -434,6 +468,7 @@ def _provider_items(
     stop_after_known_pages: int = 1,
     on_stopped_early: Callable[[str], None] | None = None,
     network: NetworkPolicy = NetworkPolicy(allowed_private_hosts=frozenset()),
+    on_raindrop_link: Callable[[str | None], None] | None = None,
 ) -> Iterable[tuple[CanonicalItem, bytes]]:
     if provider == "raindrop":
         token = _required_env("RAINDROP_TOKEN")
@@ -449,6 +484,7 @@ def _provider_items(
                 page_all_known = True
                 for raw in page_items:
                     item = canonical_item_from_metadata(raw)
+                    _clean_raindrop_link(client, raw, item, on_raindrop_link)
                     yield item, stable_json(raw).encode("utf-8")
                     if item.source_id not in known_ids:
                         page_all_known = False
@@ -468,7 +504,9 @@ def _provider_items(
                     return
             return
         for raw in client.iter_raindrops(collection_id=collection_id, per_page=50, nested=True, limit=limit):
-            yield canonical_item_from_metadata(raw), stable_json(raw).encode("utf-8")
+            item = canonical_item_from_metadata(raw)
+            _clean_raindrop_link(client, raw, item, on_raindrop_link)
+            yield item, stable_json(raw).encode("utf-8")
         return
     if provider == "hatena":
         if collection_progress is not None:

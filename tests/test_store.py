@@ -1869,3 +1869,75 @@ def test_a_migrated_database_has_the_same_fetch_capture_columns_as_a_fresh_one(t
     _downgrade_to_v8(migrated_path)
 
     assert fetch_capture_columns(migrated_path) == fresh_columns
+
+
+def _raindrop(source_id: str, url: str) -> CanonicalItem:
+    return CanonicalItem(source="raindrop", source_id=source_id, content_key=f"url:{source_id}", url=url, title="T")
+
+
+def _url_identifiers(store: VaultStore) -> list[tuple[str, str]]:
+    return [
+        (str(row["resource_id"]), str(row["value"]))
+        for row in store.connection.execute(
+            "SELECT resource_id, value FROM resource_identifier WHERE namespace = 'url' ORDER BY value"
+        )
+    ]
+
+
+def test_changed_url_normalization_rekeys_the_identifier_and_keeps_the_resource(tmp_path) -> None:
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        first = store.upsert_canonical_item(_raindrop("rd-1", "https://x.com/u/status/1"))
+        resource_id = first.resource_id or ""
+        store.connection.execute(
+            "UPDATE resource_identifier SET value = 'https://x.com/u/status/1?s=12' WHERE resource_id = ?",
+            (resource_id,),
+        )
+        store.connection.commit()
+        store.record_resource_revision(resource_id, content_markdown="Body")
+        before = store.connection.execute(
+            "SELECT current_revision_id FROM resource WHERE resource_id = ?", (resource_id,)
+        ).fetchone()[0]
+        assert before is not None
+
+        second = store.upsert_canonical_item(_raindrop("rd-1", "https://x.com/u/status/1"))
+
+        assert second.resource_id == resource_id
+        assert _url_identifiers(store) == [(resource_id, "https://x.com/u/status/1")]
+        assert store.status_counts()["resource"] == 1
+        after = store.connection.execute(
+            "SELECT current_revision_id FROM resource WHERE resource_id = ?", (resource_id,)
+        ).fetchone()[0]
+        assert after == before
+    finally:
+        store.close()
+
+
+def test_edited_bookmark_url_still_gets_a_new_resource(tmp_path) -> None:
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        first = store.upsert_canonical_item(_raindrop("rd-1", "https://example.test/old"))
+        second = store.upsert_canonical_item(_raindrop("rd-1", "https://example.test/new"))
+
+        assert first.resource_id != second.resource_id
+        assert (first.resource_id, "https://example.test/old") in _url_identifiers(store)
+    finally:
+        store.close()
+
+
+def test_rekey_does_not_touch_another_source_items_identifier(tmp_path) -> None:
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        first = store.upsert_canonical_item(_raindrop("rd-1", "https://x.com/u/status/1"))
+        store.connection.execute(
+            "UPDATE resource_identifier SET value = 'https://x.com/u/status/1?s=12' WHERE resource_id = ?",
+            (first.resource_id,),
+        )
+        store.connection.commit()
+
+        second = store.upsert_canonical_item(_raindrop("rd-2", "https://x.com/u/status/1"))
+
+        assert second.resource_id != first.resource_id
+        assert (first.resource_id, "https://x.com/u/status/1?s=12") in _url_identifiers(store)
+    finally:
+        store.close()

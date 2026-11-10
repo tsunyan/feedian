@@ -272,7 +272,7 @@ class VaultStore:
         metadata_hash = sha256_bytes(metadata_json.encode("utf-8"))
         now = utc_now()
         with self.transaction() as connection:
-            resource_id = self._resolve_resource(connection, item, now)
+            resource_id = self._resolve_resource(connection, item, account, now)
             source_row = connection.execute(
                 """
                 SELECT source_item_id, current_revision_id FROM source_item
@@ -1460,7 +1460,9 @@ class VaultStore:
             )
         return int(cursor.rowcount)
 
-    def _resolve_resource(self, connection: sqlite3.Connection, item: CanonicalItem, now: str) -> str | None:
+    def _resolve_resource(
+        self, connection: sqlite3.Connection, item: CanonicalItem, account: str, now: str
+    ) -> str | None:
         if not item.url:
             resource_id = uuid7()
             connection.execute(
@@ -1478,6 +1480,23 @@ class VaultStore:
         ).fetchone()
         if row is not None:
             return str(row["resource_id"])
+        # A URL normalization rule change must not split an existing item off its
+        # resource: re-key the identifier the item already points at instead.
+        existing = connection.execute(
+            """
+            SELECT ri.identifier_id, ri.value, ri.resource_id
+            FROM source_item AS si
+            JOIN resource_identifier AS ri ON ri.resource_id = si.resource_id AND ri.namespace = 'url'
+            WHERE si.provider = ? AND si.account = ? AND si.native_id = ?
+            """,
+            (item.source, account, item.source_id),
+        ).fetchone()
+        if existing is not None and canonicalize_url(existing["value"]) == normalized_url:
+            connection.execute(
+                "UPDATE resource_identifier SET value = ? WHERE identifier_id = ?",
+                (normalized_url, existing["identifier_id"]),
+            )
+            return str(existing["resource_id"])
         resource_id = uuid7()
         connection.execute(
             "INSERT INTO resource(resource_id, kind, created_at, updated_at) VALUES (?, 'web', ?, ?)",
@@ -1488,6 +1507,7 @@ class VaultStore:
             (uuid7(), resource_id, normalized_url, now),
         )
         return resource_id
+
 
 def _create_schema(connection: sqlite3.Connection) -> None:
     connection.executescript(

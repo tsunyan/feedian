@@ -4,6 +4,7 @@ import argparse
 import os
 import sqlite3
 import subprocess
+import sys
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
@@ -447,7 +448,13 @@ def _sync(args: argparse.Namespace) -> int:
         )
         if report.stopped_early:
             line += f" stopped_early={','.join(report.stopped_early)}"
+        if report.raindrop_links_cleaned:
+            line += f" raindrop_links_cleaned={report.raindrop_links_cleaned}"
+        if report.raindrop_link_errors:
+            line += f" raindrop_link_errors={len(report.raindrop_link_errors)}"
         print(line)
+        for error in report.raindrop_link_errors:
+            print(f"sync: raindrop link not updated: {error}", file=sys.stderr)
         return 1 if report.failed else 0
     finally:
         store.close()
@@ -679,11 +686,15 @@ def _run_pipeline(args: argparse.Namespace) -> int:
                 if args.if_due and not due_providers and not snapshot_due:
                     print("run: not due")
                     return 0
-                processed = failed = 0
+                processed = failed = links_cleaned = link_errors = 0
                 for provider in due_providers:
                     sync_report = sync_vault(store, config, source=provider)
                     processed += sync_report.processed
                     failed += sync_report.failed
+                    links_cleaned += sync_report.raindrop_links_cleaned
+                    link_errors += len(sync_report.raindrop_link_errors)
+                    for error in sync_report.raindrop_link_errors:
+                        print(f"run: raindrop link not updated: {error}", file=sys.stderr)
                 star_report = enrich_hatena_stars(
                     store, refresh_days=int(config.fetch.get("star_refresh_days", 30))
                 )
@@ -696,10 +707,15 @@ def _run_pipeline(args: argparse.Namespace) -> int:
                 if not args.skip_snapshot and snapshot_due:
                     snapshot_report = create_snapshot(store, root, config)
                     print(f"run: snapshot={snapshot_report.tag}")
-                print(
+                line = (
                     f"run: providers={','.join(due_providers) or 'none'} processed={processed} "
                     f"stars_updated={star_report.updated} raw_written={render_report.written}"
                 )
+                if links_cleaned:
+                    line += f" raindrop_links_cleaned={links_cleaned}"
+                if link_errors:
+                    line += f" raindrop_link_errors={link_errors}"
+                print(line)
             notify_windows("Feedian", "Weekly sync and snapshot completed.")
             return 0
         except Exception as exc:

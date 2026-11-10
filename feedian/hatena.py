@@ -18,7 +18,7 @@ from urllib.parse import urlencode, urlparse
 from urllib.request import HTTPSHandler, ProxyHandler, Request, build_opener
 from xml.etree import ElementTree
 
-from .canonical import CanonicalItem, source_id_for_url, url_content_key
+from .canonical import CanonicalItem, source_id_for_url, strip_tracking_params, url_content_key
 from .extract import (
     AllowAllHosts,
     SafeRedirectHandler,
@@ -400,9 +400,10 @@ def _search_result_item(row: Any) -> CanonicalItem | None:
     entry = row.get("entry")
     if not isinstance(entry, dict):
         return None
-    url = str(entry.get("url") or "").strip()
-    if not url:
+    original = str(entry.get("url") or "").strip()
+    if not original:
         return None
+    url = strip_tracking_params(original)
     tags, comment = _split_hatena_comment(str(row.get("comment") or ""))
     timestamp = row.get("timestamp")
     created = ""
@@ -420,6 +421,7 @@ def _search_result_item(row: Any) -> CanonicalItem | None:
         created_at=created,
         private=_hatena_bool(row.get("is_private")),
         item_type="bookmark",
+        provider_metadata={"original_url": original} if url != original else {},
     )
 
 
@@ -556,11 +558,13 @@ def _item(
     updated: str,
     private: bool | None,
 ) -> CanonicalItem:
+    original = url.strip()
+    clean = strip_tracking_params(original)
     return CanonicalItem(
         source="hatena",
-        source_id=source_id_for_url("hatena", url),
-        content_key=url_content_key(url),
-        url=url.strip(),
+        source_id=source_id_for_url("hatena", clean),
+        content_key=url_content_key(clean),
+        url=clean,
         title=title.strip(),
         comment=comment.strip(),
         tags=tags,
@@ -568,6 +572,7 @@ def _item(
         updated_at=updated.strip(),
         private=private,
         item_type="bookmark",
+        provider_metadata={"original_url": original} if clean != original else {},
     )
 
 

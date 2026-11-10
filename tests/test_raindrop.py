@@ -21,6 +21,21 @@ class RaindropClientTests(unittest.TestCase):
         self.assertEqual(request.full_url, "https://api.raindrop.io/rest/v1/raindrop/123")
         self.assertEqual(json.loads(request.data.decode("utf-8")), {"note": "Japanese summary"})
 
+    def test_update_raindrop_link_sends_only_the_link_field(self) -> None:
+        response = MagicMock()
+        response.read.return_value = b'{"result":true}'
+        context_manager = MagicMock()
+        context_manager.__enter__.return_value = response
+
+        with patch("feedian.raindrop.urlopen", return_value=context_manager) as urlopen_mock:
+            client = RaindropClient(token="token", max_retries=0)
+            client.update_raindrop_link(123, "https://x.com/u/status/1")
+
+        request = urlopen_mock.call_args.args[0]
+        self.assertEqual(request.get_method(), "PUT")
+        self.assertEqual(request.full_url, "https://api.raindrop.io/rest/v1/raindrop/123")
+        self.assertEqual(json.loads(request.data.decode("utf-8")), {"link": "https://x.com/u/status/1"})
+
     def test_append_raindrop_tags_uses_the_collection_batch_endpoint(self) -> None:
         response = MagicMock()
         response.read.return_value = b'{"result":true}'

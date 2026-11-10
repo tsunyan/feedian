@@ -47,6 +47,21 @@ Webページ・RSS・Hatena exportの取得とsnapshot復元は、外部入力�
 - SQLite schema version 7の`sync_run`は`mode`を保存する。`_due_providers`は`mode='full'`のrunだけを見るため、quickを繰り返しても`feedian run`の完全同期がdueでなくなることはない。
 - quickだけを実行し続けると、provider側のmetadata差分、Hatenaコメントの増減、`refresh_days`到達による再取得、取得失敗本文の復旧が反映されない。これらは自動補正せず、完全同期の定期実行を案内する。
 
+## URLの同一性
+
+resourceは`canonicalize_url`で正規化したURLで束ねる。正規化はschemeとhostの小文字化、既定portとfragmentの除去に加え、x.com / twitter.com（`www.`・`mobile.`を含む）のクエリ`a`・`s`・`t`を取り除く。
+
+- `a`はXが共有ごとに付ける追跡用のハッシュで、同じポストを2回共有すると値が変わる。残すと同じポストが別のresourceに分かれ、本文取得と要約が重複する。`s`は共有元クライアントの種別、`t`は以前の共有トークンで、どちらも内容を変えない。対象はx.com系hostの全pathで、他のhostの同名パラメータには触れない。残すクエリは再エンコードせず、元の順序で保つ。
+- RaindropとHatenaのitemは`CanonicalItem.url`自体を除去後のURLにする。ノートのリンク、ページ取得、Hatenaのコメント照会が同じURLを使う。Hatenaのコメントは共有ごとのURLより正規のURLのエントリに集まる。RSSのitemは`url`を書き換えず、同一性の判定だけが除去後のURLを使う。
+- `sync_vault`はRaindrop自体のリンクも書き換えるため、`feedian sync`と`feedian run`の両方で働く。収集中に見たRaindropのitemで除去によってURLが変わったものは、`PUT /raindrop/{id}`へ`{"link": ...}`だけを送る。`pleaseParse`は送らないため、カバーや抜粋は取り直されない。quickは走査したページのitemを、fullは全itemを書き換えるため、新着は`feedian sync`（既定のquick）で、それ以前のものは次のfull sync（`--full`または`feedian run`）で片付く。書き換えの失敗はsyncを失敗させない。件数とエラーを出力して次へ進み、リンクは汚れたまま残るので次回また書き換えを試みる。`_provider_items`が書き込むのは`sync_vault`がcallbackを渡したときだけである。
+- 書き換え後、Feedianに保存したRaindropの元のpayloadは、次のfull syncで新しいpayloadに置き換わる。元の`?a=…`は利用者が消すことを求めた追跡情報なので、残さない。Hatenaは除去でURLが変わったときだけ`provider_metadata.original_url`へ元のURLを保存する。Hatenaのpayloadは`as_bookmark_metadata()`の再構成でしかなく、Hatena側ではブックマークを今も元のURLで識別しているためである（APIでURLを変更できない）。Raindropはブックマークを`_id`で識別するため、元のURLは要らない。
+- Hatenaの`source_id`は正規化URLから作る。`a`だけが違う同じポストのブックマーク2件は1つのsource itemにまとまり、full syncのたびに一方の内容で上書きされる。fragmentだけが違う2件と同じ扱いであり、受け入れる。
+- 正規化規則を変えても、既存のitemは今のresourceを保つ。`_resolve_resource`は正規化URLで識別子が見つからないとき、upsert中のsource item（provider・account・native_id）が既に指しているresourceのURL識別子を調べる。その値が現在の規則で同じURLに正規化されるなら、識別子をその場で書き換えて同じresourceを使う。一致しない場合（利用者がブックマークのURLを編集した場合）は従来どおり新しいresourceを作る。書き換えなければ、旧resourceの本文・要約・OCRがノートから外れる。schema migrationにしなかったのは、`feedian migrate`の手動実行が要り、それまで無人の日次実行が止まるためである。
+- 書き換えは`upsert_canonical_item`を通るときにだけ起きる。quickは既知itemをupsertしないため、保存済みのitemが書き換わるのは次のfull syncである。それまでは旧い識別子のまま整合しており、本文も要約も残る。full syncより前にquickが同じポストの新しいブックマークを取り込むと新しいresourceが先にでき、旧itemはfull syncでそちらへ付け替わる。同じポストを規則変更の前後で2回ブックマークした場合に限られるため、受け入れる。
+- full syncで保存済みitemのURLが変わると、コメント照会の宛先も除去後のURLのエントリへ移る。`upsert_comments`は`replace=True`で新しいエントリに無い作者のコメントを削除する。x.comのパラメータ除去を入れた時点で、該当するresourceに保存済みのコメントは無かった。以後のitemは最初から除去後のURLで照会するため、この切り替えでコメントは失われない。
+- 要約のrequestはリンクを含むため、要約済みのitemはURLが変わると既存結果を再利用できない。`ingest --auto`はsource noteの無いresourceだけを選ぶため対象にならない。再要約の費用がかかるのは、手動の`ingest --stale`を実行したときである。
+- この再keyはnative_idが安定しているproviderでだけ働く。Hatenaのnative_idは正規化URL由来なので、規則変更の影響を受けるHatenaの保存済みitemは別のsource itemになる。x.comのパラメータ除去を入れた時点（2026-11-04）では該当するHatenaのitemは無かった。今後規則を変えるときは、Hatenaの保存済みitemへの影響を先に確認する。
+
 ## 並列処理
 
 外部I/Oだけをworkerへ出し、判断と書き込みはmain threadに残す。判断理由と却下した代替案は [syncとingestのスループット](docs/specs/20260819-sync-ingest-throughput.ja.md) を参照する。
