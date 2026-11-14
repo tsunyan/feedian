@@ -481,6 +481,12 @@ def fetch_page_text(
     encoding, decoded = decode_html(raw, content_type)
     if "text/plain" in content_type:
         text = normalize_plain_text(decoded)
+        # An empty extraction is a failure, as it is for HTML: _store_page tells a
+        # failed fetch from a body by the warning, and without one it saves "" over
+        # whatever body the resource held.
+        warning = f"HTML download truncated at {policy.html_max_bytes} bytes" if truncated else None
+        if not text:
+            warning = "no extractable text found"
         return PageFetchResult(
             url=url,
             text=text,
@@ -488,7 +494,7 @@ def fetch_page_text(
             extraction_method="plain-text",
             content_encoding=encoding,
             content_truncated=truncated,
-            error=f"HTML download truncated at {policy.html_max_bytes} bytes" if truncated else None,
+            error=warning,
             final_url=final_url,
             media_type=content_type,
             response_headers=response_headers,
@@ -723,8 +729,10 @@ def extract_stored_payload(raw: bytes, url: str, media_type: str) -> PageFetchRe
         )
     if "text/plain" in normalized_type:
         encoding, decoded = decode_html(raw, media_type)
+        text = normalize_plain_text(decoded)
+        warning = None if text else "no extractable text found"
         return PageFetchResult(
-            url=url, final_url=url, text=normalize_plain_text(decoded), fetch_method="stored",
+            url=url, final_url=url, text=text, error=warning, fetch_method="stored",
             extraction_method="plain-text", content_encoding=encoding, media_type=media_type, raw_body=raw,
         )
     return PageFetchResult(
