@@ -90,3 +90,37 @@ def test_reextract_splits_failed_and_successful_extractions_between_resources(tm
         assert content == "Real article body text"
     finally:
         store.close()
+
+
+def test_reextracting_an_empty_text_plain_payload_keeps_the_stored_body(tmp_path) -> None:
+    """Review 20260905-2, stored-payload side: whitespace-only text/plain is a failed extraction."""
+    store = VaultStore.open(tmp_path / "feedian.sqlite3")
+    try:
+        item = store.upsert_canonical_item(
+            CanonicalItem(source="hatena", source_id="blank", content_key="url:blank", url="https://example.test/blank")
+        )
+        payload = store.put_payload(b"   ", media_type="text/plain", source_url="https://example.test/blank")
+        revision_id, _ = store.record_resource_revision(
+            item.resource_id or "", content_markdown="Previously archived complete article",
+            final_url="https://example.test/blank", extracted_by="http:trafilatura", http_payload_id=payload,
+        )
+
+        report = reextract_stored_resources(store)
+
+        assert (report.processed, report.changed, report.failed) == (1, 0, 0)
+        row = store.connection.execute(
+            """
+            SELECT r.current_revision_id, rr.content_markdown, fc.warning, fc.http_payload_id
+            FROM resource AS r
+            JOIN resource_revision AS rr ON rr.resource_revision_id = r.current_revision_id
+            JOIN fetch_capture AS fc ON fc.resource_id = r.resource_id
+            WHERE r.resource_id = ?
+            """,
+            (item.resource_id,),
+        ).fetchone()
+        assert row["current_revision_id"] == revision_id
+        assert row["content_markdown"] == "Previously archived complete article"
+        assert row["warning"] == "no extractable text found"
+        assert row["http_payload_id"] == payload
+    finally:
+        store.close()
